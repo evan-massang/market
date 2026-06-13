@@ -1,0 +1,338 @@
+"""
+P3 — autonomous PAPER-trading loop. Scheduled, simulated, $0.
+
+NO real money, NO keys, NO execution. One pass:
+  1. fetch active Polymarket markets (read-only Gamma)
+  2. classify -> keep only OPINION markets above the liquidity floor
+  3. dedupe -> skip markets we already hold an open paper position on
+  4. enrich context upstream (GDELT news/tone + WhoIsSharp microstructure signals)
+  5. forecast with the PolySwarm swarm -> probability p, blended with market price
+  6. size a SIMULATED bet = min(0.25*Kelly, cap) * paper_bankroll
+  7. record a realistic fill (price + slippage) and open a paper position
+  8. (separately) on resolution: settle the paper position + score Brier
+
+Forecasters run in PARALLEL and are A/B'd, never chained; signals are FEATURES,
+not stages. Here we drive PolySwarm; the single-LLM challenger is added at P4.
+
+CLI (run from polyswarm/ with PYTHONUTF8=1):
+  python -m harness.loop run     [--max-markets N --size N --rounds N --dry-run ...]
+  python -m harness.loop settle
+  python -m harness.loop status
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import sys
+import traceback
+from dataclasses import dataclass
+
+# Load polyswarm/.env (LLM_PROVIDER=ollama, MODEL_FAST=...) — running as
+# `python -m harness.loop` bypasses main.py, which is what normally loads it.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
+except Exception:
+    pass
+
+from harness import gamma, classifier, sizing, wallet, challenger, journal
+from harness import gdelt as gdelt_mod
+from harness import signals as signals_mod
+
+
+@dataclass
+class LoopConfig:
+    max_markets: int = 5          # opinion markets to forecast per pass (CPU-bound)
+    fetch_limit: int = 150        # how many active markets to pull before filtering
+    swarm_size: int | None = 6    # agents (None = all 12). 6 keeps CPU passes tractable.
+    rounds: int = 1               # debate rounds (1 for speed on CPU)
+    min_volume: float = 5_000.0
+    min_liquidity: float = 1_000.0
+    min_edge: float = 0.02
+    max_days_to_resolution: int = 180   # skip markets resolving further out, so the
+                                        # gate actually accrues resolutions (the top
+                                        # opinion markets are multi-year 2028 races)
+    lam: float = 0.25             # quarter-Kelly
+    cap: float = 0.02             # hard per-bet cap
+    starting_bankroll: float = 1_000.0
+    use_gdelt: bool = True
+    use_signals: bool = True
+    use_llm_classifier: bool = False
+    challenger: bool = False      # also run a single-LLM baseline per market (parallel A/B)
+    dry_run: bool = False         # stub the forecast (test the pipeline without the slow LLM)
+
+
+# ── context enrichment (fed UPSTREAM to the forecaster) ──────────────────────
+def _build_enrichment(market: dict, cfg: LoopConfig) -> str:
+    blocks: list[str] = []
+    if cfg.use_signals:
+        try:
+            sig = signals_mod.compute_signals(market)
+            fired = sig.get("fired", [])
+            if fired:
+                blocks.append("[Market microstructure signals — WhoIsSharp port]\n"
+                              f"fired: {', '.join(fired)} | metrics: {sig.get('raw_metrics', {})}")
+        except Exception:
+            pass
+    if cfg.use_gdelt:
+        try:
+            q = gdelt_mod.build_query(market.get("question", ""))
+            ctx = gdelt_mod.gdelt_context(q, timespan="14d", max_records=20)
+            blocks.append("[News & sentiment — GDELT]\n" + gdelt_mod.format_context_for_llm(ctx))
+        except Exception:
+            pass
+    if not blocks:
+        return ""
+    return "=== HARNESS UPSTREAM CONTEXT (news/sentiment + microstructure) ===\n" + "\n\n".join(blocks)
+
+
+# ── forecast (real swarm or dry-run stub) ─────────────────────────────────────
+def _days_until(end_date) -> float | None:
+    """Days from now until an ISO end_date string, or None if unparseable."""
+    if not end_date:
+        return None
+    from datetime import datetime, timezone
+    s = str(end_date).replace("Z", "+00:00")
+    for parse in (datetime.fromisoformat,):
+        try:
+            dt = parse(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return (dt - datetime.now(timezone.utc)).total_seconds() / 86400.0
+        except Exception:
+            pass
+    return None
+
+
+def _stub_probability(market_id: str, price: float) -> float:
+    """Deterministic stub for --dry-run: a varied offset off the price so the
+    pipeline (sizing/fills/both sides) gets exercised without the slow LLM."""
+    h = int(hashlib.sha256((market_id or "x").encode()).hexdigest(), 16)
+    offset = ((h % 21) - 10) / 100.0   # -0.10 .. +0.10
+    return min(max(price + offset, 0.01), 0.99)
+
+
+def _forecast(market: dict, price: float, cfg: LoopConfig, enrichment: str = "") -> tuple[float, dict]:
+    """Returns (probability, meta). meta carries the swarm's regime/consensus for the
+    dashboard transcript."""
+    if cfg.dry_run:
+        return _stub_probability(market["market_id"], price), {"regime": "(dry-run)"}
+    from core.swarm import Swarm
+    from agents.personas import build_swarm
+    os.environ["DEBATE_ROUNDS"] = str(cfg.rounds)
+    swarm = Swarm(agents=build_swarm(cfg.swarm_size) if cfg.swarm_size else None)
+    result = swarm.forecast(market["question"], market_odds=price,
+                            market_id=market["market_id"], extra_context=enrichment)
+    rg = result.get("regime")
+    regime = rg.get("regime") if isinstance(rg, dict) else (str(rg) if rg else "")
+    return float(result["probability"]), {"regime": regime, "consensus": result.get("consensus_score")}
+
+
+# ── one pass ──────────────────────────────────────────────────────────────────
+def run_once(cfg: LoopConfig) -> dict:
+    from core.calibration import init_db
+    init_db()
+    wallet.init_wallet(cfg.starting_bankroll)
+    challenger.init_baseline_db()
+    journal.init_journal()
+
+    held = {p["market_id"] for p in wallet.get_open_positions()}
+    summary = {"scanned": 0, "opinion": 0, "forecast": 0, "opened": 0, "skipped_reasons": {}}
+
+    def skip(reason):
+        summary["skipped_reasons"][reason] = summary["skipped_reasons"].get(reason, 0) + 1
+
+    print(f"[loop] fetching up to {cfg.fetch_limit} active markets…")
+    markets = gamma.fetch_active_markets(limit=cfg.fetch_limit)
+    # Prefer SOONEST-resolving markets so watchable near-term bets get placed first.
+    markets.sort(key=lambda m: (_days_until(m.get("end_date")) if _days_until(m.get("end_date")) is not None else 1e9))
+    summary["scanned"] = len(markets)
+    print(f"[loop] {len(markets)} markets fetched. dry_run={cfg.dry_run} "
+          f"size={cfg.swarm_size} rounds={cfg.rounds}\n")
+
+    picked = 0
+    for m in markets:
+        if picked >= cfg.max_markets:
+            break
+        mid = m["market_id"]
+        ok, cls = classifier.should_forecast(
+            m, use_llm=cfg.use_llm_classifier, min_volume=cfg.min_volume, min_liquidity=cfg.min_liquidity)
+        if cls.label == "opinion":
+            summary["opinion"] += 1
+        if not ok:
+            skip("not_opinion" if cls.label != "opinion" else "below_liquidity_floor")
+            continue
+        if mid in held:
+            skip("already_held"); continue
+        price = gamma.yes_price(m)
+        if price is None or not (0.0 < price < 1.0):
+            skip("no_yes_price"); continue
+        if cfg.max_days_to_resolution:
+            days = _days_until(m.get("end_date"))
+            if days is not None and days > cfg.max_days_to_resolution:
+                skip("resolves_too_far_out"); continue
+
+        picked += 1
+        print(f"[{picked}/{cfg.max_markets}] {m['question'][:70]}")
+        print(f"      market_id={mid[:18]}…  yes_price={price:.3f}  vol=${m['volume']:,.0f}")
+        try:
+            enrichment = "" if cfg.dry_run else _build_enrichment(m, cfg)
+            p, meta = _forecast(m, price, cfg, enrichment)
+            summary["forecast"] += 1
+            # CHALLENGER — independent single-LLM forecast on the SAME market (parallel
+            # A/B, never chained). Does not drive betting; pure calibration control.
+            if cfg.challenger and not cfg.dry_run:
+                bp = challenger.single_llm_forecast(m["question"], price, enrichment)
+                if bp is not None:
+                    challenger.save_baseline(mid, m["question"], bp, price)
+                    print(f"      challenger single-LLM p={bp:.3f}")
+            bankroll = wallet.bankroll_for_sizing()
+            sz = sizing.size_bet(p, price, bankroll, lam=cfg.lam, cap=cfg.cap, min_edge=cfg.min_edge)
+            print(f"      model_p={p:.3f}  market_p={price:.3f}  edge={sz.edge:+.3f}  -> {sz.reason}")
+            regime, sig = meta.get("regime", ""), ("LONG (YES)" if sz.edge > 0 else "SHORT (NO)")
+            if sz.side is None:
+                why = f"Swarm {p:.0%} vs market {price:.0%} (edge {sz.edge:+.1%}). No bet — {sz.reason}."
+                journal.record_decision(mid, m["question"], p, price, sz.edge, None, 0.0, None,
+                                        regime, "no edge", "no_bet", why)
+                skip("no_edge_or_below_min"); print()
+                continue
+            fr = wallet.open_position(mid, m["question"], sz.side, p, price, sz.edge, sz.stake,
+                                      end_date=m.get("end_date"))
+            if fr.opened:
+                summary["opened"] += 1
+                why = (f"Swarm sees {p:.0%} vs the market's {price:.0%} — a {sz.edge:+.1%} edge. "
+                       f"Buying {fr.side} @ {fr.fill_price:.3f} with ${fr.stake:.2f} ({sz.reason}).")
+                journal.record_decision(mid, m["question"], p, price, sz.edge, fr.side, fr.stake,
+                                        fr.fill_price, regime, sig, "bet", why)
+                print(f"      OPENED {fr.side} stake=${fr.stake:.2f} fill={fr.fill_price:.3f} "
+                      f"shares={fr.shares:.2f}  bankroll now ${wallet.bankroll_for_sizing():.2f}")
+            else:
+                why = f"Sized {sz.side} ${sz.stake:.2f} but wallet rejected: {fr.reason}"
+                journal.record_decision(mid, m["question"], p, price, sz.edge, sz.side, 0.0, None,
+                                        regime, sig, "rejected", why)
+                skip("wallet_rejected"); print(f"      wallet rejected: {fr.reason}")
+        except Exception as e:
+            skip("error")
+            print(f"      ERROR: {type(e).__name__}: {e}")
+            if cfg.dry_run:
+                traceback.print_exc()
+        print()
+
+    st = wallet.get_state()
+    journal.record_snapshot(st["cash"], st["equity"], st["realized_pnl"], st["open_exposure"], st["n_open"])
+    print(f"[loop] pass done. {summary}")
+    print(f"[wallet] cash=${st['cash']:.2f} equity=${st['equity']:.2f} "
+          f"open={st['n_open']} realized_pnl=${st['realized_pnl']:.2f}")
+    return summary
+
+
+# ── settlement ────────────────────────────────────────────────────────────────
+def settle_resolved(cfg: LoopConfig | None = None) -> list[dict]:
+    from core.calibration import resolve_forecast
+    journal.init_journal()
+    positions = wallet.get_open_positions()
+    seen, results = {}, []
+    for p in positions:
+        seen.setdefault(p["market_id"], p["question"])
+    print(f"[settle] {len(seen)} markets with open paper positions to check…")
+    for mid, question in seen.items():
+        try:
+            m = gamma.fetch_market_by_condition_id(mid)
+            if m is None:
+                print(f"  {mid[:18]}… not found on Gamma — skip"); continue
+            outcome = gamma.resolution_outcome(m)
+            if outcome is None:
+                print(f"  {mid[:18]}… not resolved yet"); continue
+            settled = wallet.settle_market(mid, outcome)
+            n = resolve_forecast(question, outcome, market_id=mid)
+            challenger.resolve_baseline(outcome, mid)   # score the A/B baseline too
+            pnl = sum(s["realized_pnl"] for s in settled)
+            results.append({"market_id": mid, "outcome": outcome, "positions": len(settled),
+                            "brier_rows": n, "realized_pnl": pnl})
+            print(f"  {mid[:18]}… RESOLVED outcome={outcome} settled={len(settled)} "
+                  f"brier_rows={n} pnl=${pnl:+.2f}")
+        except Exception as e:
+            print(f"  {mid[:18]}… ERROR {type(e).__name__}: {e}")
+    st = wallet.get_state()
+    journal.record_snapshot(st["cash"], st["equity"], st["realized_pnl"], st["open_exposure"], st["n_open"])
+    print(f"[wallet] cash=${st['cash']:.2f} equity=${st['equity']:.2f} "
+          f"open={st['n_open']} realized_pnl=${st['realized_pnl']:.2f}")
+    return results
+
+
+def daemon(cfg: LoopConfig, interval_sec: int = 10_800) -> None:
+    """Scheduled autonomous operation: settle resolved -> run a pass -> sleep, repeat.
+    Default interval 3h (CPU forecasts are slow). Ctrl-C to stop. The single source
+    of truth (paper wallet + calibration DB) persists across passes."""
+    import time
+    print(f"[daemon] starting. interval={interval_sec}s ({interval_sec/3600:.1f}h). Ctrl-C to stop.")
+    while True:
+        try:
+            settle_resolved(cfg)
+            run_once(cfg)
+        except KeyboardInterrupt:
+            print("[daemon] stopped."); return
+        except Exception as e:
+            print(f"[daemon] pass error: {type(e).__name__}: {e}")
+        print(f"[daemon] sleeping {interval_sec}s…\n")
+        time.sleep(interval_sec)
+
+
+def status() -> None:
+    wallet.init_wallet()
+    st = wallet.get_state()
+    print("=== PAPER WALLET ===")
+    for k, v in st.items():
+        print(f"  {k:18s}: {v}")
+    print("\n=== OPEN POSITIONS ===")
+    for p in wallet.get_open_positions():
+        print(f"  {p['side']:3s} ${p['stake']:.2f} @ {p['fill_price']:.3f}  "
+              f"model_p={p['model_p']:.3f} mkt_p={p['market_p']:.3f}  {p['question'][:50]}")
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+def _parse(argv) -> tuple[str, LoopConfig]:
+    ap = argparse.ArgumentParser(prog="harness.loop", description="Autonomous paper-trading loop")
+    ap.add_argument("command", choices=["run", "settle", "status", "daemon"])
+    ap.add_argument("--interval", type=int, default=10_800, help="daemon pass interval (seconds)")
+    ap.add_argument("--max-markets", type=int, default=5)
+    ap.add_argument("--fetch-limit", type=int, default=150)
+    ap.add_argument("--size", type=int, default=6, help="swarm size (0 = all 12)")
+    ap.add_argument("--rounds", type=int, default=1)
+    ap.add_argument("--min-volume", type=float, default=5_000.0)
+    ap.add_argument("--min-liquidity", type=float, default=1_000.0)
+    ap.add_argument("--min-edge", type=float, default=0.02)
+    ap.add_argument("--max-days", type=int, default=180, help="skip markets resolving further out (gate accrual)")
+    ap.add_argument("--bankroll", type=float, default=1_000.0)
+    ap.add_argument("--no-gdelt", action="store_true")
+    ap.add_argument("--no-signals", action="store_true")
+    ap.add_argument("--llm-classifier", action="store_true")
+    ap.add_argument("--challenger", action="store_true", help="also run a single-LLM baseline per market (A/B)")
+    ap.add_argument("--dry-run", action="store_true", help="stub the forecast (test pipeline, no LLM)")
+    a = ap.parse_args(argv)
+    cfg = LoopConfig(
+        max_markets=a.max_markets, fetch_limit=a.fetch_limit,
+        swarm_size=(a.size or None), rounds=a.rounds,
+        min_volume=a.min_volume, min_liquidity=a.min_liquidity, min_edge=a.min_edge,
+        max_days_to_resolution=a.max_days,
+        starting_bankroll=a.bankroll, use_gdelt=not a.no_gdelt, use_signals=not a.no_signals,
+        use_llm_classifier=a.llm_classifier, challenger=a.challenger, dry_run=a.dry_run,
+    )
+    return a.command, cfg, a.interval
+
+
+def main(argv=None):
+    command, cfg, interval = _parse(argv if argv is not None else sys.argv[1:])
+    if command == "run":
+        run_once(cfg)
+    elif command == "settle":
+        settle_resolved(cfg)
+    elif command == "status":
+        status()
+    elif command == "daemon":
+        daemon(cfg, interval_sec=interval)
+
+
+if __name__ == "__main__":
+    main()

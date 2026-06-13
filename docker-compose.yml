@@ -1,0 +1,30 @@
+services:
+  polyswarm:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - LLM_PROVIDER=${LLM_PROVIDER:-anthropic}
+      - DEBATE_ROUNDS=${DEBATE_ROUNDS:-2}
+      - SWARM_SIZE=${SWARM_SIZE:-12}
+      - DATABASE_URL=sqlite+aiosqlite:///./data/polyswarm.db
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - polyswarm-data:/app/data
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  polyswarm-data:
+  redis-data:
