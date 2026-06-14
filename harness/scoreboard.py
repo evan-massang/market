@@ -69,9 +69,13 @@ def _resolved_opinion_rows() -> list[dict]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
+        # ONE resolved row per market_id (latest) — a market re-forecast across cycles
+        # must count ONCE toward the gate, not once per re-scout.
         rows = conn.execute(
             "SELECT question, market_id, final_probability, market_odds, outcome, brier_score "
-            "FROM swarm_forecasts WHERE outcome IS NOT NULL AND market_odds IS NOT NULL"
+            "FROM swarm_forecasts s WHERE outcome IS NOT NULL AND market_odds IS NOT NULL "
+            "AND (s.market_id IS NULL OR s.id = (SELECT MAX(id) FROM swarm_forecasts s2 "
+            "WHERE s2.market_id = s.market_id AND s2.outcome IS NOT NULL AND s2.market_odds IS NOT NULL))"
         ).fetchall()
     except sqlite3.OperationalError:
         rows = []
@@ -96,7 +100,9 @@ def _baseline_opinion_briers() -> list[float]:
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
-            "SELECT question, brier_score FROM baseline_forecasts WHERE brier_score IS NOT NULL"
+            "SELECT question, brier_score FROM baseline_forecasts b WHERE brier_score IS NOT NULL "
+            "AND (b.market_id IS NULL OR b.id = (SELECT MAX(id) FROM baseline_forecasts b2 "
+            "WHERE b2.market_id = b.market_id AND b2.brier_score IS NOT NULL))"
         ).fetchall()
     except sqlite3.OperationalError:
         rows = []

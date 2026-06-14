@@ -75,10 +75,12 @@ def init_wallet(starting: float = DEFAULT_STARTING_BANKROLL):
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pos_market ON paper_positions(market_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pos_status ON paper_positions(status)")
-    # migrate older DBs: add end_date for the resolution countdown
+    # migrate older DBs: add end_date (countdown) + event_slug (clickable link)
     _pcols = [r[1] for r in conn.execute("PRAGMA table_info(paper_positions)").fetchall()]
     if "end_date" not in _pcols:
         conn.execute("ALTER TABLE paper_positions ADD COLUMN end_date TEXT")
+    if "event_slug" not in _pcols:
+        conn.execute("ALTER TABLE paper_positions ADD COLUMN event_slug TEXT")
     if conn.execute("SELECT COUNT(*) FROM paper_wallet").fetchone()[0] == 0:
         conn.execute(
             "INSERT INTO paper_wallet (id, starting_bankroll, cash, realized_pnl, updated_at) VALUES (1, ?, ?, 0, ?)",
@@ -137,7 +139,7 @@ class FillResult:
 
 def open_position(market_id: str, question: str, side: str, model_p: float, market_p: float,
                   edge: float, stake: float, cfg: WalletConfig | None = None,
-                  end_date: str | None = None) -> FillResult:
+                  end_date: str | None = None, event_slug: str | None = None) -> FillResult:
     """Open a simulated paper position with a realistic (worse-than-mid) fill.
     Enforces the per-bet cap and the max-exposure guardrail; returns FillResult."""
     cfg = cfg or WalletConfig()
@@ -168,9 +170,9 @@ def open_position(market_id: str, question: str, side: str, model_p: float, mark
     conn = _conn()
     cur = conn.execute(
         """INSERT INTO paper_positions
-           (market_id, question, side, model_p, market_p, edge, stake, fill_price, shares, fee, status, end_date)
-           VALUES (?,?,?,?,?,?,?,?,?,?,'open',?)""",
-        (market_id, question, side, model_p, market_p, edge, round(stake, 6), fill_price, shares, fee, end_date),
+           (market_id, question, side, model_p, market_p, edge, stake, fill_price, shares, fee, status, end_date, event_slug)
+           VALUES (?,?,?,?,?,?,?,?,?,?,'open',?,?)""",
+        (market_id, question, side, model_p, market_p, edge, round(stake, 6), fill_price, shares, fee, end_date, event_slug),
     )
     pid = cur.lastrowid
     conn.execute("UPDATE paper_wallet SET cash = cash - ?, updated_at=? WHERE id=1",
@@ -203,8 +205,41 @@ def settle_market(market_id: str, outcome: float) -> list[dict]:
     return settled
 
 
+def close_at_price(market_id: str, current_yes_price: float) -> list[dict]:
+    """Cash OUT every open position on a market at the current market price (sell the
+    shares now instead of waiting for resolution). Used to dump bets that resolve too
+    far out. Realized P&L = sell value - stake."""
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM paper_positions WHERE market_id=? AND status='open'", (market_id,)).fetchall()
+    out = []
+    for r in rows:
+        side_price = current_yes_price if r["side"] == "YES" else (1.0 - current_yes_price)
+        sell_value = round(r["shares"] * max(0.0, min(1.0, side_price)), 6)
+        realized = round(sell_value - r["stake"], 6)
+        conn.execute("UPDATE paper_positions SET status='closed', payout=?, realized_pnl=?, settled_at=? WHERE id=?",
+                     (sell_value, realized, datetime.utcnow().isoformat(), r["id"]))
+        conn.execute("UPDATE paper_wallet SET cash = cash + ?, realized_pnl = realized_pnl + ?, updated_at=? WHERE id=1",
+                     (sell_value, realized, datetime.utcnow().isoformat()))
+        out.append({"market_id": market_id, "side": r["side"], "stake": r["stake"],
+                    "sell_value": sell_value, "realized_pnl": realized})
+    conn.commit(); conn.close()
+    return out
+
+
 def get_open_positions() -> list[dict]:
     conn = _conn()
     rows = conn.execute("SELECT * FROM paper_positions WHERE status='open' ORDER BY opened_at").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_closed_positions(limit: int = 80) -> list[dict]:
+    """Settled (market resolved) and closed (cashed-out early) positions, newest first.
+    Each carries realized_pnl — the win/loss in dollars on that single bet."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM paper_positions WHERE status IN ('settled','closed') "
+        "ORDER BY settled_at DESC, id DESC LIMIT ?", (limit,)
+    ).fetchall()
     conn.close()
     return [dict(r) for r in rows]

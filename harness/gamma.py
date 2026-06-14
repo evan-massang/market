@@ -121,6 +121,8 @@ def normalize_market(market: dict) -> dict:
         "liquidity": _first_float(market, "liquidity", "liquidityNum", "liquidityClob"),
         "end_date": market.get("endDate") or market.get("endDateIso") or None,
         "clob_token_ids": [str(t) for t in _loads_list(market.get("clobTokenIds"))],
+        "event_slug": ((market.get("events") or [{}])[0].get("slug") if market.get("events")
+                       else market.get("slug")),
         "raw": market,
     }
 
@@ -132,16 +134,34 @@ def fetch_active_markets(
     *,
     ascending: bool = False,
     timeout: float = DEFAULT_TIMEOUT,
+    end_date_min: str | None = None,
+    end_date_max: str | None = None,
 ) -> list[dict]:
     """Fetch active, open, non-archived markets sorted by `order` (desc by default).
 
-    Read-only GET against the public Gamma endpoint; no key, no wallet. Returns a
-    list of NORMALIZED market dicts (see normalize_market). Raises httpx errors on
-    network/HTTP failure so the caller can decide how to handle an outage.
+    Optional `end_date_min`/`end_date_max` (ISO datetimes, e.g. '2026-06-14T23:59:59Z')
+    use Gamma's SERVER-SIDE end-date filter — far cheaper than fetching everything and
+    filtering client-side. Read-only GET; no key, no wallet.
     """
+    extra = {}
+    if end_date_min:
+        extra["end_date_min"] = end_date_min
+    if end_date_max:
+        extra["end_date_max"] = end_date_max
     return _fetch_paginated(
         {"active": "true", "closed": "false", "archived": "false"},
-        limit, order, ascending, timeout)
+        limit, order, ascending, timeout, extra)
+
+
+def fetch_markets_ending_within(hours: float, limit: int = 200, order: str = "volumeNum",
+                                timeout: float = DEFAULT_TIMEOUT) -> list[dict]:
+    """Markets resolving within the next `hours` — uses Gamma's end_date_min/max filter.
+    e.g. fetch_markets_ending_within(24) -> everything resolving by this time tomorrow."""
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    fmt = lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return fetch_active_markets(limit=limit, order=order, timeout=timeout,
+                                end_date_min=fmt(now), end_date_max=fmt(now + timedelta(hours=hours)))
 
 
 def fetch_closed_markets(limit: int = 200, order: str = "volumeNum", *,
@@ -155,14 +175,14 @@ def fetch_closed_markets(limit: int = 200, order: str = "volumeNum", *,
 
 
 def _fetch_paginated(status: dict, limit: int, order: str, ascending: bool,
-                     timeout: float) -> list[dict]:
+                     timeout: float, extra: dict | None = None) -> list[dict]:
     PAGE = 100  # Gamma caps a single response at ~100 rows; paginate via offset.
     out: list[dict] = []
     with httpx.Client(timeout=timeout, headers=_HEADERS) as client:
         offset = 0
         while len(out) < limit:
             page = min(PAGE, limit - len(out))
-            params = {**status, "limit": page, "offset": offset, "order": order,
+            params = {**status, **(extra or {}), "limit": page, "offset": offset, "order": order,
                       "ascending": "true" if ascending else "false"}
             resp = client.get(MARKETS_URL, params=params)
             resp.raise_for_status()
