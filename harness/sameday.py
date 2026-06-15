@@ -235,6 +235,46 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                             inputs={"market_id": mid, "p": p, "consensus": cons, "price": price, "layer": "guard"},
                         )
                     continue
+                # P3 — MULTI-LEG mutually-exclusive event: evaluate the WHOLE event as a portfolio
+                # (replaces the one-YES Guard D below for ME events) and act ONLY on this leg's slot.
+                # Single-market opinions fall through to the existing conviction-sized per-market path.
+                from harness.predict_today import (build_event_legs as _build_event_legs,
+                                                   run_event_portfolio as _run_event_portfolio,
+                                                   event_leg_reject_reason as _event_leg_reject_reason,
+                                                   CONVICTION_CAP_MAX as _CAPMAX0)
+                _ev_siblings = [o for o in wallet.get_open_positions()
+                                if m.get("event_slug") and o.get("event_slug") == m.get("event_slug")
+                                and o.get("market_id") != mid]
+                _is_me_multi, _ep_legs, _event_key = _build_event_legs(m, p, price, _ev_siblings)
+                if _is_me_multi:
+                    ep, my_pos = _run_event_portfolio(mid, _ep_legs, _event_key, wallet.bankroll_for_sizing())
+                    if not (ep.accept and my_pos is not None):
+                        reason = _event_leg_reject_reason(ep, mid)
+                        print(f"  [sameday] DECISION: NO BET — {reason}")
+                        if obs:
+                            obs.hooks.on_trade_skip(
+                                forecast_id=(obs.current().get("forecast_id") if obs else None),
+                                reason=reason,
+                                inputs={"market_id": mid, "event": ev, "layer": "event_portfolio"},
+                            )
+                        continue
+                    side, stake, edge = my_pos["side"], my_pos["stake"], my_pos["edge"]
+                    print(f"  [sameday] event portfolio ACCEPTS this leg → {side} ${stake:.2f} "
+                          f"(EV ${ep.portfolio_ev:+.2f}, worst ${ep.worst_case_loss:+.2f})")
+                    fr = wallet.open_position(mid, q, side, p, price, edge, stake,
+                                              cfg=wallet.WalletConfig(max_bet_frac=_CAPMAX0, max_exposure_frac=0.85),
+                                              end_date=m.get("end_date"), event_slug=ev)
+                    if fr.opened:
+                        opened += 1; held.add(mid)
+                        if fr.side == "YES":
+                            yes_events[ev] = yes_events.get(ev, 0.0) + p
+                        journal.record_decision(mid, q, p, price, edge, fr.side, fr.stake, fr.fill_price, "swarm",
+                                                "LONG (YES)" if side == "YES" else "SHORT (NO)", "bet",
+                                                f"Event-portfolio (multi-leg ME): swarm {p:.0%} vs market {price:.0%}, "
+                                                f"portfolio EV ${ep.portfolio_ev:+.2f}, worst ${ep.worst_case_loss:+.2f} -> {fr.side}.")
+                        print(f"  [sameday] BET {fr.side} ${fr.stake:.2f} @ {fr.fill_price:.3f} "
+                              f"(event portfolio, {hl:.1f}h) {q[:34]}")
+                    continue
                 # (4) bet ONLY on a real edge — conviction-scaled stake (bigger when surer).
                 from harness.predict_today import _conviction, _conviction_sizing, CONVICTION_CAP_MAX as _CAPMAX
                 conv = _conviction(p, bp, cons, p - price, had_data=False)   # sameday gathers no GDELT

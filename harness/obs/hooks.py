@@ -279,6 +279,48 @@ def on_trade_skip(forecast_id, reason, inputs):
     )
 
 
+# ── event portfolio (P3) ────────────────────────────────────────────────────────
+@_hook
+def on_event_portfolio(
+    forecast_id,
+    event_key,
+    market_id,
+    accept,
+    positions,
+    rejected,
+    portfolio_ev,
+    worst_case_loss,
+    max_exposure,
+    losing_outcome,
+    reject_reason=None,
+    mutually_exclusive=None,
+    is_arbitrage=None,
+    explanation=None,
+):
+    """Emit the event-level portfolio decision: the legs chosen + rejected, the
+    portfolio EV / worst-case / max-exposure / losing-outcome, and the full
+    human-readable explanation. Observation-only; degrades to a no-op on failure."""
+    return eventlog.emit(
+        "event.portfolio",
+        forecast_id=forecast_id,
+        # NB: emit as `event_id` (not `event_key`): obs.redact DROPS any field whose
+        # name ends in `_KEY` as a suspected secret, which would silently delete this.
+        event_id=event_key,
+        market_id=market_id,
+        accept=accept,
+        positions=positions,
+        rejected=rejected,
+        portfolio_ev=portfolio_ev,
+        worst_case_loss=worst_case_loss,
+        max_exposure=max_exposure,
+        losing_outcome=losing_outcome,
+        reject_reason=reject_reason,
+        mutually_exclusive=mutually_exclusive,
+        is_arbitrage=is_arbitrage,
+        explanation=explanation,
+    )
+
+
 # ── resolution & scoring ───────────────────────────────────────────────────────
 @_hook
 def on_resolution(market_id, outcome, source):

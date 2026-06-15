@@ -23,7 +23,7 @@ try:
 except Exception:
     pass
 
-from harness import gamma, classifier, sizing, wallet, journal, challenger, scanner
+from harness import gamma, classifier, sizing, wallet, journal, challenger, scanner, event_portfolio
 from harness.loop import LoopConfig, _build_enrichment, _forecast, _days_until
 
 # ── observability (W1: control-flow / lifecycle / classify / skips / errors) ──
@@ -283,6 +283,94 @@ def _event_group_legs(mid, group_key):
         return []
 
 
+# ── P3: event-portfolio wiring (shared by predict_one + sameday.place_sameday) ─────────
+# When the current market is a leg of a MULTI-LEG mutually-exclusive event, we stop
+# blindly enforcing one-bet-per-event (Guard D) and instead evaluate the WHOLE event as a
+# portfolio via harness.event_portfolio.evaluate_event, then act ONLY on this leg's slot in
+# the accepted portfolio. Single-leg / non-event markets never reach here — they keep the
+# existing per-market guard + conviction-sizing path unchanged.
+def build_event_legs(m, swarm_p, price, group_legs):
+    """Assemble the event leg set for event_portfolio.evaluate_event from the CURRENT
+    forecast leg (this market) plus held SIBLING positions in the same event, and decide
+    whether this is a MULTI-LEG mutually-exclusive event (the only case routed to the
+    portfolio engine). Returns (is_me_multi, legs, event_key).
+
+    Mutual-exclusivity reuses scanner.group_events (the single source of truth for the ME
+    heuristic); as a backward-compatible fallback, any market with a real event_slug that
+    already has >=1 held sibling in that slug is treated as a one-winner event (this is
+    exactly the set Guard D's one-YES rule used to fire on).
+
+    NOTE on probabilities/prices: the current leg's model_p is the RAW (un-calibrated —
+    calibration is P6) swarm probability; sibling legs carry the model_p stored at open and
+    their price is the price AT OPEN (market_p) — we deliberately do NOT refetch live prices
+    here (this path stays network-free, e.g. under the no-network test suite)."""
+    mid = m.get("market_id")
+    slug = m.get("event_slug")
+    # market-like dicts so scanner.group_events can apply its ME heuristic unchanged
+    cur_like = {"market_id": mid, "question": m.get("question"),
+                "event_slug": slug, "outcomes": m.get("outcomes")}
+    sib_likes = [{"market_id": o.get("market_id"), "question": o.get("question"),
+                  "event_slug": o.get("event_slug"), "outcomes": None} for o in (group_legs or [])]
+    try:
+        events = scanner.group_events([cur_like] + sib_likes)
+    except Exception:
+        events = []
+    key = slug or mid
+    event = next((e for e in events if e.get("key") == key), (events[0] if events else None))
+    event_me = bool(event and event.get("mutually_exclusive") and event.get("n_legs", 0) >= 2)
+    shared_slug = bool(slug) and len(group_legs or []) >= 1
+    is_me_multi = event_me or shared_slug
+
+    legs = [{"leg_id": mid, "market_id": mid, "model_p": swarm_p, "price": price,
+             "liquidity": m.get("liquidity"), "exit_risk": m.get("_exit_risk"), "has_data": True}]
+    for o in (group_legs or []):
+        legs.append({"leg_id": o.get("market_id"), "market_id": o.get("market_id"),
+                     "model_p": o.get("model_p"), "price": o.get("market_p"),
+                     "liquidity": None, "exit_risk": None,
+                     "has_data": o.get("model_p") is not None})
+    return is_me_multi, legs, key
+
+
+def run_event_portfolio(mid, legs, event_key, bankroll):
+    """Evaluate the whole event as a portfolio and return (ep, my_pos) where ep is the
+    EventPortfolio and my_pos is THIS leg's accepted position dict (or None if the leg was
+    not selected / the event was rejected). Emits the 'event.portfolio' obs event. The
+    event is treated as mutually-exclusive (one winner) — that is why it was routed here."""
+    ep = event_portfolio.evaluate_event(
+        legs, bankroll, cfg=event_portfolio.Config(mutually_exclusive=True))
+    my_pos = None
+    if ep.accept:
+        my_pos = next((p for p in ep.positions if p.get("leg_id") == mid), None)
+    if obs:
+        obs.hooks.on_event_portfolio(
+            forecast_id=(obs.current().get("forecast_id") if obs else None),
+            event_key=event_key,
+            market_id=mid,
+            accept=ep.accept,
+            positions=ep.positions,
+            rejected=ep.rejected,
+            portfolio_ev=ep.portfolio_ev,
+            worst_case_loss=ep.worst_case_loss,
+            max_exposure=ep.max_exposure,
+            losing_outcome=ep.losing_outcome,
+            reject_reason=ep.reject_reason,
+            mutually_exclusive=ep.mutually_exclusive,
+            is_arbitrage=ep.is_arbitrage,
+            explanation=ep.explanation,
+        )
+    return ep, my_pos
+
+
+def event_leg_reject_reason(ep, mid):
+    """Human-readable reason THIS leg is not being bet under the event portfolio."""
+    if ep.reject_reason:
+        return f"event portfolio rejected: {ep.reject_reason}"
+    for r in (ep.rejected or []):
+        if r.get("leg_id") == mid:
+            return f"event portfolio skipped this leg: {r.get('reason')}"
+    return "leg not selected in the accepted event portfolio"
+
+
 def _betting_guards(label, swarm_p, challenger_p, consensus, group_legs, price):
     """Pure reliability gate evaluated BEFORE sizing. Returns (ok, reason). Pure function so
     it can be replayed deterministically (see replay_guards.py) — no I/O, no LLM. `group_legs`
@@ -382,11 +470,48 @@ def predict_one(m, cfg):
 
         # ── post-forecast reliability guards B/C/D(b): need swarm p, challenger bp, consensus.
         #    (group re-read here too — a sibling leg may have been bet during the long forecast.) ──
-        ok, reason = _betting_guards(label, p, bp, meta.get("consensus"),
-                                     _event_group_legs(mid, group_key), price)
+        group_legs = _event_group_legs(mid, group_key)
+        # P3: is this a MULTI-LEG mutually-exclusive event? If so, Guard D's one-YES rule is
+        # REPLACED by the event-portfolio engine — so we pass NO group legs to _betting_guards
+        # (Guard D is then a no-op) and run the reliability guards B/C only; the portfolio owns
+        # event coherence. Single-leg / non-event markets keep the full per-market guard path.
+        is_me_multi, ep_legs, event_key = build_event_legs(m, p, price, group_legs)
+        guard_legs = [] if is_me_multi else group_legs
+        ok, reason = _betting_guards(label, p, bp, meta.get("consensus"), guard_legs, price)
         if not ok:
             print("\n[4/4] BET — reliability guard…", flush=True)
             return _skip(mid, q, reason, p=p, price=price)
+
+        # 4 — BET — MULTI-LEG ME event → evaluate the WHOLE event as a portfolio, act on THIS leg.
+        if is_me_multi:
+            print("\n[4/4] BET — multi-leg event: evaluating the whole event as a portfolio…", flush=True)
+            ep, my_pos = run_event_portfolio(mid, ep_legs, event_key, wallet.bankroll_for_sizing())
+            if not (ep.accept and my_pos is not None):
+                return _skip(mid, q, event_leg_reject_reason(ep, mid), p=p, price=price)
+            side, stake, edge = my_pos["side"], my_pos["stake"], my_pos["edge"]
+            regime = meta.get("regime", "")
+            sig = "LONG (YES)" if side == "YES" else "SHORT (NO)"
+            print(f"      event portfolio ACCEPTS this leg → {side} ${stake:.2f} "
+                  f"(portfolio EV ${ep.portfolio_ev:+.2f}, worst-case ${ep.worst_case_loss:+.2f}, "
+                  f"max exposure ${ep.max_exposure:.2f})")
+            fr = wallet.open_position(mid, q, side, p, price, edge, stake,
+                                      cfg=wallet.WalletConfig(max_bet_frac=CONVICTION_CAP_MAX, max_exposure_frac=0.95),
+                                      end_date=m.get("end_date"), event_slug=m.get("event_slug"))
+            if fr.opened:
+                why = (f"Event-portfolio (multi-leg mutually-exclusive): swarm {p:.0%} vs market {price:.0%}. "
+                       f"Portfolio EV ${ep.portfolio_ev:+.2f}, worst-case ${ep.worst_case_loss:+.2f}. "
+                       f"Bought {fr.side} @ {fr.fill_price:.3f} with ${fr.stake:.2f}. Resolves in {hl:.1f}h (today).")
+                journal.record_decision(mid, q, p, price, edge, fr.side, fr.stake, fr.fill_price, regime, sig, "bet", why)
+                print(f"      BET PLACED: {fr.side} ${fr.stake:.2f} @ {fr.fill_price:.3f} — resolves in {hl:.1f}h")
+                return True
+            print(f"      bet rejected by wallet: {fr.reason}")
+            if obs:
+                obs.hooks.on_trade_skip(
+                    forecast_id=(obs.current().get("forecast_id") if obs else None),
+                    reason=f"wallet_rejected: {fr.reason}",
+                    inputs={"market_id": mid, "side": side, "stake": stake, "layer": "wallet"},
+                )
+            return False
 
         # 4 — BET — conviction-scaled stake (bigger when surer); size_bet mechanics UNCHANGED
         print("\n[4/4] BET — sizing on the swarm's edge vs the market…", flush=True)
