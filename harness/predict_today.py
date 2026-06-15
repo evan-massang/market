@@ -184,6 +184,23 @@ def _window_name(window=None) -> str:
     return name if name in scanner.WINDOWS else scanner.SAME_DAY
 
 
+def _observe_only_for(question):
+    """(fine_label, observe_only) for a question. fine_label is the granular theme;
+    observe_only consults the P4B label backtest. Fully guarded — a missing table /
+    DB never breaks candidate selection (defaults to (theme_or_'other', False))."""
+    fine = "other"
+    try:
+        from harness import scoreboard
+        fine = scoreboard.theme_of(question)
+    except Exception:
+        pass
+    try:
+        from harness import label_perf
+        return fine, bool(label_perf.should_observe_only(fine))
+    except Exception:
+        return fine, False
+
+
 def find_candidates(max_hours=24.0, max_n=3, include_mechanical=False, window=None):
     """Markets the AI can predict in the selected resolution WINDOW: liquid, tradeable price,
     not already held, not stale. Opinion (forecastable) markets first.
@@ -237,6 +254,12 @@ def find_candidates(max_hours=24.0, max_n=3, include_mechanical=False, window=No
         m["_label"] = cls.label
         m["_hl"] = hl
         m["_price"] = price
+        # P4B — consult the label backtest. MARK (never drop) observe-only labels:
+        # a fine_label that historically lost money / didn't beat the market is still
+        # forecast + logged (so the backtest keeps learning) but is never bet.
+        fine, obs_only = _observe_only_for(m.get("question"))
+        m["_fine_label"] = fine
+        m["_observe_only"] = obs_only
         if obs:
             obs.hooks.on_classify(mid, m.get("question"), cls.label,
                                   getattr(cls, "signals", None),
@@ -481,6 +504,14 @@ def predict_one(m, cfg):
         if not ok:
             print("\n[4/4] BET — reliability guard…", flush=True)
             return _skip(mid, q, reason, p=p, price=price)
+
+        # ── P4B: OBSERVE-ONLY label — the forecast above is saved + logged, but this
+        #    fine_label historically lost money / didn't beat the market, so NO bet is
+        #    placed. We mark, not drop: the forecast keeps feeding the label backtest. ──
+        if m.get("_observe_only"):
+            fine = m.get("_fine_label") or _observe_only_for(q)[0]
+            print("\n[4/4] BET — observe-only label (no bet)…", flush=True)
+            return _skip(mid, q, f"observe_only:{fine}", p=p, price=price)
 
         # 4 — BET — MULTI-LEG ME event → evaluate the WHOLE event as a portfolio, act on THIS leg.
         if is_me_multi:

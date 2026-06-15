@@ -358,6 +358,22 @@ def settle_resolved(cfg: LoopConfig | None = None) -> list[dict]:
                 n = resolve_forecast(question, outcome, market_id=mid)
                 challenger.resolve_baseline(outcome, mid)   # score the A/B baseline too
                 pnl = sum(s["realized_pnl"] for s in settled)
+                # P4B — feed the label backtest (best-effort; never break settlement).
+                # fine_label = theme, coarse label = classifier verdict; model_p/market_p
+                # come from the just-resolved swarm forecast, pnl from the settled position.
+                try:
+                    from harness import label_perf, scoreboard
+                    model_p, market_p = label_perf.latest_forecast_pq(mid)
+                    label_perf.record_classification_outcome(
+                        mid, question, scoreboard.theme_of(question),
+                        classifier.tag_market(m).label, model_p, market_p, outcome, pnl)
+                except Exception as _e:
+                    if obs:
+                        try:
+                            obs.hooks.on_error(where="loop.settle_resolved.label_perf",
+                                               exc=_e, action="skip", context={"market_id": mid})
+                        except Exception:
+                            pass
                 results.append({"market_id": mid, "outcome": outcome, "positions": len(settled),
                                 "brier_rows": n, "realized_pnl": pnl})
                 print(f"  {mid[:18]}… RESOLVED outcome={outcome} settled={len(settled)} "
