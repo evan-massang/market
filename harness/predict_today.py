@@ -128,6 +128,40 @@ def _p8_risk_guards(m, side, q):
         return True, "risk_guards_error"
 
 
+def _p9_can_trade():
+    """P9: pre-bet bankroll KILL SWITCH (drawdown pause / loss limit / losing-streak
+    cooldown). Returns ``(ok, reason)``. FAIL-OPEN: any error -> (True, ...) so the
+    bettor never halts on a bug. A pause withholds only the BET — the forecast is
+    still computed + logged + frozen for scoring (observe-only)."""
+    try:
+        from harness import bankroll as _bank
+        return _bank.can_trade()
+    except Exception as e:
+        if obs:
+            try:
+                obs.hooks.on_error(where="predict_today._p9_can_trade", exc=e, action="skip")
+            except Exception:
+                pass
+        return True, "can_trade_error"
+
+
+def _p9_exposure_ok(q, event, stake):
+    """P9: per-theme / per-event STAKE exposure cap. Returns ``(ok, reason)``.
+    FAIL-OPEN. Pure tightening — refuses a bet that would over-concentrate the book."""
+    try:
+        from harness import bankroll as _bank
+        theme = _scoreboard_p7.theme_of(q)
+        ok, reason, _detail = _bank.exposure_ok(theme, event, stake)
+        return bool(ok), (reason or "ok")
+    except Exception as e:
+        if obs:
+            try:
+                obs.hooks.on_error(where="predict_today._p9_exposure_ok", exc=e, action="skip")
+            except Exception:
+                pass
+        return True, "exposure_error"
+
+
 def _p7_experiment_tag():
     """P7 (B4): the active parameter experiment, materialized + returned best-effort.
 
@@ -784,6 +818,14 @@ def predict_one(m, cfg):
             print("\n[4/4] BET — observe-only label (no bet)…", flush=True)
             return _skip(mid, q, f"observe_only:{fine}", p=p, price=price)
 
+        # ── P9: bankroll KILL SWITCH — pause NEW bets under drawdown / loss-limit /
+        #    losing-streak cooldown. The forecast above is already logged + frozen for
+        #    scoring; this only WITHHOLDS the bet (observe-only). Fail-open. ──
+        ct_ok, ct_reason = _p9_can_trade()
+        if not ct_ok:
+            print("\n[4/4] BET — bankroll kill switch (no bet)…", flush=True)
+            return _skip(mid, q, ct_reason, p=p, price=price)
+
         # 4 — BET — MULTI-LEG ME event → evaluate the WHOLE event as a portfolio, act on THIS leg.
         if is_me_multi:
             print("\n[4/4] BET — multi-leg event: evaluating the whole event as a portfolio…", flush=True)
@@ -803,6 +845,10 @@ def predict_one(m, cfg):
             rg_ok, rg_reason = _p8_risk_guards(m, side, q)
             if not rg_ok:
                 return _skip(mid, q, rg_reason, p=p, price=price)
+            # P9: per-theme / per-event stake exposure cap (concentration limit).
+            ex_ok, ex_reason = _p9_exposure_ok(q, m.get("event_slug"), stake)
+            if not ex_ok:
+                return _skip(mid, q, ex_reason, p=p, price=price)
             regime = meta.get("regime", "")
             sig = "LONG (YES)" if side == "YES" else "SHORT (NO)"
             print(f"      event portfolio ACCEPTS this leg → {side} ${stake:.2f} "
@@ -869,6 +915,10 @@ def predict_one(m, cfg):
         rg_ok, rg_reason = _p8_risk_guards(m, sz.side, q)
         if not rg_ok:
             return _skip(mid, q, rg_reason, p=p, price=price)
+        # P9: per-theme / per-event stake exposure cap (concentration limit).
+        ex_ok, ex_reason = _p9_exposure_ok(q, m.get("event_slug"), sz.stake)
+        if not ex_ok:
+            return _skip(mid, q, ex_reason, p=p, price=price)
         # Give the precise AI pipeline its own exposure headroom so the daemon's price-rule
         # positions don't crowd out its (small, Kelly-capped) data-driven bets.
         fr = wallet.open_position(mid, q, sz.side, final_p, price, sz.edge, sz.stake,
