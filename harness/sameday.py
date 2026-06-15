@@ -25,6 +25,10 @@ except Exception:
     pass
 
 from harness import gamma, classifier, wallet, journal, sizing, challenger
+# P6 — same skill-weighted blend + gated calibration + versioned record as predict_today.
+# All three are HARD cold-start passthroughs (see _ai_scout): final_p == swarm p today.
+from harness import calibration_apply, forecast_versions
+from harness import forecaster_weights as forecaster_weights_mod
 
 # ── observability (W1: control-flow / lifecycle / classify / skips / errors) ──
 # Guarded import: a broken/missing obs package can NEVER break a cycle. Every obs
@@ -111,10 +115,37 @@ def close_long_dated(max_hours=MAX_HOURS):
     return closed
 
 
+def _record_forecast_version(mid, q, swarm_p, ens, blended, final_p, weights, cal):
+    """Best-effort append of the full P6 forecast context to forecast_versions (mirror of
+    predict_today._record_forecast_version). PASSIVE audit only — never feeds back into a
+    decision and never raises into the cycle."""
+    try:
+        fid = obs.current().get("forecast_id") if obs else None
+        forecast_versions.record_forecast_version(
+            forecast_id=fid, market_id=mid, question=q, swarm_p=swarm_p,
+            challenger_models=(ens or {}).get("models") or [],
+            challenger_ps=(ens or {}).get("probs") or [],
+            blended_p=blended, calibrated_p=final_p, weights=weights,
+            calibration_method=(cal or {}).get("method"),
+            n_calib_history=(cal or {}).get("n_history"),
+        )
+    except Exception as e:
+        if obs:
+            try:
+                obs.hooks.on_error(where="sameday._record_forecast_version", exc=e, action="skip")
+            except Exception:
+                pass
+
+
 def _ai_scout(market, price):
-    """Run the AI agents (PolySwarm + single-LLM challenger) on a same-day OPINION
-    market so their forecasts show on the dashboard. Also fires a best-effort MiroFish
-    crowd-sim (subprocess) the first time we see a given market."""
+    """Run the AI agents (PolySwarm + challenger ENSEMBLE) on a same-day OPINION market so
+    their forecasts show on the dashboard. Also fires a best-effort MiroFish crowd-sim
+    (subprocess) the first time we see a given market.
+
+    Returns ``(swarm_p, challenger_bp, consensus, final_p)`` where ``final_p`` is the P6
+    DECISION probability (skill-weighted blend → gated calibration). The swarm SNAPSHOT
+    forecast input is unchanged (the Swarm still saves its raw probability); final_p only
+    governs sizing. COLD-START: final_p == swarm_p to full float precision today."""
     mid = market["market_id"]
     # ONE forecast per market: re-scouting the same market every cycle wastes minutes
     # of CPU and double-counts it toward the gate (and cross-joins the A/B panel).
@@ -123,7 +154,7 @@ def _ai_scout(market, price):
         from core.calibration import get_open_market_ids
         if mid in get_open_market_ids():
             print(f"[sameday] already forecast — skip re-scout: {market['question'][:44]}")
-            return None, None, None
+            return None, None, None, None
     except Exception as e:
         if obs:
             obs.hooks.on_error(where="sameday._ai_scout.open_ids", exc=e, action="skip")
@@ -138,7 +169,7 @@ def _ai_scout(market, price):
         except Exception as e:
             if obs:
                 obs.hooks.on_error(where="sameday._ai_scout.mirofish_launch", exc=e, action="skip")
-    # PolySwarm + challenger (the AI agents)
+    # PolySwarm + challenger ENSEMBLE (the AI agents)
     try:
         from core.swarm import Swarm
         from agents.personas import build_swarm
@@ -146,16 +177,29 @@ def _ai_scout(market, price):
         res = Swarm(agents=build_swarm(5)).forecast(market["question"], market_odds=price, market_id=mid)
         sp = float(res["probability"])
         cons = res.get("consensus_score")          # swarm internal agreement (for Guard C)
-        bp = challenger.single_llm_forecast(market["question"], price)
+        # P6 step 1: challenger ENSEMBLE mean (default 1-model roster == today's single bp).
+        ens = challenger.ensemble_forecast(market["question"], price)
+        bp = ens.get("mean")
         if bp is not None:
             challenger.save_baseline(mid, market["question"], bp, price)
-        print(f"[sameday] 🤖 swarm {sp:.0%} | single-LLM {bp if bp is not None else '-'} | market {price:.0%}")
-        return sp, bp, cons
+        # P6 steps 2+3: weighted blend (swarm vs challenger by realized Brier) → gated
+        # calibration → the decision probability final_p. Cold-start: weights are
+        # {"swarm":1,"challenger":0} and calibration is passthrough, so final_p == sp EXACTLY.
+        weights = forecaster_weights_mod.forecaster_weights()
+        blended = forecaster_weights_mod.blend_forecasters(sp, bp, weights)
+        cal = calibration_apply.apply_calibration(blended)
+        final_p = cal["calibrated_p"]
+        # P6 step 5: stash the full forecast context (passive audit).
+        _record_forecast_version(mid, market["question"], sp, ens, blended, final_p, weights, cal)
+        extra = f" | decision {final_p:.0%}" if final_p != sp else ""
+        print(f"[sameday] 🤖 swarm {sp:.0%} | challenger {bp if bp is not None else '-'} | "
+              f"market {price:.0%}{extra}")
+        return sp, bp, cons, final_p
     except Exception as e:
         if obs:
             obs.hooks.on_error(where="sameday._ai_scout", exc=e, action="skip")
         print("[sameday] AI scout error:", e)
-        return None, None, None
+        return None, None, None, None
 
 
 def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE):
@@ -210,11 +254,15 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                 # (3) the SWARM forecast drives the bet.
                 print(f"[sameday] AI scouting ({hl:.1f}h): {q[:50]}")
                 scouted += 1
-                p, bp, cons = _ai_scout(m, price)
+                # p = RAW swarm probability (used by the reliability guards); final_p = the P6
+                # decision probability (skill-weighted blend → gated calibration) used for sizing.
+                # COLD-START: final_p == p exactly today.
+                p, bp, cons, final_p = _ai_scout(m, price)
                 if p is None:
                     continue
                 # reliability guards B/C (Guard A = opinion-only filter above, Guard D = bet_events above):
                 # skip when the swarm number is untrustworthy. Thresholds shared with predict_today.
+                # P6: divergence/consensus guards stay on RAW swarm p vs RAW challenger bp.
                 from harness.predict_today import (MAX_SWARM_CHALLENGER_DIVERGENCE as _MAXDIV,
                                                    MIN_SWARM_CONSENSUS as _MINCONS)
                 if bp is not None and abs(p - bp) > _MAXDIV:
@@ -271,7 +319,7 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                 _ev_siblings = [o for o in wallet.get_open_positions()
                                 if m.get("event_slug") and o.get("event_slug") == m.get("event_slug")
                                 and o.get("market_id") != mid]
-                _is_me_multi, _ep_legs, _event_key = _build_event_legs(m, p, price, _ev_siblings)
+                _is_me_multi, _ep_legs, _event_key = _build_event_legs(m, final_p, price, _ev_siblings)
                 if _is_me_multi:
                     ep, my_pos = _run_event_portfolio(mid, _ep_legs, _event_key, wallet.bankroll_for_sizing())
                     if not (ep.accept and my_pos is not None):
@@ -287,14 +335,15 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                     side, stake, edge = my_pos["side"], my_pos["stake"], my_pos["edge"]
                     print(f"  [sameday] event portfolio ACCEPTS this leg → {side} ${stake:.2f} "
                           f"(EV ${ep.portfolio_ev:+.2f}, worst ${ep.worst_case_loss:+.2f})")
-                    fr = wallet.open_position(mid, q, side, p, price, edge, stake,
+                    # P6: size/record on the DECISION probability final_p (== raw swarm p today).
+                    fr = wallet.open_position(mid, q, side, final_p, price, edge, stake,
                                               cfg=wallet.WalletConfig(max_bet_frac=_CAPMAX0, max_exposure_frac=0.85),
                                               end_date=m.get("end_date"), event_slug=ev)
                     if fr.opened:
                         opened += 1; held.add(mid)
                         if fr.side == "YES":
-                            yes_events[ev] = yes_events.get(ev, 0.0) + p
-                        journal.record_decision(mid, q, p, price, edge, fr.side, fr.stake, fr.fill_price, "swarm",
+                            yes_events[ev] = yes_events.get(ev, 0.0) + final_p
+                        journal.record_decision(mid, q, final_p, price, edge, fr.side, fr.stake, fr.fill_price, "swarm",
                                                 "LONG (YES)" if side == "YES" else "SHORT (NO)", "bet",
                                                 f"Event-portfolio (multi-leg ME): swarm {p:.0%} vs market {price:.0%}, "
                                                 f"portfolio EV ${ep.portfolio_ev:+.2f}, worst ${ep.worst_case_loss:+.2f} -> {fr.side}.")
@@ -305,12 +354,14 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                 from harness.predict_today import _conviction, _conviction_sizing, CONVICTION_CAP_MAX as _CAPMAX
                 # sameday now gathers the same evidence pack (above) -> feed its quality into
                 # conviction so a stronger evidence base raises (and a thin one lowers) the stake.
-                conv = _conviction(p, bp, cons, p - price,
+                # P6: conviction + Kelly size on the DECISION probability final_p (== raw p today);
+                # the divergence/consensus guards above already ran on RAW p vs bp.
+                conv = _conviction(final_p, bp, cons, final_p - price,
                                    had_data=bool(pack and pack.text),
                                    evidence_quality=(pack.evidence_quality if pack else None))
                 lam, cap = _conviction_sizing(conv)
                 print(f"  [sameday] conviction {conv:.2f} → {lam:g}x Kelly, cap {cap:.0%}")
-                sz = sizing.size_bet(p, price, wallet.bankroll_for_sizing(), lam=lam, cap=cap, min_edge=min_edge)
+                sz = sizing.size_bet(final_p, price, wallet.bankroll_for_sizing(), lam=lam, cap=cap, min_edge=min_edge)
                 if sz.side is None or sz.stake <= 0:
                     print(f"[sameday] no bet: swarm {p:.0%} vs market {price:.0%} ({sz.reason})")
                     if obs:
@@ -341,14 +392,14 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                                 inputs={"market_id": mid, "event": ev, "layer": "guard"},
                             )
                         continue
-                fr = wallet.open_position(mid, q, sz.side, p, price, sz.edge, sz.stake,
+                fr = wallet.open_position(mid, q, sz.side, final_p, price, sz.edge, sz.stake,
                                           cfg=wallet.WalletConfig(max_bet_frac=_CAPMAX, max_exposure_frac=0.85),
                                           end_date=m.get("end_date"), event_slug=ev)
                 if fr.opened:
                     opened += 1; held.add(mid)
                     if fr.side == "YES":
-                        yes_events[ev] = yes_events.get(ev, 0.0) + p
-                    journal.record_decision(mid, q, p, price, sz.edge,
+                        yes_events[ev] = yes_events.get(ev, 0.0) + final_p
+                    journal.record_decision(mid, q, final_p, price, sz.edge,
                                             fr.side, fr.stake, fr.fill_price, "swarm",
                                             "LONG (YES)" if sz.side == "YES" else "SHORT (NO)", "bet",
                                             f"Swarm sees {p:.0%} vs market {price:.0%} ({hl:.1f}h) -> {sz.side}, edge {sz.edge:+.1%}.")

@@ -24,6 +24,10 @@ except Exception:
     pass
 
 from harness import gamma, classifier, sizing, wallet, journal, challenger, scanner, event_portfolio
+# P6 — skill-weighted forecaster blend + gated calibration + versioned forecast record.
+# All three are HARD cold-start passthroughs (see the blend/calibrate site in predict_one).
+from harness import calibration_apply, forecast_versions
+from harness import forecaster_weights as forecaster_weights_mod
 from harness.loop import LoopConfig, _build_enrichment, _forecast, _days_until, build_pack
 
 # ── observability (W1: control-flow / lifecycle / classify / skips / errors) ──
@@ -339,10 +343,12 @@ def build_event_legs(m, swarm_p, price, group_legs):
     already has >=1 held sibling in that slug is treated as a one-winner event (this is
     exactly the set Guard D's one-YES rule used to fire on).
 
-    NOTE on probabilities/prices: the current leg's model_p is the RAW (un-calibrated —
-    calibration is P6) swarm probability; sibling legs carry the model_p stored at open and
-    their price is the price AT OPEN (market_p) — we deliberately do NOT refetch live prices
-    here (this path stays network-free, e.g. under the no-network test suite)."""
+    NOTE on probabilities/prices: the current leg's model_p (``swarm_p`` arg) is the P6
+    DECISION probability — the blended + (gated-)calibrated value, which is NUMERICALLY
+    IDENTICAL to the raw swarm probability until resolved data accrues; sibling legs carry
+    the model_p stored at open and their price is the price AT OPEN (market_p) — we
+    deliberately do NOT refetch live prices here (this path stays network-free, e.g. under
+    the no-network test suite)."""
     mid = m.get("market_id")
     slug = m.get("event_slug")
     # market-like dicts so scanner.group_events can apply its ME heuristic unchanged
@@ -503,6 +509,56 @@ def _emit_evidence_pack(mid, pack):
             obs.hooks.on_error(where="predict_today._emit_evidence_pack", exc=e, action="skip")
 
 
+def _decision_probability(swarm_p, challenger_p):
+    """P6 — fold the raw swarm probability and the challenger ensemble into the
+    SINGLE decision probability, in the order the spec fixes:
+
+        1. WEIGHTED BLEND   — weight swarm vs challenger by their realized per-forecaster
+                              Brier skill (harness.forecaster_weights).
+        2. GATED CALIBRATE  — calibrate the blend against resolved swarm history, but only
+                              once enough has accrued (harness.calibration_apply).
+
+    Returns ``(final_p, blended, weights, cal)`` so the caller can both SIZE on
+    ``final_p`` and RECORD the full context. Pure-ish: no network / no LLM (only
+    local-DB reads behind best-effort guards).
+
+    COLD-START INVARIANT (today: 0 resolved opinion markets): ``forecaster_weights``
+    returns ``{"swarm":1.0,"challenger":0.0}`` until BOTH forecasters have a real
+    track record, so ``blend_forecasters`` returns ``swarm_p`` EXACTLY (object
+    identity, no float math); ``apply_calibration`` is an exact passthrough below
+    its n>=30 floor, so ``calibrated_p == swarm_p``. Hence ``final_p == swarm_p``
+    to full float precision — NUMERICALLY IDENTICAL to the pre-P6 decision p."""
+    w = forecaster_weights_mod.forecaster_weights()
+    blended = forecaster_weights_mod.blend_forecasters(swarm_p, challenger_p, w)
+    cal = calibration_apply.apply_calibration(blended)
+    return cal["calibrated_p"], blended, w, cal
+
+
+def _record_forecast_version(mid, q, swarm_p, ens, blended, final_p, weights, cal):
+    """Best-effort append of the FULL forecast context (raw swarm p, the challenger
+    ensemble + per-model probs, the blended p, the calibrated decision p, the
+    per-forecaster weights, the calibration method/data-count) to the
+    forecast_versions audit table. PASSIVE — never feeds back into a decision and
+    never raises into the forecast path. This is the P6 'OBS' step: the blend /
+    calibration / weights are stashed here (no new canonical obs event needed)."""
+    try:
+        fid = obs.current().get("forecast_id") if obs else None
+        forecast_versions.record_forecast_version(
+            forecast_id=fid, market_id=mid, question=q, swarm_p=swarm_p,
+            challenger_models=(ens or {}).get("models") or [],
+            challenger_ps=(ens or {}).get("probs") or [],
+            blended_p=blended, calibrated_p=final_p, weights=weights,
+            calibration_method=(cal or {}).get("method"),
+            n_calib_history=(cal or {}).get("n_history"),
+        )
+    except Exception as e:
+        if obs:
+            try:
+                obs.hooks.on_error(where="predict_today._record_forecast_version", exc=e, action="skip")
+            except Exception:
+                pass
+
+
 def predict_one(m, cfg):
     q, price, mid, hl = m["question"], m["_price"], m["market_id"], m["_hl"]
     label = m.get("_label", "unknown")
@@ -547,15 +603,36 @@ def predict_one(m, cfg):
         p, meta = _forecast(m, price, cfg, enr)
         print(f"      swarm: {p:.1%} YES vs market {price:.0%} · regime={meta.get('regime')} "
               f"· consensus={meta.get('consensus')} · {time.time()-t0:.0f}s")
+        # ── P6 step 1: CHALLENGER ENSEMBLE (replaces the single challenger call). The DEFAULT
+        #    1-model roster makes ens["mean"] NUMERICALLY IDENTICAL to today's single bp (no
+        #    extra LLM load on the CPU box). bp keeps feeding the divergence/consensus guards
+        #    UNCHANGED. Extra models activate only when CHALLENGER_MODELS is set. ──
         bp = None
+        ens = {"per_model": {}, "probs": [], "mean": None, "n": 0, "models": []}
         try:
-            bp = challenger.single_llm_forecast(q, price, enr)
+            ens = challenger.ensemble_forecast(q, price, enr)
+            bp = ens.get("mean")
             if bp is not None:
                 challenger.save_baseline(mid, q, bp, price)
-                print(f"      single-LLM challenger (A/B): {bp:.1%} YES")
+                roster = ens.get("models") or []
+                tag = f"[{ens.get('n', 0)}/{len(roster)} model(s)]" if len(roster) > 1 else "(A/B)"
+                print(f"      challenger ensemble {tag}: {bp:.1%} YES")
         except Exception as e:
             if obs:
                 obs.hooks.on_error(where="predict_today.predict_one.challenger", exc=e, action="skip")
+
+        # ── P6 steps 2+3: WEIGHTED BLEND (swarm vs challenger by realized Brier) → GATED
+        #    CALIBRATION → the SINGLE decision probability `final_p`. ORDER MATTERS. Both are
+        #    HARD cold-start passthroughs: today (0 resolved opinion markets) final_p == p to
+        #    full float precision, so sizing is NUMERICALLY IDENTICAL to the pre-P6 value. The
+        #    new machinery only activates as resolved per-forecaster / calibration data accrues.
+        final_p, blended, weights, cal = _decision_probability(p, bp)
+        if final_p != p:
+            print(f"      P6 decision p: swarm {p:.1%} → blended {blended:.1%} → "
+                  f"calibrated {final_p:.1%} (method={cal.get('method')}, n_hist={cal.get('n_history')})")
+        # P6 step 5/6 (VERSION + OBS): stash the full context (swarm p, ensemble, blend, calibrated
+        # decision p, weights, calibration method/n) in the forecast_versions audit table. Passive.
+        _record_forecast_version(mid, q, p, ens, blended, final_p, weights, cal)
 
         # ── post-forecast reliability guards B/C/D(b): need swarm p, challenger bp, consensus.
         #    (group re-read here too — a sibling leg may have been bet during the long forecast.) ──
@@ -564,8 +641,11 @@ def predict_one(m, cfg):
         # REPLACED by the event-portfolio engine — so we pass NO group legs to _betting_guards
         # (Guard D is then a no-op) and run the reliability guards B/C only; the portfolio owns
         # event coherence. Single-leg / non-event markets keep the full per-market guard path.
-        is_me_multi, ep_legs, event_key = build_event_legs(m, p, price, group_legs)
+        # The event-portfolio leg sizes on the DECISION probability `final_p` (== p today).
+        is_me_multi, ep_legs, event_key = build_event_legs(m, final_p, price, group_legs)
         guard_legs = [] if is_me_multi else group_legs
+        # P6: the divergence/consensus guards stay on the RAW swarm p vs the RAW challenger bp,
+        # so a downstream blend/calibration step can NEVER mask genuine model disagreement.
         ok, reason = _betting_guards(label, p, bp, meta.get("consensus"), guard_legs, price)
         if not ok:
             print("\n[4/4] BET — reliability guard…", flush=True)
@@ -600,14 +680,15 @@ def predict_one(m, cfg):
             print(f"      event portfolio ACCEPTS this leg → {side} ${stake:.2f} "
                   f"(portfolio EV ${ep.portfolio_ev:+.2f}, worst-case ${ep.worst_case_loss:+.2f}, "
                   f"max exposure ${ep.max_exposure:.2f})")
-            fr = wallet.open_position(mid, q, side, p, price, edge, stake,
+            # P6: size/record on the DECISION probability final_p (== raw swarm p today).
+            fr = wallet.open_position(mid, q, side, final_p, price, edge, stake,
                                       cfg=wallet.WalletConfig(max_bet_frac=CONVICTION_CAP_MAX, max_exposure_frac=0.95),
                                       end_date=m.get("end_date"), event_slug=m.get("event_slug"))
             if fr.opened:
                 why = (f"Event-portfolio (multi-leg mutually-exclusive): swarm {p:.0%} vs market {price:.0%}. "
                        f"Portfolio EV ${ep.portfolio_ev:+.2f}, worst-case ${ep.worst_case_loss:+.2f}. "
                        f"Bought {fr.side} @ {fr.fill_price:.3f} with ${fr.stake:.2f}. Resolves in {hl:.1f}h (today).")
-                journal.record_decision(mid, q, p, price, edge, fr.side, fr.stake, fr.fill_price, regime, sig, "bet", why)
+                journal.record_decision(mid, q, final_p, price, edge, fr.side, fr.stake, fr.fill_price, regime, sig, "bet", why)
                 print(f"      BET PLACED: {fr.side} ${fr.stake:.2f} @ {fr.fill_price:.3f} — resolves in {hl:.1f}h")
                 return True
             print(f"      bet rejected by wallet: {fr.reason}")
@@ -619,20 +700,23 @@ def predict_one(m, cfg):
                 )
             return False
 
-        # 4 — BET — conviction-scaled stake (bigger when surer); size_bet mechanics UNCHANGED
+        # 4 — BET — conviction-scaled stake (bigger when surer); size_bet mechanics UNCHANGED.
+        # P6: conviction + Kelly size on the DECISION probability final_p (== raw swarm p today).
+        # The divergence guard above already ran on RAW p vs bp, so blend/calibration can't sneak
+        # a bet past it; final_p only refines the magnitude once calibration/weighting activate.
         print("\n[4/4] BET — sizing on the swarm's edge vs the market…", flush=True)
-        conv = _conviction(p, bp, meta.get("consensus"), p - price, bool(enr),
+        conv = _conviction(final_p, bp, meta.get("consensus"), final_p - price, bool(enr),
                            evidence_quality=pack.evidence_quality)
         lam, cap = _conviction_sizing(conv)
         print(f"      conviction {conv:.2f} → {lam:g}x Kelly, cap {cap:.0%}")
-        sz = sizing.size_bet(p, price, wallet.bankroll_for_sizing(), lam=lam, cap=cap, min_edge=cfg.min_edge)
+        sz = sizing.size_bet(final_p, price, wallet.bankroll_for_sizing(), lam=lam, cap=cap, min_edge=cfg.min_edge)
         print(f"      edge {sz.edge:+.1%} → {sz.reason}")
         regime = meta.get("regime", "")
         sig = "LONG (YES)" if sz.edge > 0 else "SHORT (NO)"
         if sz.side is None:
             why = (f"AI pipeline: gathered GDELT+signals, swarm {p:.0%} vs market {price:.0%} "
                    f"(edge {sz.edge:+.1%}). No bet — {sz.reason}.")
-            journal.record_decision(mid, q, p, price, sz.edge, None, 0.0, None, regime, "no edge", "no_bet", why)
+            journal.record_decision(mid, q, final_p, price, sz.edge, None, 0.0, None, regime, "no edge", "no_bet", why)
             print("      DECISION: NO BET — edge below threshold")
             if obs:
                 obs.hooks.on_trade_skip(
@@ -643,14 +727,14 @@ def predict_one(m, cfg):
             return False
         # Give the precise AI pipeline its own exposure headroom so the daemon's price-rule
         # positions don't crowd out its (small, Kelly-capped) data-driven bets.
-        fr = wallet.open_position(mid, q, sz.side, p, price, sz.edge, sz.stake,
+        fr = wallet.open_position(mid, q, sz.side, final_p, price, sz.edge, sz.stake,
                                   cfg=wallet.WalletConfig(max_bet_frac=CONVICTION_CAP_MAX, max_exposure_frac=0.95),
                                   end_date=m.get("end_date"), event_slug=m.get("event_slug"))
         if fr.opened:
             why = (f"AI pipeline (data-driven): gathered GDELT news + microstructure, the {cfg.swarm_size}-persona "
                    f"swarm forecast {p:.0%} vs market {price:.0%} → {sz.edge:+.1%} edge. Bought {fr.side} @ "
                    f"{fr.fill_price:.3f} with ${fr.stake:.2f} ({sz.reason}). Resolves in {hl:.1f}h (today).")
-            journal.record_decision(mid, q, p, price, sz.edge, fr.side, fr.stake, fr.fill_price, regime, sig, "bet", why)
+            journal.record_decision(mid, q, final_p, price, sz.edge, fr.side, fr.stake, fr.fill_price, regime, sig, "bet", why)
             print(f"      BET PLACED: {fr.side} ${fr.stake:.2f} @ {fr.fill_price:.3f} — resolves in {hl:.1f}h")
             return True
         print(f"      bet rejected by wallet: {fr.reason}")

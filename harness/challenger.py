@@ -165,3 +165,103 @@ def get_baseline_brier() -> float | None:
         row = None
     conn.close()
     return row[0] if row else None
+
+
+# ── B3: MULTI-CHALLENGER ENSEMBLE ────────────────────────────────────────────--
+# ADDITIVE. Does NOT touch single_llm_forecast, auth, keys, or provider plumbing.
+# DEFAULT roster has EXACTLY ONE element = today's single challenger model, so the
+# default ensemble mean == today's single bp (numeric identity, no extra LLM load
+# on the 16GB CPU box). Extra models activate ONLY when CHALLENGER_MODELS is set.
+
+def _default_challenger_model() -> str:
+    """The exact model `single_llm_forecast(model=None)` resolves to today.
+
+    Used as the sole default-roster element so the one-element ensemble reproduces
+    today's bp NUMERICALLY (not just structurally):
+      - hosted  -> CHALLENGER_MODEL (_hosted_raw ignores the `model` arg anyway)
+      - local + MODEL_FAST set   -> MODEL_FAST (re-passing it is a no-op)
+      - local + MODEL_FAST unset -> core.agent._get_model_name() (the provider
+        default model=None would have resolved to — same value, same result)
+    """
+    if _hosted_configured():
+        return os.getenv("CHALLENGER_MODEL")
+    mf = os.getenv("MODEL_FAST")
+    if mf:
+        return mf
+    try:
+        from core.agent import _get_model_name  # same resolution model=None uses
+        return _get_model_name()
+    except Exception:
+        return challenger_model_label()
+
+
+def challenger_models() -> list[str]:
+    """The challenger model roster.
+
+    CHALLENGER_MODELS (comma-separated) overrides; otherwise EXACTLY ONE element =
+    today's single challenger model. So with no CHALLENGER_MODELS set the default
+    list has one entry and the ensemble is byte-for-byte today's single challenger.
+    """
+    raw = os.getenv("CHALLENGER_MODELS")
+    if raw:
+        models = [m.strip() for m in raw.split(",") if m.strip()]
+        if models:
+            return models
+    return [_default_challenger_model()]
+
+
+def _log_model_skip(model, exc) -> None:
+    """Best-effort obs log when a challenger model is dropped. Never raises."""
+    if not (obs and obs.hooks):
+        return
+    try:
+        obs.hooks.on_error(
+            where="challenger.ensemble_forecast", exc=exc,
+            action="skip_model", context={"model": model},
+        )
+    except Exception:
+        pass
+
+
+def ensemble_forecast(question: str, market_odds: float | None = None,
+                      extra_context: str = "", models: list[str] | None = None) -> dict:
+    """Run the single-LLM challenger across a roster of models and average them.
+
+    ADDITIVE wrapper over single_llm_forecast (auth/provider plumbing UNCHANGED).
+    `models` defaults to challenger_models() -> ONE model today, so mean == that
+    single forecast == today's bp (numeric identity, no extra LLM load).
+
+    Every model is called best-effort: a model that raises OR returns None is
+    SKIPPED (logged via obs.hooks.on_error) and excluded from the mean — so a bad
+    model can never inflate or corrupt the ensemble.
+
+    Returns dict{
+      per_model: {model: p}   # successful models only
+      probs:     [p, ...]     # successful probabilities, roster order
+      mean:      float | None # average of probs, or None if EVERY model failed
+      n:         int          # len(probs)
+      models:    [...]        # the roster that was attempted
+    }
+    """
+    roster = list(models) if models is not None else challenger_models()
+    per_model: dict[str, float] = {}
+    probs: list[float] = []
+    for m in roster:
+        try:
+            p = single_llm_forecast(question, market_odds, extra_context, model=m)
+        except Exception as exc:  # single_llm_forecast shouldn't raise; stay safe
+            _log_model_skip(m, exc)
+            continue
+        if p is None:
+            _log_model_skip(m, RuntimeError(f"challenger model returned no probability: {m}"))
+            continue
+        per_model[str(m)] = float(p)
+        probs.append(float(p))
+    mean = (sum(probs) / len(probs)) if probs else None
+    return {
+        "per_model": per_model,
+        "probs": probs,
+        "mean": mean,
+        "n": len(probs),
+        "models": roster,
+    }

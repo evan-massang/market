@@ -312,6 +312,78 @@ def run_once(cfg: LoopConfig) -> dict:
 
 
 # ── settlement ────────────────────────────────────────────────────────────────
+def _latest_baseline_p(market_id):
+    """Latest stored challenger (baseline) probability for a market, or None.
+
+    Settlement fallback for the challenger per-forecaster Brier when no
+    forecast_versions row was recorded. DATABASE_URL-aware (resolved at call time).
+    Best-effort: never raises."""
+    try:
+        import sqlite3
+        raw = os.getenv("DATABASE_URL")
+        if raw:
+            db = raw.replace("sqlite+aiosqlite:///./", "").replace("sqlite:///./", "")
+        else:
+            try:
+                from harness.obs import config as _cfg
+                db = str(_cfg.resolve_db_path())
+            except Exception:
+                db = "polyswarm.db"
+        conn = sqlite3.connect(db)
+        try:
+            row = conn.execute(
+                "SELECT probability FROM baseline_forecasts WHERE market_id=? "
+                "ORDER BY id DESC LIMIT 1", (market_id,)).fetchone()
+        finally:
+            conn.close()
+        return float(row[0]) if row and row[0] is not None else None
+    except Exception:
+        return None
+
+
+def _record_forecaster_outcomes(market_id, outcome):
+    """P6 settlement hook — attribute a resolved market's Brier to each FORECASTER
+    (the raw SWARM probability and the challenger ENSEMBLE mean) so
+    harness.forecaster_weights can build a per-forecaster track record.
+
+    Prefers the EXACT probabilities stashed in the forecast_versions audit row for
+    this market (swarm_p, mean of the challenger ensemble probs); falls back to the
+    swarm_forecasts / baseline_forecasts tables if no version row exists. Best-effort
+    and never raises into settlement; recording does NOT affect the cold-start decision
+    probability (forecaster_weights stays swarm-only until BOTH forecasters qualify)."""
+    try:
+        from harness import forecaster_weights, forecast_versions
+        swarm_p = challenger_p = None
+        ver = forecast_versions.get_forecast_version_by_market(market_id)
+        if ver:
+            swarm_p = ver.get("swarm_p")
+            ps = ver.get("challenger_ps") or []
+            if ps:
+                try:
+                    challenger_p = sum(ps) / len(ps)
+                except Exception:
+                    challenger_p = None
+        if swarm_p is None:
+            try:
+                from harness import label_perf
+                swarm_p, _mkt = label_perf.latest_forecast_pq(market_id)
+            except Exception:
+                swarm_p = None
+        if challenger_p is None:
+            challenger_p = _latest_baseline_p(market_id)
+        if swarm_p is not None:
+            forecaster_weights.record_forecaster_outcome("swarm", market_id, swarm_p, outcome)
+        if challenger_p is not None:
+            forecaster_weights.record_forecaster_outcome("challenger", market_id, challenger_p, outcome)
+    except Exception as e:
+        if obs:
+            try:
+                obs.hooks.on_error(where="loop.settle_resolved.forecaster_weights",
+                                   exc=e, action="skip", context={"market_id": market_id})
+            except Exception:
+                pass
+
+
 def settle_resolved(cfg: LoopConfig | None = None) -> list[dict]:
     from core.calibration import resolve_forecast
     journal.init_journal()
@@ -336,6 +408,11 @@ def settle_resolved(cfg: LoopConfig | None = None) -> list[dict]:
                 settled = wallet.settle_market(mid, outcome)
                 n = resolve_forecast(question, outcome, market_id=mid)
                 challenger.resolve_baseline(outcome, mid)   # score the A/B baseline too
+                # P6 — record the SWARM and CHALLENGER per-forecaster realized Brier so the
+                # skill-weighted blend can ACTIVATE once BOTH have a track record. Best-effort:
+                # never breaks settlement (cold-start identity is unaffected — this only feeds
+                # forecaster_weights, which stays {"swarm":1,"challenger":0} until both qualify).
+                _record_forecaster_outcomes(mid, outcome)
                 pnl = sum(s["realized_pnl"] for s in settled)
                 # P4B — feed the label backtest (best-effort; never break settlement).
                 # fine_label = theme, coarse label = classifier verdict; model_p/market_p
