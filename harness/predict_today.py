@@ -28,6 +28,7 @@ from harness import gamma, classifier, sizing, wallet, journal, challenger, scan
 # All three are HARD cold-start passthroughs (see the blend/calibrate site in predict_one).
 from harness import calibration_apply, forecast_versions
 from harness import forecaster_weights as forecaster_weights_mod
+from harness import provenance as _provenance
 from harness.loop import LoopConfig, _build_enrichment, _forecast, _days_until, build_pack
 
 # ── observability (W1: control-flow / lifecycle / classify / skips / errors) ──
@@ -969,6 +970,7 @@ def run_once(cfg, max_n=3, max_hours=24.0, include_mech=False, window=None):
         if obs:
             _es.enter_context(obs.run_ctx(run_id=obs.mint("run")))
             obs.hooks.on_run_start(_obs_run_config(cfg), _obs_bankroll())
+        _provenance.record_config_snapshot()  # P12: config-change event (idempotent)
         print(f"[1/4] FIND — scanning {win} markets the AI can predict…", flush=True)
         cands = find_candidates(max_hours=max_hours, max_n=max_n, include_mechanical=include_mech, window=win)
         if not cands:
@@ -1013,6 +1015,7 @@ def daemon(cfg, max_hours=24.0, interval=60, include_mech=False, window=None):
                 if obs:
                     _es.enter_context(obs.run_ctx(run_id=obs.mint("run")))
                     obs.hooks.on_run_start(_obs_run_config(cfg), _obs_bankroll())
+                    _provenance.record_config_snapshot()  # P12: config-change event
                 worked = bool(_settle())              # a settlement is real work (P&L moved)
                 cands = [c for c in find_candidates(max_hours=max_hours, max_n=12,
                                                     include_mechanical=include_mech, window=win)

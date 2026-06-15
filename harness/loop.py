@@ -40,6 +40,7 @@ except Exception:
     pass
 
 from harness import gamma, classifier, sizing, wallet, challenger, journal
+from harness import provenance as _provenance
 from harness import gdelt as gdelt_mod
 from harness import signals as signals_mod
 
@@ -172,6 +173,7 @@ def run_once(cfg: LoopConfig) -> dict:
         if obs:
             _es.enter_context(obs.run_ctx(run_id=obs.mint("run")))
             obs.hooks.on_run_start(_obs_run_config(cfg), _obs_bankroll())
+        _provenance.record_config_snapshot()  # P12: config-change event (idempotent)
         held = {p["market_id"] for p in wallet.get_open_positions()}
         summary = {"scanned": 0, "opinion": 0, "forecast": 0, "opened": 0, "skipped_reasons": {}}
 
