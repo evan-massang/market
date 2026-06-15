@@ -6,6 +6,7 @@ Supports: Anthropic Claude, OpenAI GPT, Ollama (local models).
 from __future__ import annotations
 import os
 import json
+import math
 import re
 import contextlib
 from time import perf_counter
@@ -170,6 +171,31 @@ def _parse_json(raw: str) -> dict:
         raise ValueError(f"no parseable JSON in LLM response: {(raw or '')[:120]!r}")
 
 
+def _coerce_prob(value, default=None):
+    """Best-effort coerce an LLM probability/confidence to a float in [0,1].
+
+    Small local models emit ``"60%"`` / ``"60 percent"`` / ``"about 0.6"`` / null /
+    prose, which previously raised out of the WHOLE forecast at a bare float(...).
+    Numeric inputs preserve the prior clamp (e.g. 8 -> 1.0); strings parse the first
+    number and treat a trailing %, the word 'percent', or a value > 1 as a percentage.
+    Returns ``default`` when nothing usable is present (caller skips that agent)."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        v = float(value)
+        return min(max(v, 0.0), 1.0) if math.isfinite(v) else default
+    s = str(value).strip().lower()
+    if not s:
+        return default
+    m = re.search(r"\d+(?:\.\d+)?", s)
+    if not m:
+        return default
+    v = float(m.group(0))
+    if s.endswith("%") or "percent" in s or v > 1.0:
+        v = v / 100.0
+    return min(max(v, 0.0), 1.0) if math.isfinite(v) else default
+
+
 @dataclass
 class Agent:
     agent_id: str
@@ -226,16 +252,36 @@ Output ONLY valid JSON, no other text."""
                 user_content += f"\nYour relevant past observations:\n{memory_str}"
 
             raw = _call_llm(self._provider, self._client, self._build_system_prompt(), user_content)
-            data = _parse_json(raw)
+            try:
+                data = _parse_json(raw)
+            except Exception:
+                # No JSON at all (pure prose like "I estimate about 0.7") — keep the raw
+                # string and let _coerce_prob try to extract a probability from it.
+                data = raw
+
+            # _parse_json may return a bare number/list (json.loads('0.6') / '[0.6]'),
+            # not just a dict — coerce defensively instead of subscripting blindly.
+            if isinstance(data, dict):
+                prob = _coerce_prob(data.get("probability"))
+                conf = _coerce_prob(data.get("confidence", 0.6), default=0.6)
+                reasoning = str(data.get("reasoning", "") or "")
+                key_factors = data.get("key_factors", []) or []
+            else:
+                bare = data[0] if isinstance(data, (list, tuple)) and data else data
+                prob, conf, reasoning, key_factors = _coerce_prob(bare), 0.6, "", []
+            if prob is None:
+                # no usable probability in THIS agent's reply — raise so the swarm
+                # skips just this agent (handled in Swarm.forecast) without poisoning
+                # or discarding the other agents' completed estimates.
+                raise ValueError(f"agent {self.agent_id}: no usable probability in reply {str(raw)[:80]!r}")
 
             estimate = AgentEstimate(
                 agent_id=self.agent_id,
                 persona=self.persona,
-                # clamp to [0,1] — small models sometimes return 8 or 1.5 etc. (don't poison the aggregate)
-                probability=min(max(float(data["probability"]), 0.0), 1.0),
-                confidence=min(max(float(data.get("confidence", 0.6) or 0.6), 0.0), 1.0),
-                reasoning=str(data.get("reasoning", "") or ""),
-                key_factors=data.get("key_factors", []) or [],
+                probability=prob,
+                confidence=conf if conf is not None else 0.6,
+                reasoning=reasoning,
+                key_factors=key_factors,
                 round=debate_round,
             )
             self.estimates_history.append(estimate)

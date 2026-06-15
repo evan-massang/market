@@ -66,8 +66,19 @@ def single_llm_forecast(question: str, market_odds: float | None = None,
     if not raw:
         return None
     try:
+        from core.agent import _coerce_prob   # robust % / prose / null coercion
         m = re.search(r'\{.*\}', raw, re.DOTALL)
-        p = float(json.loads(m.group(0))["probability"]) if m else float(re.search(r'[01]?\.?\d+', raw).group(0))
+        if m:
+            try:
+                p = _coerce_prob(json.loads(m.group(0)).get("probability"))
+            except Exception:
+                p = None
+        else:
+            # prose fallback: "60 percent"/"75%" -> 0.6/0.75 (NOT a forced 0.99);
+            # an unparseable reply returns None (reject) rather than a fake max-confidence.
+            p = _coerce_prob(raw)
+        if p is None:
+            return None
         return min(max(p, 0.01), 0.99)
     except Exception:
         return None

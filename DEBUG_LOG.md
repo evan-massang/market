@@ -87,4 +87,27 @@ ships a regression test. Severity counts: 1 critical, 18 major, 22 minor.
 
 Suite: 41 → 43 modules, all green.
 
+### BATCH 2 — forecast parser robustness — FIXED
+
+- **B1 🟠 one malformed agent reply discarded the WHOLE forecast.** `core/agent.py:235`
+  `float(data["probability"])` raised KeyError/ValueError/TypeError on missing-key /
+  `"60%"` / null / `"about 0.6"` / a non-dict `_parse_json` return, and `core/swarm.py`
+  looped agents with NO per-agent guard, so one bad reply (of 5/12 slow CPU forecasts)
+  aborted `forecast()` and threw away every other agent's completed estimate. **FIX:**
+  new `_coerce_prob` (numbers clamp as before; `"60%"`/`"60 percent"`/prose →
+  fraction; null/garbage → default), wrap `_parse_json` so pure prose falls through to
+  the coercer, and a non-dict/`None` result raises a CLEAN per-agent `ValueError`.
+  `core/swarm.forecast` now wraps each `agent.estimate()` in try/except → **skips just
+  that agent** (logs `obs.on_error`), and returns a neutral degraded forecast if EVERY
+  agent fails (instead of crashing the 26-method aggregation on an empty set).
+  `core/agent.py`, `core/swarm.py`. FIXED.
+- **B2 🟡 challenger prose "60 percent" → 0.99.** `challenger.single_llm_forecast`'s
+  no-JSON fallback `float(re.search(r'[01]?\.?\d+', raw))` read "60" as a raw prob and
+  clamped to max-confidence 0.99. **FIX:** reuse `_coerce_prob` (→ 0.6); an unparseable
+  reply returns `None` (reject) instead of a fake 0.99. `harness/challenger.py`. FIXED.
+
+Test: `test_parser_robust` 5/5 (numeric clamp, %/prose, unparseable→default, agent
+estimate never raises a dirty error, challenger prose ≠ 0.99). `test_swarm_sizes`
+still 5/5. Suite 44 modules.
+
 _(remaining batches appended below as each is closed)_

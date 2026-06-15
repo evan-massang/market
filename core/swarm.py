@@ -160,12 +160,25 @@ class Swarm:
                 for agent in self.agents:
                     persona_short = agent.persona[:22].ljust(22)
                     console.print(f"  [{COLORS['dim']}]{persona_short}[/]", end="")
-                    est = agent.estimate(
-                        question=question,
-                        context=context,
-                        debate_round=round_num,
-                        other_estimates=all_estimates if round_num > 1 else None,
-                    )
+                    # Per-agent isolation: one malformed LLM reply must NOT discard the
+                    # whole forecast (and every other agent's slow CPU-bound estimate).
+                    # Skip just this agent and carry on.
+                    try:
+                        est = agent.estimate(
+                            question=question,
+                            context=context,
+                            debate_round=round_num,
+                            other_estimates=all_estimates if round_num > 1 else None,
+                        )
+                    except Exception as exc:
+                        console.print(f" [{COLORS['warning']}]skipped ({type(exc).__name__})[/]")
+                        if obs:
+                            try:
+                                obs.hooks.on_error(where="swarm.forecast.agent_estimate", exc=exc,
+                                                   action="skip-agent", context={"agent_id": agent.agent_id})
+                            except Exception:
+                                pass
+                        continue
                     round_estimates.append(est)
 
                     # Mini inline visualization
@@ -188,6 +201,22 @@ class Swarm:
                             for e in round_estimates
                         ],
                     )
+
+            # If EVERY agent failed to produce a usable estimate, there is no signal —
+            # return a neutral forecast (caller decides; no bet on no signal) rather
+            # than crash the aggregation pipeline on an empty estimate set.
+            if not all_estimates:
+                if obs:
+                    try:
+                        obs.hooks.on_error(where="swarm.forecast", exc=RuntimeError("all agents failed"),
+                                           action="neutral-0.5", context={"n_agents": len(self.agents)})
+                    except Exception:
+                        pass
+                return {
+                    "probability": 0.5, "probability_pct": "50.0%", "consensus_score": 0.0,
+                    "std_dev": 0.0, "n_agents": 0, "regime": None,
+                    "individual_estimates": [], "method": "degraded_all_agents_failed",
+                }
 
             # save to calibration DB
             for est in all_estimates:
