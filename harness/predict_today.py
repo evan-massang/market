@@ -105,6 +105,29 @@ def _p7_ev_gate(model_p, market_p, side):
         return True, "ev_gate_error"
 
 
+def _p8_risk_guards(m, side, q):
+    """P8: unified adaptive risk guards (market-quality: stale/low-liquidity/
+    high-spread; portfolio: correlation/bad-theme) under a drawdown-derived
+    `tighten` (stricter when the book is losing). Returns ``(allow, reason)``.
+
+    PURE TIGHTENING + FAIL-OPEN: any error / unavailability returns (True, ...) so
+    the bettor is never crashed or wrongly blocked — never LOOSER than pre-P8."""
+    try:
+        from harness import risk_guards as _rg
+    except Exception:
+        return True, "risk_guards_unavailable"
+    try:
+        rg = _rg.evaluate(m, side, q)
+        return bool(rg.get("allow", True)), (rg.get("blocking_reason") or "ok")
+    except Exception as e:
+        if obs:
+            try:
+                obs.hooks.on_error(where="predict_today._p8_risk_guards", exc=e, action="skip")
+            except Exception:
+                pass
+        return True, "risk_guards_error"
+
+
 def _p7_experiment_tag():
     """P7 (B4): the active parameter experiment, materialized + returned best-effort.
 
@@ -774,6 +797,12 @@ def predict_one(m, cfg):
             ev_ok, ev_reason = _p7_ev_gate(final_p, price, side)
             if not ev_ok:
                 return _skip(mid, q, ev_reason, p=p, price=price)
+            # P8: unified adaptive risk guards (market-quality + correlation + bad-theme),
+            # STRICTER under book drawdown. Fail-open. Pure tightening — a clean market in
+            # a healthy book is unaffected.
+            rg_ok, rg_reason = _p8_risk_guards(m, side, q)
+            if not rg_ok:
+                return _skip(mid, q, rg_reason, p=p, price=price)
             regime = meta.get("regime", "")
             sig = "LONG (YES)" if side == "YES" else "SHORT (NO)"
             print(f"      event portfolio ACCEPTS this leg → {side} ${stake:.2f} "
@@ -834,6 +863,12 @@ def predict_one(m, cfg):
         ev_ok, ev_reason = _p7_ev_gate(final_p, price, sz.side)
         if not ev_ok:
             return _skip(mid, q, ev_reason, p=p, price=price)
+        # P8: unified adaptive risk guards (stale/low-liquidity/high-spread + correlation
+        # + bad-theme), STRICTER under book drawdown. Fail-open; pure tightening so a clean
+        # liquid market in a healthy book is never blocked here.
+        rg_ok, rg_reason = _p8_risk_guards(m, sz.side, q)
+        if not rg_ok:
+            return _skip(mid, q, rg_reason, p=p, price=price)
         # Give the precise AI pipeline its own exposure headroom so the daemon's price-rule
         # positions don't crowd out its (small, Kelly-capped) data-driven bets.
         fr = wallet.open_position(mid, q, sz.side, final_p, price, sz.edge, sz.stake,

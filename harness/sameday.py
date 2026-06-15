@@ -353,6 +353,19 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                                 inputs={"market_id": mid, "event": ev, "side": side, "layer": "ev_gate"},
                             )
                         continue
+                    # P8: unified adaptive risk guards (market-quality + correlation +
+                    # bad-theme), STRICTER under drawdown. Fail-open; pure tightening.
+                    from harness.predict_today import _p8_risk_guards as _p8_rg_ep
+                    _rg_ok, _rg_reason = _p8_rg_ep(m, side, q)
+                    if not _rg_ok:
+                        print(f"  [sameday] DECISION: NO BET — {_rg_reason}")
+                        if obs:
+                            obs.hooks.on_trade_skip(
+                                forecast_id=(obs.current().get("forecast_id") if obs else None),
+                                reason=_rg_reason,
+                                inputs={"market_id": mid, "event": ev, "side": side, "layer": "risk_guards"},
+                            )
+                        continue
                     print(f"  [sameday] event portfolio ACCEPTS this leg → {side} ${stake:.2f} "
                           f"(EV ${ep.portfolio_ev:+.2f}, worst ${ep.worst_case_loss:+.2f})")
                     # P6: size/record on the DECISION probability final_p (== raw swarm p today).
@@ -405,6 +418,19 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                             forecast_id=(obs.current().get("forecast_id") if obs else None),
                             reason=_ev_reason,
                             inputs={"market_id": mid, "p": final_p, "price": price, "side": sz.side, "layer": "ev_gate"},
+                        )
+                    continue
+                # P8: unified adaptive risk guards (stale/low-liquidity/high-spread +
+                # correlation + bad-theme), STRICTER under drawdown. Fail-open; tightening.
+                from harness.predict_today import _p8_risk_guards as _p8_rg_reg
+                _rg_ok, _rg_reason = _p8_rg_reg(m, sz.side, q)
+                if not _rg_ok:
+                    print(f"[sameday] no bet: risk guard — {_rg_reason}")
+                    if obs:
+                        obs.hooks.on_trade_skip(
+                            forecast_id=(obs.current().get("forecast_id") if obs else None),
+                            reason=_rg_reason,
+                            inputs={"market_id": mid, "p": final_p, "price": price, "side": sz.side, "layer": "risk_guards"},
                         )
                     continue
                 # Guard D — one YES (winner) per mutually-exclusive event; NO/fade unlimited.
