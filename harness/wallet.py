@@ -45,8 +45,16 @@ class WalletConfig:
 
 
 def _conn():
-    c = sqlite3.connect(DB_PATH)
+    # timeout + busy_timeout so two concurrent daemons (sameday + predict_today)
+    # settling the same polyswarm.db WAIT for the write lock instead of raising
+    # 'database is locked'. Settlement idempotency itself is enforced by the
+    # guarded `WHERE ... AND status='open'` UPDATE + rowcount check below.
+    c = sqlite3.connect(DB_PATH, timeout=30.0)
     c.row_factory = sqlite3.Row
+    try:
+        c.execute("PRAGMA busy_timeout=30000")
+    except Exception:
+        pass
     return c
 
 
@@ -170,8 +178,11 @@ def open_position(market_id: str, question: str, side: str, model_p: float, mark
         return _skip(FillResult(False, "non-positive stake"))
 
     cash = _cash()
-    if stake > cash + 1e-6:
-        return _skip(FillResult(False, f"stake {stake:.2f} exceeds cash {cash:.2f}"))
+    # Affordability must cover what we actually debit (stake + fee), else a fee
+    # could push cash negative. At the default fee_frac=0.0 this == stake.
+    total_cost = stake * (1.0 + cfg.fee_frac)
+    if total_cost > cash + 1e-6:
+        return _skip(FillResult(False, f"stake+fee {total_cost:.2f} exceeds cash {cash:.2f}"))
     # Defensive guardrails (the sizer is the primary cap). Use a small relative
     # tolerance so a stake sized EXACTLY at the cap isn't rejected by float rounding
     # — otherwise every high-edge (cap-binding) bet would be refused.
@@ -228,10 +239,18 @@ def settle_market(market_id: str, outcome: float) -> list[dict]:
         won = (r["side"] == "YES" and outcome == 1.0) or (r["side"] == "NO" and outcome == 0.0)
         payout = round(r["shares"] * 1.0, 6) if won else 0.0
         realized = round(payout - r["stake"] - r["fee"], 6)
-        conn.execute(
-            "UPDATE paper_positions SET status='settled', outcome=?, payout=?, realized_pnl=?, settled_at=? WHERE id=?",
+        # IDEMPOTENT settle: only transition a row that is STILL open, and only
+        # credit the wallet when THIS process actually did the transition
+        # (rowcount==1). If another daemon already settled it, rowcount==0 and we
+        # skip the credit — never double-credit cash / realized_pnl (the number
+        # Gate 2 reads).
+        cur = conn.execute(
+            "UPDATE paper_positions SET status='settled', outcome=?, payout=?, realized_pnl=?, settled_at=? "
+            "WHERE id=? AND status='open'",
             (outcome, payout, realized, datetime.utcnow().isoformat(), r["id"]),
         )
+        if cur.rowcount != 1:
+            continue  # already settled/closed by a concurrent settle — do NOT re-credit
         conn.execute("UPDATE paper_wallet SET cash = cash + ?, realized_pnl = realized_pnl + ?, updated_at=? WHERE id=1",
                      (payout, realized, datetime.utcnow().isoformat()))
         settled.append({"market_id": market_id, "side": r["side"], "stake": r["stake"],
@@ -266,9 +285,18 @@ def close_at_price(market_id: str, current_yes_price: float) -> list[dict]:
     for r in rows:
         side_price = current_yes_price if r["side"] == "YES" else (1.0 - current_yes_price)
         sell_value = round(r["shares"] * max(0.0, min(1.0, side_price)), 6)
-        realized = round(sell_value - r["stake"], 6)
-        conn.execute("UPDATE paper_positions SET status='closed', payout=?, realized_pnl=?, settled_at=? WHERE id=?",
-                     (sell_value, realized, datetime.utcnow().isoformat(), r["id"]))
+        # Subtract the fee so a cashed-out round-trip carries the same friction as a
+        # settled one (close_at_price previously omitted it, overstating closed P&L
+        # vs settle_market; dormant at the default fee_frac=0.0 but now consistent).
+        realized = round(sell_value - r["stake"] - (r["fee"] or 0.0), 6)
+        # IDEMPOTENT close: guard on status='open' + rowcount so a position can't be
+        # both cashed-out AND settled (or closed twice) — no double credit.
+        cur = conn.execute(
+            "UPDATE paper_positions SET status='closed', payout=?, realized_pnl=?, settled_at=? "
+            "WHERE id=? AND status='open'",
+            (sell_value, realized, datetime.utcnow().isoformat(), r["id"]))
+        if cur.rowcount != 1:
+            continue
         conn.execute("UPDATE paper_wallet SET cash = cash + ?, realized_pnl = realized_pnl + ?, updated_at=? WHERE id=1",
                      (sell_value, realized, datetime.utcnow().isoformat()))
         out.append({"market_id": market_id, "side": r["side"], "stake": r["stake"],

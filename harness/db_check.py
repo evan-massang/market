@@ -1,0 +1,179 @@
+"""harness.db_check — read-only paper-trading DB integrity + reconciliation.
+
+`python -m harness.db_check` (add --json for machine output). NEVER writes. It:
+  * runs PRAGMA integrity_check
+  * confirms the core tables exist
+  * RECONCILES the paper_wallet running totals (cash / realized_pnl / equity)
+    against the paper_positions ledger — the exact drift the audit found (wallet
+    realized_pnl is the number Gate 2 reads, so a silent drift = lying about P&L)
+  * flags negative cash, double-counted / bad-status positions, settled-vs-closed
+    P&L split, and forecasts that were bet but never resolved.
+
+Output: OK / WARN / FAIL lines + a summary; exits non-zero only on a FAIL.
+"""
+from __future__ import annotations
+
+import os
+import sqlite3
+import sys
+
+
+def _db_path() -> str:
+    raw = os.getenv("DATABASE_URL")
+    if raw:
+        return raw.replace("sqlite+aiosqlite:///./", "").replace("sqlite:///./", "")
+    try:
+        from harness.obs import config as _cfg
+        return str(_cfg.resolve_db_path())
+    except Exception:
+        return "polyswarm.db"
+
+
+def _ro_conn(path: str):
+    # open read-only so a check can never mutate the live DB
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10.0)
+    except Exception:
+        c = sqlite3.connect(path, timeout=10.0)
+    c.row_factory = sqlite3.Row
+    return c
+
+
+CHECKS = []  # (name, status, detail)
+
+
+def _add(name, status, detail):
+    CHECKS.append((name, status, detail))
+
+
+def run() -> dict:
+    CHECKS.clear()
+    path = _db_path()
+    if not os.path.exists(path):
+        _add("db_file", "FAIL", f"{path} does not exist")
+        return _summary(path)
+    conn = _ro_conn(path)
+
+    # 1) integrity
+    try:
+        r = conn.execute("PRAGMA integrity_check").fetchone()
+        ok = r and (r[0] == "ok")
+        _add("integrity", "OK" if ok else "FAIL", r[0] if r else "no result")
+    except Exception as e:
+        _add("integrity", "FAIL", f"integrity_check error: {e}")
+
+    # 2) required tables
+    try:
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    except Exception as e:
+        _add("tables", "FAIL", f"cannot read schema: {e}")
+        return _summary(path)
+    required = ["paper_wallet", "paper_positions"]
+    missing = [t for t in required if t not in names]
+    _add("tables", "FAIL" if missing else "OK",
+         f"missing {missing}" if missing else f"{len(names)} tables; core present")
+
+    if "paper_positions" not in names or "paper_wallet" not in names:
+        return _summary(path)
+
+    # 3) bad status values
+    try:
+        bad = conn.execute(
+            "SELECT COUNT(*) FROM paper_positions WHERE status NOT IN ('open','settled','closed')"
+        ).fetchone()[0]
+        _add("position_status", "WARN" if bad else "OK",
+             f"{bad} rows with an unexpected status" if bad else "all open/settled/closed")
+    except Exception as e:
+        _add("position_status", "WARN", f"status check error: {e}")
+
+    # 4) reconcile wallet running totals vs the positions ledger
+    try:
+        w = conn.execute("SELECT starting_bankroll, cash, realized_pnl FROM paper_wallet WHERE id=1").fetchone()
+        starting = float(w["starting_bankroll"] or 0.0)
+        wallet_cash = float(w["cash"] or 0.0)
+        wallet_realized = float(w["realized_pnl"] or 0.0)
+        agg = conn.execute(
+            "SELECT "
+            "COALESCE(SUM(stake),0) AS stake, "
+            "COALESCE(SUM(fee),0) AS fee, "
+            "COALESCE(SUM(CASE WHEN status IN ('settled','closed') THEN payout ELSE 0 END),0) AS payout, "
+            "COALESCE(SUM(CASE WHEN status IN ('settled','closed') THEN realized_pnl ELSE 0 END),0) AS realized, "
+            "COALESCE(SUM(CASE WHEN status='open' THEN stake ELSE 0 END),0) AS open_stake "
+            "FROM paper_positions"
+        ).fetchone()
+        # cash = starting - (stake debited on every open) - fees + payouts returned on close/settle
+        ledger_cash = starting - float(agg["stake"]) - float(agg["fee"]) + float(agg["payout"])
+        ledger_realized = float(agg["realized"])
+        cash_drift = wallet_cash - ledger_cash
+        realized_drift = wallet_realized - ledger_realized
+        cd = "OK" if abs(cash_drift) < 0.01 else "WARN"
+        _add("reconcile_cash", cd,
+             f"wallet ${wallet_cash:.2f} vs ledger ${ledger_cash:.2f} (drift ${cash_drift:+.2f})")
+        rd = "OK" if abs(realized_drift) < 0.01 else "WARN"
+        _add("reconcile_realized", rd,
+             f"wallet ${wallet_realized:.2f} vs ledger ${ledger_realized:.2f} (drift ${realized_drift:+.2f}) "
+             f"[Gate-2 reads the wallet number]")
+        # equity invariant: equity (cash + open stake) should equal starting + realized
+        equity = wallet_cash + float(agg["open_stake"])
+        inv_drift = equity - (starting + wallet_realized)
+        _add("equity_invariant", "OK" if abs(inv_drift) < 0.01 else "WARN",
+             f"equity ${equity:.2f} vs starting+realized ${starting + wallet_realized:.2f} (drift ${inv_drift:+.2f})")
+        _add("negative_cash", "FAIL" if wallet_cash < -0.01 else "OK", f"cash ${wallet_cash:.2f}")
+    except Exception as e:
+        _add("reconcile", "WARN", f"reconciliation error: {e}")
+
+    # 5) settled-vs-closed P&L split (so a hidden cash-out loss bucket is visible)
+    try:
+        sp = conn.execute("SELECT COALESCE(SUM(realized_pnl),0), COUNT(*) FROM paper_positions WHERE status='settled'").fetchone()
+        cp = conn.execute("SELECT COALESCE(SUM(realized_pnl),0), COUNT(*) FROM paper_positions WHERE status='closed'").fetchone()
+        _add("pnl_split", "OK",
+             f"settled n={sp[1]} ${sp[0]:.2f} · closed/cashed-out n={cp[1]} ${cp[0]:.2f}")
+    except Exception as e:
+        _add("pnl_split", "WARN", f"split error: {e}")
+
+    # 6) forecasts bet but never resolved (Gate-1 sample completeness)
+    if "swarm_forecasts" in names:
+        try:
+            tot = conn.execute("SELECT COUNT(*) FROM swarm_forecasts").fetchone()[0]
+            res = conn.execute("SELECT COUNT(*) FROM swarm_forecasts WHERE outcome IS NOT NULL").fetchone()[0]
+            _add("forecasts_resolved", "OK", f"{res}/{tot} swarm forecasts resolved (rest pending)")
+        except Exception as e:
+            _add("forecasts_resolved", "WARN", f"forecast check error: {e}")
+
+    try:
+        conn.close()
+    except Exception:
+        pass
+    return _summary(path)
+
+
+def _summary(path: str) -> dict:
+    n_fail = sum(1 for _, s, _ in CHECKS if s == "FAIL")
+    n_warn = sum(1 for _, s, _ in CHECKS if s == "WARN")
+    n_ok = sum(1 for _, s, _ in CHECKS if s == "OK")
+    return {"db": path, "checks": list(CHECKS), "ok": n_ok, "warn": n_warn, "fail": n_fail}
+
+
+def render(res: dict) -> None:
+    print("harness.db_check — read-only DB integrity + reconciliation")
+    print(f"  db: {res['db']}")
+    print("-" * 60)
+    for name, status, detail in res["checks"]:
+        print(f"[{status:<4}] {name:<20} {detail}")
+    print("-" * 60)
+    print(f"OK: {res['ok']} pass, {res['warn']} warn, {res['fail']} fail  (of {len(res['checks'])} checks)")
+
+
+def main(argv=None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    res = run()
+    if "--json" in argv:
+        import json
+        print(json.dumps(res, indent=2))
+    else:
+        render(res)
+    return 1 if res["fail"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
