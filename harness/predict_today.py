@@ -457,7 +457,14 @@ def daemon(cfg, max_hours=24.0, interval=60, include_mech=False):
                     m = cands[0]                      # one deep forecast per cycle (slow)
                     done.add(m["market_id"])
                     print("=" * 78)
-                    predict_one(m, cfg)
+                    # crash-safety: one bad market must never kill the cycle, so the
+                    # snapshot/heartbeat/run_end below still run for this cycle.
+                    try:
+                        predict_one(m, cfg)
+                    except Exception as e:
+                        if obs:
+                            obs.hooks.on_error(where="predict_today.daemon.market", exc=e, action="skip")
+                        print(f"[predict] market error ({type(e).__name__}): {e}", flush=True)
                     worked = True
                 st = wallet.get_state()
                 # Only snapshot/log when something actually changed — stops the idle spin from

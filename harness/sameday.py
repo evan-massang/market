@@ -185,104 +185,112 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
         if opened >= max_new or scouted >= max_scout:
             break
         mid, q = m["market_id"], m["question"]
-        with contextlib.ExitStack() as _es:
+        try:
+            with contextlib.ExitStack() as _es:
+                if obs:
+                    _es.enter_context(obs.market_ctx(market_id=mid, question=q))
+                    _es.enter_context(obs.forecast_ctx(forecast_id=obs.mint('f')))
+                if mid in held:
+                    continue
+                hl = _hours_left(m.get("end_date"))
+                if hl is None or hl < 0.3:
+                    continue
+                price = gamma.yes_price(m)
+                if price is None or not (0.02 <= price <= 0.98) or m.get("liquidity", 0) < 1000:
+                    continue
+                # (1) OPINION markets only — the swarm forecasts crowd-driven outcomes, not
+                #     sports/crypto/weather (those are MECHANICAL and get skipped here).
+                if classifier.tag_market(m, use_llm=False).label != "opinion":
+                    continue
+                # (2) event coherence is checked AFTER the forecast now (so we can bet the winning side
+                #     per leg): one YES per event, NO/fade unlimited. ev is defined here for that check.
+                ev = m.get("event_slug") or mid
+                if not use_ai:
+                    continue
+                # (3) the SWARM forecast drives the bet.
+                print(f"[sameday] AI scouting ({hl:.1f}h): {q[:50]}")
+                scouted += 1
+                p, bp, cons = _ai_scout(m, price)
+                if p is None:
+                    continue
+                # reliability guards B/C (Guard A = opinion-only filter above, Guard D = bet_events above):
+                # skip when the swarm number is untrustworthy. Thresholds shared with predict_today.
+                from harness.predict_today import (MAX_SWARM_CHALLENGER_DIVERGENCE as _MAXDIV,
+                                                   MIN_SWARM_CONSENSUS as _MINCONS)
+                if bp is not None and abs(p - bp) > _MAXDIV:
+                    print(f"  [sameday] DECISION: NO BET — swarm/challenger divergence {abs(p - bp):.2f}")
+                    if obs:
+                        obs.hooks.on_trade_skip(
+                            forecast_id=(obs.current().get("forecast_id") if obs else None),
+                            reason=f"divergence {abs(p - bp):.2f}",
+                            inputs={"market_id": mid, "p": p, "challenger_p": bp, "price": price, "layer": "guard"},
+                        )
+                    continue
+                if cons is not None and cons < _MINCONS:
+                    print(f"  [sameday] DECISION: NO BET — consensus {cons:.2f} < {_MINCONS:.2f}")
+                    if obs:
+                        obs.hooks.on_trade_skip(
+                            forecast_id=(obs.current().get("forecast_id") if obs else None),
+                            reason=f"consensus {cons:.2f} < {_MINCONS:.2f}",
+                            inputs={"market_id": mid, "p": p, "consensus": cons, "price": price, "layer": "guard"},
+                        )
+                    continue
+                # (4) bet ONLY on a real edge — conviction-scaled stake (bigger when surer).
+                from harness.predict_today import _conviction, _conviction_sizing, CONVICTION_CAP_MAX as _CAPMAX
+                conv = _conviction(p, bp, cons, p - price, had_data=False)   # sameday gathers no GDELT
+                lam, cap = _conviction_sizing(conv)
+                print(f"  [sameday] conviction {conv:.2f} → {lam:g}x Kelly, cap {cap:.0%}")
+                sz = sizing.size_bet(p, price, wallet.bankroll_for_sizing(), lam=lam, cap=cap, min_edge=min_edge)
+                if sz.side is None or sz.stake <= 0:
+                    print(f"[sameday] no bet: swarm {p:.0%} vs market {price:.0%} ({sz.reason})")
+                    if obs:
+                        obs.hooks.on_trade_skip(
+                            forecast_id=(obs.current().get("forecast_id") if obs else None),
+                            reason=f"no_edge: {sz.reason}",
+                            inputs={"market_id": mid, "p": p, "price": price, "edge": sz.edge, "layer": "sizer"},
+                        )
+                    continue
+                # Guard D — one YES (winner) per mutually-exclusive event; NO/fade unlimited.
+                from harness.predict_today import ONE_YES_PER_EVENT as _ONEYES, MAX_GROUP_PROB_SUM as _MAXSUM
+                if sz.side == "YES":
+                    if _ONEYES and ev in yes_events:
+                        print("  [sameday] DECISION: NO BET — already hold the YES (winner) leg in this event")
+                        if obs:
+                            obs.hooks.on_trade_skip(
+                                forecast_id=(obs.current().get("forecast_id") if obs else None),
+                                reason="already hold YES (winner) leg in this event",
+                                inputs={"market_id": mid, "event": ev, "side": sz.side, "layer": "guard"},
+                            )
+                        continue
+                    if yes_events.get(ev, 0.0) + p > _MAXSUM:
+                        print(f"  [sameday] DECISION: NO BET — incoherent group (YES-prob sum {yes_events.get(ev, 0.0) + p:.2f})")
+                        if obs:
+                            obs.hooks.on_trade_skip(
+                                forecast_id=(obs.current().get("forecast_id") if obs else None),
+                                reason=f"incoherent group (YES-prob sum {yes_events.get(ev, 0.0) + p:.2f})",
+                                inputs={"market_id": mid, "event": ev, "layer": "guard"},
+                            )
+                        continue
+                fr = wallet.open_position(mid, q, sz.side, p, price, sz.edge, sz.stake,
+                                          cfg=wallet.WalletConfig(max_bet_frac=_CAPMAX, max_exposure_frac=0.85),
+                                          end_date=m.get("end_date"), event_slug=ev)
+                if fr.opened:
+                    opened += 1; held.add(mid)
+                    if fr.side == "YES":
+                        yes_events[ev] = yes_events.get(ev, 0.0) + p
+                    journal.record_decision(mid, q, p, price, sz.edge,
+                                            fr.side, fr.stake, fr.fill_price, "swarm",
+                                            "LONG (YES)" if sz.side == "YES" else "SHORT (NO)", "bet",
+                                            f"Swarm sees {p:.0%} vs market {price:.0%} ({hl:.1f}h) -> {sz.side}, edge {sz.edge:+.1%}.")
+                    print(f"  [sameday] BET {fr.side} ${fr.stake:.2f} @ {fr.fill_price:.3f} "
+                          f"(swarm {p:.0%} vs mkt {price:.0%}, {hl:.1f}h) {q[:34]}")
+        except Exception as e:
+            # crash-safety: one bad market must never kill the daemon cycle.
             if obs:
-                _es.enter_context(obs.market_ctx(market_id=mid, question=q))
-                _es.enter_context(obs.forecast_ctx(forecast_id=obs.mint('f')))
-            if mid in held:
-                continue
-            hl = _hours_left(m.get("end_date"))
-            if hl is None or hl < 0.3:
-                continue
-            price = gamma.yes_price(m)
-            if price is None or not (0.02 <= price <= 0.98) or m.get("liquidity", 0) < 1000:
-                continue
-            # (1) OPINION markets only — the swarm forecasts crowd-driven outcomes, not
-            #     sports/crypto/weather (those are MECHANICAL and get skipped here).
-            if classifier.tag_market(m, use_llm=False).label != "opinion":
-                continue
-            # (2) event coherence is checked AFTER the forecast now (so we can bet the winning side
-            #     per leg): one YES per event, NO/fade unlimited. ev is defined here for that check.
-            ev = m.get("event_slug") or mid
-            if not use_ai:
-                continue
-            # (3) the SWARM forecast drives the bet.
-            print(f"[sameday] AI scouting ({hl:.1f}h): {q[:50]}")
-            scouted += 1
-            p, bp, cons = _ai_scout(m, price)
-            if p is None:
-                continue
-            # reliability guards B/C (Guard A = opinion-only filter above, Guard D = bet_events above):
-            # skip when the swarm number is untrustworthy. Thresholds shared with predict_today.
-            from harness.predict_today import (MAX_SWARM_CHALLENGER_DIVERGENCE as _MAXDIV,
-                                               MIN_SWARM_CONSENSUS as _MINCONS)
-            if bp is not None and abs(p - bp) > _MAXDIV:
-                print(f"  [sameday] DECISION: NO BET — swarm/challenger divergence {abs(p - bp):.2f}")
-                if obs:
-                    obs.hooks.on_trade_skip(
-                        forecast_id=(obs.current().get("forecast_id") if obs else None),
-                        reason=f"divergence {abs(p - bp):.2f}",
-                        inputs={"market_id": mid, "p": p, "challenger_p": bp, "price": price, "layer": "guard"},
-                    )
-                continue
-            if cons is not None and cons < _MINCONS:
-                print(f"  [sameday] DECISION: NO BET — consensus {cons:.2f} < {_MINCONS:.2f}")
-                if obs:
-                    obs.hooks.on_trade_skip(
-                        forecast_id=(obs.current().get("forecast_id") if obs else None),
-                        reason=f"consensus {cons:.2f} < {_MINCONS:.2f}",
-                        inputs={"market_id": mid, "p": p, "consensus": cons, "price": price, "layer": "guard"},
-                    )
-                continue
-            # (4) bet ONLY on a real edge — conviction-scaled stake (bigger when surer).
-            from harness.predict_today import _conviction, _conviction_sizing, CONVICTION_CAP_MAX as _CAPMAX
-            conv = _conviction(p, bp, cons, p - price, had_data=False)   # sameday gathers no GDELT
-            lam, cap = _conviction_sizing(conv)
-            print(f"  [sameday] conviction {conv:.2f} → {lam:g}x Kelly, cap {cap:.0%}")
-            sz = sizing.size_bet(p, price, wallet.bankroll_for_sizing(), lam=lam, cap=cap, min_edge=min_edge)
-            if sz.side is None or sz.stake <= 0:
-                print(f"[sameday] no bet: swarm {p:.0%} vs market {price:.0%} ({sz.reason})")
-                if obs:
-                    obs.hooks.on_trade_skip(
-                        forecast_id=(obs.current().get("forecast_id") if obs else None),
-                        reason=f"no_edge: {sz.reason}",
-                        inputs={"market_id": mid, "p": p, "price": price, "edge": sz.edge, "layer": "sizer"},
-                    )
-                continue
-            # Guard D — one YES (winner) per mutually-exclusive event; NO/fade unlimited.
-            from harness.predict_today import ONE_YES_PER_EVENT as _ONEYES, MAX_GROUP_PROB_SUM as _MAXSUM
-            if sz.side == "YES":
-                if _ONEYES and ev in yes_events:
-                    print("  [sameday] DECISION: NO BET — already hold the YES (winner) leg in this event")
-                    if obs:
-                        obs.hooks.on_trade_skip(
-                            forecast_id=(obs.current().get("forecast_id") if obs else None),
-                            reason="already hold YES (winner) leg in this event",
-                            inputs={"market_id": mid, "event": ev, "side": sz.side, "layer": "guard"},
-                        )
-                    continue
-                if yes_events.get(ev, 0.0) + p > _MAXSUM:
-                    print(f"  [sameday] DECISION: NO BET — incoherent group (YES-prob sum {yes_events.get(ev, 0.0) + p:.2f})")
-                    if obs:
-                        obs.hooks.on_trade_skip(
-                            forecast_id=(obs.current().get("forecast_id") if obs else None),
-                            reason=f"incoherent group (YES-prob sum {yes_events.get(ev, 0.0) + p:.2f})",
-                            inputs={"market_id": mid, "event": ev, "layer": "guard"},
-                        )
-                    continue
-            fr = wallet.open_position(mid, q, sz.side, p, price, sz.edge, sz.stake,
-                                      cfg=wallet.WalletConfig(max_bet_frac=_CAPMAX, max_exposure_frac=0.85),
-                                      end_date=m.get("end_date"), event_slug=ev)
-            if fr.opened:
-                opened += 1; held.add(mid)
-                if fr.side == "YES":
-                    yes_events[ev] = yes_events.get(ev, 0.0) + p
-                journal.record_decision(mid, q, p, price, sz.edge,
-                                        fr.side, fr.stake, fr.fill_price, "swarm",
-                                        "LONG (YES)" if sz.side == "YES" else "SHORT (NO)", "bet",
-                                        f"Swarm sees {p:.0%} vs market {price:.0%} ({hl:.1f}h) -> {sz.side}, edge {sz.edge:+.1%}.")
-                print(f"  [sameday] BET {fr.side} ${fr.stake:.2f} @ {fr.fill_price:.3f} "
-                      f"(swarm {p:.0%} vs mkt {price:.0%}, {hl:.1f}h) {q[:34]}")
+                obs.hooks.on_error(where="sameday.place_sameday", exc=e, action="skip",
+                                   context={"market_id": m.get("market_id")})
+            print(f"[sameday] market error ({type(e).__name__}): {e}")
+            continue
     return opened
 
 

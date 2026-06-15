@@ -60,11 +60,46 @@ except Exception:
 class Swarm:
     def __init__(self, agents: list[Agent] | None = None):
         init_db()
-        self.agents = agents or build_swarm()
+        # Distinguish "use defaults" (agents is None) from "explicitly empty"
+        # (agents == []). The old `agents or build_swarm()` silently expanded an
+        # empty list back to all 12 agents (truthiness), which both hid operator
+        # error and made the degenerate-size guard in forecast() unreachable.
+        self.agents = agents if agents is not None else build_swarm()
         self.debate_rounds = int(os.getenv("DEBATE_ROUNDS", "2"))
 
     def forecast(self, question: str, market_odds: float | None = None,
                  market_id: str | None = None, extra_context: str = "") -> dict:
+        # ── Degenerate swarm size: graceful, human-readable handling ──
+        # (HARNESS PATCH P1.1/P1.3) A swarm with zero agents cannot forecast.
+        # Return a clear, neutral result instead of crashing deep in the math
+        # pipeline (aggregate() raises "No estimates to aggregate"). We return
+        # BEFORE opening an obs forecast context — there is no forecast to
+        # observe — and keep the keys consumers read (probability / regime /
+        # consensus_score / individual_estimates) present so nothing KeyErrors.
+        n_agents = len(self.agents)
+        if n_agents < 1:
+            console.print()
+            console.print(Panel(
+                f"  [bold {COLORS['warning']}]No agents in swarm — cannot run a forecast.[/]\n"
+                f"  [{COLORS['dim']}]Build a swarm with at least 1 agent (use --size N, N>=1; "
+                f"N>=3 enables full herding / cascade / contrarian diagnostics).[/]",
+                border_style=COLORS["warning"],
+                title=f"[bold {COLORS['warning']}]<<<>>>  FORECAST ABORTED[/]",
+                title_align="left",
+                padding=(1, 2),
+            ))
+            return {
+                "probability": 0.5,
+                "probability_pct": "50.0%",
+                "consensus_score": 0.0,
+                "std_dev": 0.0,
+                "n_agents": 0,
+                "individual_estimates": [],
+                "regime": None,
+                "aborted": True,
+                "note": "No agents in swarm; returned neutral 0.5 (no forecast performed).",
+            }
+
         with (obs.forecast_ctx(forecast_id=(obs.current().get('forecast_id') or obs.mint('f')), market_id=market_id, question=question) if obs else contextlib.nullcontext()):
             if obs:
                 obs.hooks.on_forecast_start(
@@ -82,6 +117,19 @@ class Swarm:
                 subtitle_align="right",
                 padding=(1, 2),
             ))
+
+            # ── Small-swarm notice ──
+            # (HARNESS PATCH P1.1/P1.3) With <3 agents the HHI/quintile herding
+            # math and the contrarian/cascade diagnostics are not meaningful; they
+            # degrade gracefully (herding_score=0.0) rather than crash. Tell the
+            # operator so a degraded run is never mistaken for a full one.
+            if n_agents < 3:
+                console.print()
+                console.print(
+                    f"  [{COLORS['warning']}]Note: {n_agents} agent(s) — herding / "
+                    f"information-cascade / contrarian diagnostics are degraded "
+                    f"(need >=3 agents for the full game-theory analysis).[/]"
+                )
 
             # ── Data Fetch ──
             console.print()
@@ -268,11 +316,15 @@ class Swarm:
             result["shapley"] = shapley
 
             # 24. Regime Detection (Hidden Markov Model)
+            # Defensive .get() defaults (HARNESS PATCH): herding always carries
+            # herding_score now (see core/game_theory.py), but reading via .get
+            # keeps regime_input well-formed even for tiny/degraded swarms so
+            # detect_regime's required-key guard ({std_dev, herding_score}) holds.
             regime_input = {
-                "mean_prob": result["probability"],
-                "std_dev": result["std_dev"],
-                "herding_score": herding["herding_score"],
-                "cascade_rate": cascade["convergence_rate"] if cascade else 0,
+                "mean_prob": result.get("probability", 0.5),
+                "std_dev": result.get("std_dev", 0.0),
+                "herding_score": herding.get("herding_score", 0.0),
+                "cascade_rate": cascade.get("convergence_rate", 0.0) if cascade else 0,
             }
             regime = detect_regime(regime_input)
             result["regime"] = regime
@@ -482,15 +534,15 @@ class Swarm:
         console.print(f"  [bold {COLORS['accent']}]{'━' * 3} DIAGNOSTICS {'━' * 40}[/]")
         console.print()
 
-        # Herding
-        if herding["herding_detected"]:
+        # Herding (defensive .get() — HARNESS PATCH: tolerant of tiny/degraded swarms)
+        if herding.get("herding_detected"):
             h_icon = f"[{COLORS['warning']}]![/]"
-            h_text = f"[{COLORS['warning']}]Herding detected[/]  score={herding['herding_score']:.2f}  direction={herding['herd_direction']}"
-            if herding["contrarians"]:
-                h_text += f"\n                         [{COLORS['dim']}]Contrarians: {', '.join(herding['contrarians'])}[/]"
+            h_text = f"[{COLORS['warning']}]Herding detected[/]  score={herding.get('herding_score', 0.0):.2f}  direction={herding.get('herd_direction')}"
+            if herding.get("contrarians"):
+                h_text += f"\n                         [{COLORS['dim']}]Contrarians: {', '.join(herding.get('contrarians', []))}[/]"
         else:
             h_icon = f"[{COLORS['positive']}]OK[/]"
-            h_text = f"[{COLORS['dim']}]No herding  score={herding['herding_score']:.2f}[/]"
+            h_text = f"[{COLORS['dim']}]No herding  score={herding.get('herding_score', 0.0):.2f}[/]"
         console.print(f"  {h_icon}  Herding     {h_text}")
 
         # Nash

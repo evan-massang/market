@@ -16,7 +16,19 @@ def detect_herding(estimates: list[AgentEstimate]) -> dict:
     Uses the Herfindahl-Hirschman Index (HHI) adapted for probability space.
     """
     if len(estimates) < 3:
-        return {"herding_detected": False, "hhi": 0}
+        # Too few agents to assess herding: the HHI / quintile-bucket math is
+        # undefined for 1-2 points. Return a COMPLETE, shape-consistent dict so
+        # every consumer (regime_input @ swarm.py and the diagnostics display)
+        # can read the same keys unconditionally. herding_score=0.0 is the
+        # correct semantics here ("no herding" — a swarm this small cannot herd).
+        return {
+            "herding_score": 0.0,
+            "herding_detected": False,
+            "herd_direction": None,
+            "hhi": 0.0,
+            "contrarians": [],
+            "contrarian_signal": False,
+        }
 
     probs = [e.probability for e in estimates]
     mean_p = sum(probs) / len(probs)

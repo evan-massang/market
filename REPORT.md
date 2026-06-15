@@ -59,3 +59,32 @@ Built and verified with multi-agent workflows in phases (recon+design → founda
 - Profitability is an open empirical question — bigger/faster models and more guards improve the *odds*, not the certainty. No claim is made that it beats the market yet.
 - A pre-existing swarm bug (`KeyError 'herding_score'`) crashes forecasts at swarm size 2 (needs ≥3 agents); the daemons use size 5 and are unaffected — and obs correctly logs such crashes as `error` events.
 - Real-money trading remains out of scope and unimplemented.
+
+## 6. How to run & verify (Windows)
+
+Everything runs from `polyswarm/` with the venv interpreter and `PYTHONUTF8=1` (PowerShell shown below; on a POSIX shell use `PYTHONUTF8=1 ./.venv/Scripts/python.exe …` with the same module paths). The five PowerShell daemon launchers (`1_…`–`5_…`) live one level **above** `polyswarm/`, in `C:\Users\OMEN\Pictures\Polymarket\`.
+
+**Preflight — `python -m harness.doctor`** runs ~12 read-only PASS/WARN/FAIL probes (Python / deps / `.env` / DB / Ollama / Gamma / GDELT / Wikipedia / MiroFish / dashboard / heartbeat / obs hash-chain). It never writes, never trades, and never prints any `*_API_KEY` value; `--json` emits machine-readable output; it exits non-zero only on a `FAIL` (a `WARN`, e.g. GDELT throttling or a down viewer, does not):
+
+```powershell
+$env:PYTHONUTF8 = "1"; .\.venv\Scripts\python.exe -m harness.doctor
+```
+```text
+[PASS] ollama     up, 9 models, 'qwen2.5:3b' present
+[PASS] obs_chain  chain intact: run_68b1c7b3d5 (204 lines)
+[WARN] gdelt      HTTP 429 from GDELT doc API (rate-limited / throttled)
+------------------------------------------------------------
+OK: 11 pass, 1 warn, 0 fail  (of 12 checks)
+```
+
+**Tests — `python run_tests.py`** runs the full acceptance + unit suite (including the 7 obs acceptance criteria in §3; individual obs tests can also be run directly, e.g. `python -m harness.obs.tests.test_hash_chain`).
+
+**One forecast — `python -m harness.predict_today once --max 1 --size 5 --rounds 1 --min-edge 0.03`** runs the full find→gather→think→bet chain (minutes per forecast on CPU). Each market ends in `BET PLACED …`, a `DECISION: NO BET — <guard reason>`, or — now that the per-market body is crash-wrapped — a logged `obs.hooks.on_error` that the loop survives so one bad market never kills the pass.
+
+**Gates — `python -m harness.scoreboard`** (read-only, no network):
+```text
+ Resolved opinion markets: n = 0  (gate needs >= 50)
+ GATE 1  (model Brier < market Brier, n>=50):  FAIL   (no resolved markets yet)
+ GATE 2  (paper bankroll grew after costs):                 FAIL   (start $1000.00 -> equity $978.80, realized $-61.63)
+ >>> gates not both passed — stay on paper
+```

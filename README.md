@@ -75,23 +75,100 @@ All **7 acceptance criteria pass**: correlation IDs, explain/replay, frozen-fore
 
 ## How to run it
 
-Four processes (Windows PowerShell launchers at the repo root); Ollama must be running:
+Ollama must be running. **Run the preflight health check first** — it is read-only (~12 probes), never writes, and never trades:
 
 ```powershell
-.\1_mirofish_backend.ps1    # MiroFish crowd-sim Flask service  (:5001)
-.\2_mirofish_frontend.ps1   # MiroFish web UI                   (:3000)
-.\3_sameday_daemon.ps1      # favorite-longshot + AI same-day daemon
-.\5_ai_pipeline.ps1         # the precise AI pipeline daemon (find→gather→MiroFish→LLM→bet)
-.\4_dashboard.ps1           # live monitor                      (http://localhost:8800)
+# from polyswarm\  (PowerShell)
+$env:PYTHONUTF8 = "1"
+.\.venv\Scripts\python.exe -m harness.doctor          # add --json for machine-readable output
 ```
 
-Manual / one-off:
-```bash
-# from polyswarm/ , with PYTHONUTF8=1 and ./.venv/Scripts/python.exe
-python -m harness.predict_today once --max 1 --size 5 --rounds 1 --min-edge 0.03
-python -m harness.predict_today daemon --with-mirofish --size 5 --rounds 1 --mf-wait 360
-python -m harness.scoreboard          # read the two gates
-python -m harness.loop status
+Expected output on a healthy box (a `WARN` is tolerated — it never fails the run; only a `FAIL` makes doctor exit non-zero):
+
+```text
+harness.doctor — read-only health check
+------------------------------------------------------------
+[PASS] python     3.11.9 (>= 3.11)
+[PASS] deps       all 7 importable (httpx, fastapi, uvicorn, dotenv, pydantic, sqlalchemy, sqlite3)
+[PASS] env        MODEL_FAST=qwen2.5:3b, OLLAMA_BASE_URL set
+[PASS] db         15 tables, all required present (polyswarm.db)
+[PASS] ollama     up, 9 models, 'qwen2.5:3b' present
+[PASS] gamma      reachable, 1 market returned
+[PASS] wikipedia  reachable, summary 'extract' present
+[PASS] mirofish   backend up (:5001, external mode)
+[PASS] dashboard  serving (http://localhost:8800)
+[PASS] heartbeat  .heartbeat.json touched 407s ago
+[PASS] obs_chain  chain intact: run_68b1c7b3d5 (204 lines)
+[WARN] gdelt      HTTP 429 from GDELT doc API (rate-limited / throttled)
+------------------------------------------------------------
+OK: 11 pass, 1 warn, 0 fail  (of 12 checks)
+```
+
+**The five daemons** are Windows PowerShell launchers that live in `C:\Users\OMEN\Pictures\Polymarket\` — one level **above** the `polyswarm/` package (they are *not* in the git repo root). Launch them in numeric order:
+
+```powershell
+# from C:\Users\OMEN\Pictures\Polymarket\
+.\1_mirofish_backend.ps1    # MiroFish crowd-sim Flask service    (:5001)
+.\2_mirofish_frontend.ps1   # MiroFish web UI                     (:3000)
+.\3_sameday_daemon.ps1      # same-day swarm daemon            -> sameday_live.log
+.\4_dashboard.ps1           # live monitor    (http://localhost:8800)
+.\5_ai_pipeline.ps1         # precise AI pipeline daemon (find->gather->MiroFish->LLM->bet) -> ai_night.log
+```
+
+**Manual / one-off** — run from `polyswarm/` with the venv interpreter and UTF-8 on:
+
+```powershell
+# from polyswarm\  (PowerShell)
+$env:PYTHONUTF8 = "1"
+.\.venv\Scripts\python.exe -m harness.predict_today once --max 1 --size 5 --rounds 1 --min-edge 0.03
+.\.venv\Scripts\python.exe -m harness.predict_today daemon --with-mirofish --size 5 --rounds 1 --mf-wait 360
+.\.venv\Scripts\python.exe -m harness.scoreboard      # the two gates (read-only, no network)
+.\.venv\Scripts\python.exe -m harness.loop status     # paper wallet + open positions
+.\.venv\Scripts\python.exe -m harness.doctor          # the preflight health check (above)
+.\.venv\Scripts\python.exe run_tests.py               # full acceptance + unit test suite
+```
+
+The same commands on a POSIX shell (e.g. Git Bash): `PYTHONUTF8=1 ./.venv/Scripts/python.exe -m harness.predict_today once …` — identical module paths.
+
+`predict_today once` runs the full find→gather→think→bet chain on the soonest same-day markets (minutes per forecast on CPU). An abridged healthy run:
+
+```text
+  PRECISE same-day AI pipeline — find -> gather -> think -> bet (today only, <24h)
+
+[1/4] FIND — scanning same-day markets the AI can predict…
+      Picked 1 market(s) resolving today:
+        - [opinion] 7.4h - Will <event> happen by <date>?
+==============================================================================
+MARKET: Will <event> happen by <date>?
+  resolves in 7.4h (today) · market YES 38% · class=opinion · 0x1a2b3c4d5e6f78…
+[2/4] GATHER — pulling GDELT news/sentiment + microstructure signals…
+      gathered 2143 chars of real context in 6s
+[3/4] THINK — 5-persona swarm forecasting WITH that data (slow on CPU)…
+      swarm: 44.0% YES vs market 38% · regime=… · consensus=0.71 · 53s
+      single-LLM challenger (A/B): 41.0% YES
+[4/4] BET — sizing on the swarm's edge vs the market…
+      conviction 0.62 → 0.41x Kelly, cap 7%
+      edge +6.0% → kelly stake (within cap)
+      BET PLACED: YES $12.40 @ 0.391 — resolves in 7.4h
+==============================================================================
+DONE — 1 data-driven bet(s) placed. wallet: cash $… · equity $… · realized $… · N open
+```
+
+(Numbers vary per market; a market that fails a reliability guard prints `DECISION: NO BET — <reason>` instead. One bad market never aborts the pass — the per-market body is crash-wrapped, the failure is logged via the obs error hook, and the loop continues to the next market.)
+
+`scoreboard` prints the two go/no-go gates from `polyswarm.db` (read-only, no network):
+
+```text
+==================================================================
+ POLYMARKET HARNESS — DUAL-GATE SCOREBOARD  (paper, out-of-sample)
+==================================================================
+ Resolved opinion markets: n = 0  (gate needs >= 50)
+ …
+ GATE 1  (model Brier < market Brier, n>=50):  FAIL   (no resolved markets yet)
+ GATE 2  (paper bankroll grew after costs):                 FAIL   (start $1000.00 -> equity $978.80, realized $-61.63)
+
+ >>> gates not both passed — stay on paper
+==================================================================
 ```
 
 **Model**: `MODEL_FAST` in `polyswarm/.env` (currently `qwen2.5:3b` — 1.5× faster than 7B, consistent enough to clear the guards; `gemma2:2b` is faster but too noisy). 14B+ does not fit 16 GB.
@@ -113,6 +190,7 @@ python -m harness.loop status
 | `challenger.py` | single-LLM A/B baseline |
 | `mirofish*.py` | MiroFish crowd-sim client + signal distillation |
 | `scoreboard.py` | dual-Brier + the two gates |
+| `doctor.py` | read-only preflight health check (~12 PASS/WARN/FAIL probes); never writes/trades |
 | `journal.py` | dashboard time-series (equity, decisions) |
 | `dashboard.py` | FastAPI live monitor (`:8800`) — equity/P&L, gates, agent feed, MiroFish graph |
 | `obs/` | observability/audit layer (see above) |

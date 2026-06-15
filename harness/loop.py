@@ -211,99 +211,108 @@ def run_once(cfg: LoopConfig) -> dict:
         for m in markets:
             if picked >= cfg.max_markets:
                 break
-            mid = m["market_id"]
-            ok, cls = classifier.should_forecast(
-                m, use_llm=cfg.use_llm_classifier, min_volume=cfg.min_volume, min_liquidity=cfg.min_liquidity)
-            if cls.label == "opinion":
-                summary["opinion"] += 1
-            if not ok:
-                _reason = "not_opinion" if cls.label != "opinion" else "below_liquidity_floor"
-                if obs:
-                    obs.hooks.on_classify(mid, m.get("question"), cls.label, getattr(cls, "signals", None), False, _reason)
-                skip(_reason)
-                continue
-            if mid in held:
-                if obs:
-                    obs.hooks.on_classify(mid, m.get("question"), cls.label, getattr(cls, "signals", None), False, "already_held")
-                skip("already_held"); continue
-            price = gamma.yes_price(m)
-            if price is None or not (0.0 < price < 1.0):
-                if obs:
-                    obs.hooks.on_classify(mid, m.get("question"), cls.label, getattr(cls, "signals", None), False, "no_yes_price")
-                skip("no_yes_price"); continue
-            if cfg.max_days_to_resolution:
-                days = _days_until(m.get("end_date"))
-                if days is not None and days > cfg.max_days_to_resolution:
+            try:
+                mid = m["market_id"]
+                ok, cls = classifier.should_forecast(
+                    m, use_llm=cfg.use_llm_classifier, min_volume=cfg.min_volume, min_liquidity=cfg.min_liquidity)
+                if cls.label == "opinion":
+                    summary["opinion"] += 1
+                if not ok:
+                    _reason = "not_opinion" if cls.label != "opinion" else "below_liquidity_floor"
                     if obs:
-                        obs.hooks.on_classify(mid, m.get("question"), cls.label, getattr(cls, "signals", None), False, "resolves_too_far_out")
-                    skip("resolves_too_far_out"); continue
+                        obs.hooks.on_classify(mid, m.get("question"), cls.label, getattr(cls, "signals", None), False, _reason)
+                    skip(_reason)
+                    continue
+                if mid in held:
+                    if obs:
+                        obs.hooks.on_classify(mid, m.get("question"), cls.label, getattr(cls, "signals", None), False, "already_held")
+                    skip("already_held"); continue
+                price = gamma.yes_price(m)
+                if price is None or not (0.0 < price < 1.0):
+                    if obs:
+                        obs.hooks.on_classify(mid, m.get("question"), cls.label, getattr(cls, "signals", None), False, "no_yes_price")
+                    skip("no_yes_price"); continue
+                if cfg.max_days_to_resolution:
+                    days = _days_until(m.get("end_date"))
+                    if days is not None and days > cfg.max_days_to_resolution:
+                        if obs:
+                            obs.hooks.on_classify(mid, m.get("question"), cls.label, getattr(cls, "signals", None), False, "resolves_too_far_out")
+                        skip("resolves_too_far_out"); continue
 
-            picked += 1
-            if obs:
-                obs.hooks.on_classify(mid, m.get("question"), cls.label, getattr(cls, "signals", None), True, "candidate")
-            with contextlib.ExitStack() as _mes:
+                picked += 1
                 if obs:
-                    _mes.enter_context(obs.market_ctx(market_id=mid, question=m["question"]))
-                    _mes.enter_context(obs.forecast_ctx(forecast_id=obs.mint('f')))
-                print(f"[{picked}/{cfg.max_markets}] {m['question'][:70]}")
-                print(f"      market_id={mid[:18]}…  yes_price={price:.3f}  vol=${m['volume']:,.0f}")
-                try:
-                    enrichment = "" if cfg.dry_run else _build_enrichment(m, cfg)
-                    p, meta = _forecast(m, price, cfg, enrichment)
-                    summary["forecast"] += 1
-                    # CHALLENGER — independent single-LLM forecast on the SAME market (parallel
-                    # A/B, never chained). Does not drive betting; pure calibration control.
-                    if cfg.challenger and not cfg.dry_run:
-                        bp = challenger.single_llm_forecast(m["question"], price, enrichment)
-                        if bp is not None:
-                            challenger.save_baseline(mid, m["question"], bp, price)
-                            print(f"      challenger single-LLM p={bp:.3f}")
-                    bankroll = wallet.bankroll_for_sizing()
-                    sz = sizing.size_bet(p, price, bankroll, lam=cfg.lam, cap=cfg.cap, min_edge=cfg.min_edge)
-                    print(f"      model_p={p:.3f}  market_p={price:.3f}  edge={sz.edge:+.3f}  -> {sz.reason}")
-                    regime, sig = meta.get("regime", ""), ("LONG (YES)" if sz.edge > 0 else "SHORT (NO)")
-                    if sz.side is None:
-                        why = f"Swarm {p:.0%} vs market {price:.0%} (edge {sz.edge:+.1%}). No bet — {sz.reason}."
-                        journal.record_decision(mid, m["question"], p, price, sz.edge, None, 0.0, None,
-                                                regime, "no edge", "no_bet", why)
-                        skip("no_edge_or_below_min"); print()
-                        if obs:
-                            obs.hooks.on_trade_skip(
-                                forecast_id=(obs.current().get("forecast_id") if obs else None),
-                                reason="no_edge_or_below_min",
-                                inputs={"market_id": mid, "p": p, "price": price, "edge": sz.edge, "layer": "sizer"},
-                            )
-                        continue
-                    fr = wallet.open_position(mid, m["question"], sz.side, p, price, sz.edge, sz.stake,
-                                              end_date=m.get("end_date"))
-                    if fr.opened:
-                        summary["opened"] += 1
-                        why = (f"Swarm sees {p:.0%} vs the market's {price:.0%} — a {sz.edge:+.1%} edge. "
-                               f"Buying {fr.side} @ {fr.fill_price:.3f} with ${fr.stake:.2f} ({sz.reason}).")
-                        journal.record_decision(mid, m["question"], p, price, sz.edge, fr.side, fr.stake,
-                                                fr.fill_price, regime, sig, "bet", why)
-                        print(f"      OPENED {fr.side} stake=${fr.stake:.2f} fill={fr.fill_price:.3f} "
-                              f"shares={fr.shares:.2f}  bankroll now ${wallet.bankroll_for_sizing():.2f}")
-                    else:
-                        why = f"Sized {sz.side} ${sz.stake:.2f} but wallet rejected: {fr.reason}"
-                        journal.record_decision(mid, m["question"], p, price, sz.edge, sz.side, 0.0, None,
-                                                regime, sig, "rejected", why)
-                        skip("wallet_rejected"); print(f"      wallet rejected: {fr.reason}")
-                        if obs:
-                            obs.hooks.on_trade_skip(
-                                forecast_id=(obs.current().get("forecast_id") if obs else None),
-                                reason=f"wallet_rejected: {fr.reason}",
-                                inputs={"market_id": mid, "side": sz.side, "stake": sz.stake, "layer": "wallet"},
-                            )
-                except Exception as e:
-                    skip("error")
+                    obs.hooks.on_classify(mid, m.get("question"), cls.label, getattr(cls, "signals", None), True, "candidate")
+                with contextlib.ExitStack() as _mes:
                     if obs:
-                        obs.hooks.on_error(where="loop.run_once", exc=e, action="skip",
-                                           context={"market_id": mid})
-                    print(f"      ERROR: {type(e).__name__}: {e}")
-                    if cfg.dry_run:
-                        traceback.print_exc()
-                print()
+                        _mes.enter_context(obs.market_ctx(market_id=mid, question=m["question"]))
+                        _mes.enter_context(obs.forecast_ctx(forecast_id=obs.mint('f')))
+                    print(f"[{picked}/{cfg.max_markets}] {m['question'][:70]}")
+                    print(f"      market_id={mid[:18]}…  yes_price={price:.3f}  vol=${m['volume']:,.0f}")
+                    try:
+                        enrichment = "" if cfg.dry_run else _build_enrichment(m, cfg)
+                        p, meta = _forecast(m, price, cfg, enrichment)
+                        summary["forecast"] += 1
+                        # CHALLENGER — independent single-LLM forecast on the SAME market (parallel
+                        # A/B, never chained). Does not drive betting; pure calibration control.
+                        if cfg.challenger and not cfg.dry_run:
+                            bp = challenger.single_llm_forecast(m["question"], price, enrichment)
+                            if bp is not None:
+                                challenger.save_baseline(mid, m["question"], bp, price)
+                                print(f"      challenger single-LLM p={bp:.3f}")
+                        bankroll = wallet.bankroll_for_sizing()
+                        sz = sizing.size_bet(p, price, bankroll, lam=cfg.lam, cap=cfg.cap, min_edge=cfg.min_edge)
+                        print(f"      model_p={p:.3f}  market_p={price:.3f}  edge={sz.edge:+.3f}  -> {sz.reason}")
+                        regime, sig = meta.get("regime", ""), ("LONG (YES)" if sz.edge > 0 else "SHORT (NO)")
+                        if sz.side is None:
+                            why = f"Swarm {p:.0%} vs market {price:.0%} (edge {sz.edge:+.1%}). No bet — {sz.reason}."
+                            journal.record_decision(mid, m["question"], p, price, sz.edge, None, 0.0, None,
+                                                    regime, "no edge", "no_bet", why)
+                            skip("no_edge_or_below_min"); print()
+                            if obs:
+                                obs.hooks.on_trade_skip(
+                                    forecast_id=(obs.current().get("forecast_id") if obs else None),
+                                    reason="no_edge_or_below_min",
+                                    inputs={"market_id": mid, "p": p, "price": price, "edge": sz.edge, "layer": "sizer"},
+                                )
+                            continue
+                        fr = wallet.open_position(mid, m["question"], sz.side, p, price, sz.edge, sz.stake,
+                                                  end_date=m.get("end_date"))
+                        if fr.opened:
+                            summary["opened"] += 1
+                            why = (f"Swarm sees {p:.0%} vs the market's {price:.0%} — a {sz.edge:+.1%} edge. "
+                                   f"Buying {fr.side} @ {fr.fill_price:.3f} with ${fr.stake:.2f} ({sz.reason}).")
+                            journal.record_decision(mid, m["question"], p, price, sz.edge, fr.side, fr.stake,
+                                                    fr.fill_price, regime, sig, "bet", why)
+                            print(f"      OPENED {fr.side} stake=${fr.stake:.2f} fill={fr.fill_price:.3f} "
+                                  f"shares={fr.shares:.2f}  bankroll now ${wallet.bankroll_for_sizing():.2f}")
+                        else:
+                            why = f"Sized {sz.side} ${sz.stake:.2f} but wallet rejected: {fr.reason}"
+                            journal.record_decision(mid, m["question"], p, price, sz.edge, sz.side, 0.0, None,
+                                                    regime, sig, "rejected", why)
+                            skip("wallet_rejected"); print(f"      wallet rejected: {fr.reason}")
+                            if obs:
+                                obs.hooks.on_trade_skip(
+                                    forecast_id=(obs.current().get("forecast_id") if obs else None),
+                                    reason=f"wallet_rejected: {fr.reason}",
+                                    inputs={"market_id": mid, "side": sz.side, "stake": sz.stake, "layer": "wallet"},
+                                )
+                    except Exception as e:
+                        skip("error")
+                        if obs:
+                            obs.hooks.on_error(where="loop.run_once", exc=e, action="skip",
+                                               context={"market_id": mid})
+                        print(f"      ERROR: {type(e).__name__}: {e}")
+                        if cfg.dry_run:
+                            traceback.print_exc()
+                    print()
+            except Exception as e:
+                # crash-safety: one malformed market must never abort the whole pass.
+                skip("error")
+                if obs:
+                    obs.hooks.on_error(where="loop.run_once.market", exc=e, action="skip",
+                                       context={"market_id": m.get("market_id")})
+                print(f"      ERROR (market): {type(e).__name__}: {e}")
+                continue
 
         st = wallet.get_state()
         journal.record_snapshot(st["cash"], st["equity"], st["realized_pnl"], st["open_exposure"], st["n_open"])
