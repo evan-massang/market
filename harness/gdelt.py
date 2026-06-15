@@ -38,6 +38,11 @@ import time
 
 import httpx
 
+try:
+    from harness import obs
+except Exception:
+    obs = None
+
 # ── endpoint / client config ─────────────────────────────────────────────────
 BASE_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 USER_AGENT = "PolymarketHarness/1.0"
@@ -141,12 +146,33 @@ def _get(params: dict) -> dict:
 
     _wait_for_slot()
 
+    _t0 = time.perf_counter()
     try:
         resp = httpx.get(BASE_URL, params=params, headers=HEADERS, timeout=HTTP_TIMEOUT)
     except httpx.HTTPError:
         # Network hiccup / timeout — back off a touch and report empty.
         _register_throttle()
         return {}
+    _latency_ms = (time.perf_counter() - _t0) * 1000.0
+
+    # obs (leaf emit): capture the raw body BEFORE the _looks_like_json throttle guard
+    # so throttle plaintext bodies (HTTP 200) are preserved for the audit trail. This
+    # does NOT change the {}/data return or the throttle handling below.
+    if obs:
+        try:
+            _raw_text = resp.text
+            try:
+                _parsed = resp.json()
+            except Exception:
+                _parsed = None
+            _item_count = len(_parsed) if hasattr(_parsed, "__len__") else 0
+            obs.hooks.on_data_fetch(
+                source="gdelt", endpoint=BASE_URL, params=dict(params),
+                raw_text=_raw_text, item_count=(_item_count or 0),
+                latency_ms=_latency_ms,
+            )
+        except Exception:
+            pass
 
     # Guard #1: is the body even JSON? A plain-text body == we were throttled.
     if not _looks_like_json(resp):
@@ -295,10 +321,19 @@ def gdelt_context(query: str, timespan: str = "14d", max_records: int = 25) -> d
       {query, articles, tone_timeline, volume_timeline, latest_tone, attention_trend}.
     """
     articles = gdelt_articles(query, timespan=timespan, max_records=max_records)
-    tone_timeline = gdelt_tone_timeline(query, timespan=timespan)
-    volume_timeline = gdelt_volume_timeline(query, timespan=timespan)
+    used_query = query
+    # Broaden once if the narrow AND-query found nothing: fall back to just the lead entity,
+    # so we still get headlines + a tone timeline instead of "no coverage / no tone data".
+    if not articles and query.split():
+        broad = query[1:].split('"', 1)[0] if query.startswith('"') else query.split()[0]
+        if broad and broad != query:
+            retry = gdelt_articles(broad, timespan=timespan, max_records=max_records)
+            if retry:
+                articles, used_query = retry, broad
+    tone_timeline = gdelt_tone_timeline(used_query, timespan=timespan)
+    volume_timeline = gdelt_volume_timeline(used_query, timespan=timespan)
     return {
-        "query": query,
+        "query": used_query,
         "articles": articles,
         "tone_timeline": tone_timeline,
         "volume_timeline": volume_timeline,
@@ -330,45 +365,35 @@ _STOPWORDS = {
     "than", "then", "from", "into", "out", "up", "down", "more", "most", "least",
     "any", "all", "some", "no", "not",
 }
-# Domain topic terms preferred as the single salient keyword paired with an entity.
+# Domain topic terms preferred as the salient keyword(s) paired with an entity.
 _TOPIC_KEYWORDS = [
     "election", "approval", "primary", "caucus", "nominee", "nomination", "referendum",
-    "vote", "impeach", "impeachment", "resign", "ceasefire", "war", "invasion", "sanctions",
-    "ban", "recession", "rate", "inflation", "championship", "verdict", "indictment",
-    "win", "reelection", "poll", "shutdown", "strike", "treaty", "summit",
+    "vote", "impeach", "impeachment", "resign", "resignation", "ceasefire", "truce", "war",
+    "invasion", "sanctions", "sanction", "ban", "recession", "rate", "inflation",
+    "championship", "verdict", "indictment", "indict", "win", "reelection", "poll",
+    "shutdown", "strike", "airstrike", "treaty", "summit",
+    # geopolitical / event terms that were arriving as 'unknown' topics:
+    "peace", "deal", "agreement", "airspace", "blockade", "hostage", "prisoner", "pardon",
+    "arrest", "attack", "airspace", "tariff", "tariffs", "default", "bankruptcy", "merger",
+    "acquisition", "lawsuit", "release", "released", "launch", "draw", "hormuz", "nuclear",
 ]
+# Generic / low-specificity entities — deprioritized so a SPECIFIC entity (Iran, Hormuz)
+# beats a generic one (US, United States) when building the query.
+_GENERIC_ENTITIES = {
+    "us", "u.s.", "usa", "america", "american", "uk", "eu", "un", "world", "global",
+    "united", "states", "state", "national", "international", "government",
+}
 
 
-def build_query(question: str) -> str:
-    """Derive a focused GDELT query from a Polymarket question.
-
-    Strips the leading auxiliary verb ('Will'/'Did'/...) and trailing '?', drops a
-    trailing temporal qualifier ('in 2026', 'by the end of 2026'), condenses very
-    long questions to their salient terms, and quotes multi-word phrases so GDELT
-    does an exact-phrase match. Intentionally simple and robust — never raises.
-
-    Examples:
-      "Will Venezuela hold an election in 2026?"  -> '"Venezuela hold election"'
-      "Will Bitcoin hit $100k?"                   -> '"Bitcoin hit $100k"'
-      "Trump approval rating above 50%?"          -> '"Trump approval rating above 50%"'
-    """
-    q = (question or "").strip()
-    if not q:
-        return ""
-    q = q.rstrip(" ?.!")
+def extract_entities(question: str) -> list[str]:
+    """Proper-noun runs (Capitalized, non-stopword, <=3 words) from a question, ordered
+    SPECIFIC-first (generic country/government words deprioritized), de-duplicated. Reused
+    by build_query AND the Wikipedia source to ground the forecast on the right subject."""
+    q = (question or "").strip().rstrip(" ?.!")
     q = _LEADING_AUX.sub("", q, count=1)
     q = _TEMPORAL_TAIL.sub("", q).strip()
-    q = re.sub(r"\s+", " ", q).strip(" ,;:-")
-    if not q:
-        return ""
-
-    raw = q.split()
-
-    # 1) Primary entity = the longest run of consecutive proper-noun (Capitalized,
-    #    non-stopword) tokens, capped at 3 words. Quoting a SHORT entity returns
-    #    results; quoting a long phrase (the old behavior) almost never matched.
     runs, cur = [], []
-    for w in raw:
+    for w in q.split():
         tok = w.strip(",.;:'\"").removesuffix("'s").removesuffix("’s")
         if tok[:1].isupper() and tok.lower() not in _STOPWORDS and any(c.isalpha() for c in tok):
             cur.append(tok)
@@ -377,23 +402,44 @@ def build_query(question: str) -> str:
                 runs.append(cur); cur = []
     if cur:
         runs.append(cur)
-    entity = " ".join(max(runs, key=len)[:3]) if runs else ""
-    entity_lc = set(entity.lower().split())
+    ents, seen = [], set()
+    for r in runs:
+        e = " ".join(r[:3])
+        if e.lower() not in seen:
+            seen.add(e.lower()); ents.append(e)
+    ents.sort(key=lambda e: (all(w.lower() in _GENERIC_ENTITIES for w in e.split()),
+                             -len(e.split()), -len(e)))
+    return ents
 
-    # 2) One salient TOPIC term — prefer a known domain keyword present in the
-    #    question, else the longest remaining content word.
-    lowered = [w.strip(",.;:'\"").lower().removesuffix("'s") for w in raw]
-    topic = next((t for t in _TOPIC_KEYWORDS if t in lowered and t not in entity_lc), "")
-    if not topic:
-        cands = [w for w in lowered if w.isalpha() and w not in _STOPWORDS and w not in entity_lc]
-        topic = max(cands, key=len) if cands else ""
 
-    parts = []
-    if entity:
-        parts.append(f'"{entity}"' if " " in entity else entity)
-    if topic:
-        parts.append(topic)
-    if not parts:  # no entity, no topic -> top content words, unquoted (AND)
+def build_query(question: str) -> str:
+    """Derive a focused GDELT query: the 1-2 most SPECIFIC entities + 1-2 salient topic
+    terms, AND-joined (multi-word entities quoted for an exact-phrase match). Robust; never
+    raises. The old version grabbed the first 1-word entity + longest leftover word, so
+    'US x Iran permanent peace deal' became 'US permanent' (missed Iran AND the topic).
+
+    Examples:
+      "US x Iran permanent peace deal in 2026?"  -> 'Iran US peace'
+      "Israel closes its airspace by June 15?"   -> 'Israel airspace'
+    """
+    q = (question or "").strip()
+    if not q:
+        return ""
+    entities_top = extract_entities(q)[:2]
+    entity_lc = set(" ".join(entities_top).lower().split())
+
+    q2 = _TEMPORAL_TAIL.sub("", _LEADING_AUX.sub("", q.rstrip(" ?.!"), count=1)).strip()
+    lowered = [w.strip(",.;:'\"").lower().removesuffix("'s").removesuffix("’s") for w in q2.split()]
+    topics = [w for w in lowered if w in _TOPIC_KEYWORDS and w not in entity_lc]
+    topics = list(dict.fromkeys(topics))          # de-dup, keep question order
+    if not topics:
+        cands = [w for w in lowered if w.isalpha() and len(w) >= 4
+                 and w not in _STOPWORDS and w not in entity_lc]
+        topics = sorted(dict.fromkeys(cands), key=lambda w: -len(w))[:1]
+
+    parts = [f'"{e}"' if " " in e else e for e in entities_top] + topics
+    parts = parts[:3]                              # keep the AND short enough to still match
+    if not parts:
         parts = [w for w in lowered if w.isalpha() and w not in _STOPWORDS][:3]
     return " ".join(parts).strip()
 
@@ -441,7 +487,7 @@ def format_context_for_llm(ctx: dict) -> str:
     lines.append(f"Recent matching articles: {len(articles)}")
     if articles:
         lines.append("Top headlines:")
-        for a in articles[:8]:
+        for a in articles[:12]:
             title = str(a.get("title", "")).strip()
             if not title:
                 continue

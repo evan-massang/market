@@ -22,9 +22,12 @@ CLI (run from polyswarm/ with PYTHONUTF8=1):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import json
 import os
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 
@@ -39,6 +42,38 @@ except Exception:
 from harness import gamma, classifier, sizing, wallet, challenger, journal
 from harness import gdelt as gdelt_mod
 from harness import signals as signals_mod
+
+# ── observability (W1: control-flow / lifecycle / classify / resolution / errors) ──
+# Guarded import: a broken/missing obs package can NEVER break a pass. Every obs call
+# is gated on `if obs:` and is OBSERVATION-ONLY (no return/logic/exception change).
+try:
+    from harness import obs
+except Exception:
+    obs = None
+
+
+def _obs_run_config(cfg):
+    """Effective config snapshot for run.start (observation-only)."""
+    try:
+        import dataclasses
+        base = dataclasses.asdict(cfg)
+    except Exception:
+        base = {}
+    base.update({
+        "entry": "loop",
+        "MODEL_FAST": os.getenv("MODEL_FAST"),
+        "MODEL_DEEP": os.getenv("MODEL_DEEP"),
+        "DEBATE_ROUNDS": os.getenv("DEBATE_ROUNDS"),
+        "LLM_PROVIDER": os.getenv("LLM_PROVIDER"),
+    })
+    return base
+
+
+def _obs_bankroll():
+    try:
+        return wallet.get_state().get("cash") or 1000.0
+    except Exception:
+        return 1000.0
 
 
 @dataclass
@@ -73,18 +108,35 @@ def _build_enrichment(market: dict, cfg: LoopConfig) -> str:
             if fired:
                 blocks.append("[Market microstructure signals — WhoIsSharp port]\n"
                               f"fired: {', '.join(fired)} | metrics: {sig.get('raw_metrics', {})}")
-        except Exception:
-            pass
+        except Exception as e:
+            if obs:
+                obs.hooks.on_error(where="loop._build_enrichment.signals", exc=e, action="skip",
+                                   context={"market_id": market.get("market_id")})
     if cfg.use_gdelt:
         try:
             q = gdelt_mod.build_query(market.get("question", ""))
-            ctx = gdelt_mod.gdelt_context(q, timespan="14d", max_records=20)
+            ctx = gdelt_mod.gdelt_context(q, timespan="14d", max_records=30)
             blocks.append("[News & sentiment — GDELT]\n" + gdelt_mod.format_context_for_llm(ctx))
-        except Exception:
-            pass
+        except Exception as e:
+            if obs:
+                obs.hooks.on_error(where="loop._build_enrichment.gdelt", exc=e, action="skip",
+                                   context={"market_id": market.get("market_id")})
+    # Wikipedia factual grounding for the question's entities (keyless). Defaults on; set
+    # cfg.use_wiki=False to disable. GDELT = what the press SAYS; Wikipedia = the FACTS.
+    if getattr(cfg, "use_wiki", True):
+        try:
+            from harness import wiki as wiki_mod
+            ents = gdelt_mod.extract_entities(market.get("question", ""))
+            wblock = wiki_mod.wiki_context(ents, n=2)
+            if wblock:
+                blocks.append(wblock)
+        except Exception as e:
+            if obs:
+                obs.hooks.on_error(where="loop._build_enrichment.wiki", exc=e, action="skip",
+                                   context={"market_id": market.get("market_id")})
     if not blocks:
         return ""
-    return "=== HARNESS UPSTREAM CONTEXT (news/sentiment + microstructure) ===\n" + "\n\n".join(blocks)
+    return "=== HARNESS UPSTREAM CONTEXT (facts + news/sentiment + microstructure) ===\n" + "\n\n".join(blocks)
 
 
 # ── forecast (real swarm or dry-run stub) ─────────────────────────────────────
@@ -137,94 +189,138 @@ def run_once(cfg: LoopConfig) -> dict:
     challenger.init_baseline_db()
     journal.init_journal()
 
-    held = {p["market_id"] for p in wallet.get_open_positions()}
-    summary = {"scanned": 0, "opinion": 0, "forecast": 0, "opened": 0, "skipped_reasons": {}}
+    with contextlib.ExitStack() as _es:
+        if obs:
+            _es.enter_context(obs.run_ctx(run_id=obs.mint("run")))
+            obs.hooks.on_run_start(_obs_run_config(cfg), _obs_bankroll())
+        held = {p["market_id"] for p in wallet.get_open_positions()}
+        summary = {"scanned": 0, "opinion": 0, "forecast": 0, "opened": 0, "skipped_reasons": {}}
 
-    def skip(reason):
-        summary["skipped_reasons"][reason] = summary["skipped_reasons"].get(reason, 0) + 1
+        def skip(reason):
+            summary["skipped_reasons"][reason] = summary["skipped_reasons"].get(reason, 0) + 1
 
-    print(f"[loop] fetching up to {cfg.fetch_limit} active markets…")
-    markets = gamma.fetch_active_markets(limit=cfg.fetch_limit)
-    # Prefer SOONEST-resolving markets so watchable near-term bets get placed first.
-    markets.sort(key=lambda m: (_days_until(m.get("end_date")) if _days_until(m.get("end_date")) is not None else 1e9))
-    summary["scanned"] = len(markets)
-    print(f"[loop] {len(markets)} markets fetched. dry_run={cfg.dry_run} "
-          f"size={cfg.swarm_size} rounds={cfg.rounds}\n")
+        print(f"[loop] fetching up to {cfg.fetch_limit} active markets…")
+        markets = gamma.fetch_active_markets(limit=cfg.fetch_limit)
+        # Prefer SOONEST-resolving markets so watchable near-term bets get placed first.
+        markets.sort(key=lambda m: (_days_until(m.get("end_date")) if _days_until(m.get("end_date")) is not None else 1e9))
+        summary["scanned"] = len(markets)
+        print(f"[loop] {len(markets)} markets fetched. dry_run={cfg.dry_run} "
+              f"size={cfg.swarm_size} rounds={cfg.rounds}\n")
 
-    picked = 0
-    for m in markets:
-        if picked >= cfg.max_markets:
-            break
-        mid = m["market_id"]
-        ok, cls = classifier.should_forecast(
-            m, use_llm=cfg.use_llm_classifier, min_volume=cfg.min_volume, min_liquidity=cfg.min_liquidity)
-        if cls.label == "opinion":
-            summary["opinion"] += 1
-        if not ok:
-            skip("not_opinion" if cls.label != "opinion" else "below_liquidity_floor")
-            continue
-        if mid in held:
-            skip("already_held"); continue
-        price = gamma.yes_price(m)
-        if price is None or not (0.0 < price < 1.0):
-            skip("no_yes_price"); continue
-        if cfg.max_days_to_resolution:
-            days = _days_until(m.get("end_date"))
-            if days is not None and days > cfg.max_days_to_resolution:
-                skip("resolves_too_far_out"); continue
-
-        picked += 1
-        print(f"[{picked}/{cfg.max_markets}] {m['question'][:70]}")
-        print(f"      market_id={mid[:18]}…  yes_price={price:.3f}  vol=${m['volume']:,.0f}")
-        try:
-            enrichment = "" if cfg.dry_run else _build_enrichment(m, cfg)
-            p, meta = _forecast(m, price, cfg, enrichment)
-            summary["forecast"] += 1
-            # CHALLENGER — independent single-LLM forecast on the SAME market (parallel
-            # A/B, never chained). Does not drive betting; pure calibration control.
-            if cfg.challenger and not cfg.dry_run:
-                bp = challenger.single_llm_forecast(m["question"], price, enrichment)
-                if bp is not None:
-                    challenger.save_baseline(mid, m["question"], bp, price)
-                    print(f"      challenger single-LLM p={bp:.3f}")
-            bankroll = wallet.bankroll_for_sizing()
-            sz = sizing.size_bet(p, price, bankroll, lam=cfg.lam, cap=cfg.cap, min_edge=cfg.min_edge)
-            print(f"      model_p={p:.3f}  market_p={price:.3f}  edge={sz.edge:+.3f}  -> {sz.reason}")
-            regime, sig = meta.get("regime", ""), ("LONG (YES)" if sz.edge > 0 else "SHORT (NO)")
-            if sz.side is None:
-                why = f"Swarm {p:.0%} vs market {price:.0%} (edge {sz.edge:+.1%}). No bet — {sz.reason}."
-                journal.record_decision(mid, m["question"], p, price, sz.edge, None, 0.0, None,
-                                        regime, "no edge", "no_bet", why)
-                skip("no_edge_or_below_min"); print()
+        picked = 0
+        for m in markets:
+            if picked >= cfg.max_markets:
+                break
+            mid = m["market_id"]
+            ok, cls = classifier.should_forecast(
+                m, use_llm=cfg.use_llm_classifier, min_volume=cfg.min_volume, min_liquidity=cfg.min_liquidity)
+            if cls.label == "opinion":
+                summary["opinion"] += 1
+            if not ok:
+                _reason = "not_opinion" if cls.label != "opinion" else "below_liquidity_floor"
+                if obs:
+                    obs.hooks.on_classify(mid, m.get("question"), cls.label, getattr(cls, "signals", None), False, _reason)
+                skip(_reason)
                 continue
-            fr = wallet.open_position(mid, m["question"], sz.side, p, price, sz.edge, sz.stake,
-                                      end_date=m.get("end_date"))
-            if fr.opened:
-                summary["opened"] += 1
-                why = (f"Swarm sees {p:.0%} vs the market's {price:.0%} — a {sz.edge:+.1%} edge. "
-                       f"Buying {fr.side} @ {fr.fill_price:.3f} with ${fr.stake:.2f} ({sz.reason}).")
-                journal.record_decision(mid, m["question"], p, price, sz.edge, fr.side, fr.stake,
-                                        fr.fill_price, regime, sig, "bet", why)
-                print(f"      OPENED {fr.side} stake=${fr.stake:.2f} fill={fr.fill_price:.3f} "
-                      f"shares={fr.shares:.2f}  bankroll now ${wallet.bankroll_for_sizing():.2f}")
-            else:
-                why = f"Sized {sz.side} ${sz.stake:.2f} but wallet rejected: {fr.reason}"
-                journal.record_decision(mid, m["question"], p, price, sz.edge, sz.side, 0.0, None,
-                                        regime, sig, "rejected", why)
-                skip("wallet_rejected"); print(f"      wallet rejected: {fr.reason}")
-        except Exception as e:
-            skip("error")
-            print(f"      ERROR: {type(e).__name__}: {e}")
-            if cfg.dry_run:
-                traceback.print_exc()
-        print()
+            if mid in held:
+                if obs:
+                    obs.hooks.on_classify(mid, m.get("question"), cls.label, getattr(cls, "signals", None), False, "already_held")
+                skip("already_held"); continue
+            price = gamma.yes_price(m)
+            if price is None or not (0.0 < price < 1.0):
+                if obs:
+                    obs.hooks.on_classify(mid, m.get("question"), cls.label, getattr(cls, "signals", None), False, "no_yes_price")
+                skip("no_yes_price"); continue
+            if cfg.max_days_to_resolution:
+                days = _days_until(m.get("end_date"))
+                if days is not None and days > cfg.max_days_to_resolution:
+                    if obs:
+                        obs.hooks.on_classify(mid, m.get("question"), cls.label, getattr(cls, "signals", None), False, "resolves_too_far_out")
+                    skip("resolves_too_far_out"); continue
 
-    st = wallet.get_state()
-    journal.record_snapshot(st["cash"], st["equity"], st["realized_pnl"], st["open_exposure"], st["n_open"])
-    print(f"[loop] pass done. {summary}")
-    print(f"[wallet] cash=${st['cash']:.2f} equity=${st['equity']:.2f} "
-          f"open={st['n_open']} realized_pnl=${st['realized_pnl']:.2f}")
-    return summary
+            picked += 1
+            if obs:
+                obs.hooks.on_classify(mid, m.get("question"), cls.label, getattr(cls, "signals", None), True, "candidate")
+            with contextlib.ExitStack() as _mes:
+                if obs:
+                    _mes.enter_context(obs.market_ctx(market_id=mid, question=m["question"]))
+                    _mes.enter_context(obs.forecast_ctx(forecast_id=obs.mint('f')))
+                print(f"[{picked}/{cfg.max_markets}] {m['question'][:70]}")
+                print(f"      market_id={mid[:18]}…  yes_price={price:.3f}  vol=${m['volume']:,.0f}")
+                try:
+                    enrichment = "" if cfg.dry_run else _build_enrichment(m, cfg)
+                    p, meta = _forecast(m, price, cfg, enrichment)
+                    summary["forecast"] += 1
+                    # CHALLENGER — independent single-LLM forecast on the SAME market (parallel
+                    # A/B, never chained). Does not drive betting; pure calibration control.
+                    if cfg.challenger and not cfg.dry_run:
+                        bp = challenger.single_llm_forecast(m["question"], price, enrichment)
+                        if bp is not None:
+                            challenger.save_baseline(mid, m["question"], bp, price)
+                            print(f"      challenger single-LLM p={bp:.3f}")
+                    bankroll = wallet.bankroll_for_sizing()
+                    sz = sizing.size_bet(p, price, bankroll, lam=cfg.lam, cap=cfg.cap, min_edge=cfg.min_edge)
+                    print(f"      model_p={p:.3f}  market_p={price:.3f}  edge={sz.edge:+.3f}  -> {sz.reason}")
+                    regime, sig = meta.get("regime", ""), ("LONG (YES)" if sz.edge > 0 else "SHORT (NO)")
+                    if sz.side is None:
+                        why = f"Swarm {p:.0%} vs market {price:.0%} (edge {sz.edge:+.1%}). No bet — {sz.reason}."
+                        journal.record_decision(mid, m["question"], p, price, sz.edge, None, 0.0, None,
+                                                regime, "no edge", "no_bet", why)
+                        skip("no_edge_or_below_min"); print()
+                        if obs:
+                            obs.hooks.on_trade_skip(
+                                forecast_id=(obs.current().get("forecast_id") if obs else None),
+                                reason="no_edge_or_below_min",
+                                inputs={"market_id": mid, "p": p, "price": price, "edge": sz.edge, "layer": "sizer"},
+                            )
+                        continue
+                    fr = wallet.open_position(mid, m["question"], sz.side, p, price, sz.edge, sz.stake,
+                                              end_date=m.get("end_date"))
+                    if fr.opened:
+                        summary["opened"] += 1
+                        why = (f"Swarm sees {p:.0%} vs the market's {price:.0%} — a {sz.edge:+.1%} edge. "
+                               f"Buying {fr.side} @ {fr.fill_price:.3f} with ${fr.stake:.2f} ({sz.reason}).")
+                        journal.record_decision(mid, m["question"], p, price, sz.edge, fr.side, fr.stake,
+                                                fr.fill_price, regime, sig, "bet", why)
+                        print(f"      OPENED {fr.side} stake=${fr.stake:.2f} fill={fr.fill_price:.3f} "
+                              f"shares={fr.shares:.2f}  bankroll now ${wallet.bankroll_for_sizing():.2f}")
+                    else:
+                        why = f"Sized {sz.side} ${sz.stake:.2f} but wallet rejected: {fr.reason}"
+                        journal.record_decision(mid, m["question"], p, price, sz.edge, sz.side, 0.0, None,
+                                                regime, sig, "rejected", why)
+                        skip("wallet_rejected"); print(f"      wallet rejected: {fr.reason}")
+                        if obs:
+                            obs.hooks.on_trade_skip(
+                                forecast_id=(obs.current().get("forecast_id") if obs else None),
+                                reason=f"wallet_rejected: {fr.reason}",
+                                inputs={"market_id": mid, "side": sz.side, "stake": sz.stake, "layer": "wallet"},
+                            )
+                except Exception as e:
+                    skip("error")
+                    if obs:
+                        obs.hooks.on_error(where="loop.run_once", exc=e, action="skip",
+                                           context={"market_id": mid})
+                    print(f"      ERROR: {type(e).__name__}: {e}")
+                    if cfg.dry_run:
+                        traceback.print_exc()
+                print()
+
+        st = wallet.get_state()
+        journal.record_snapshot(st["cash"], st["equity"], st["realized_pnl"], st["open_exposure"], st["n_open"])
+        print(f"[loop] pass done. {summary}")
+        print(f"[wallet] cash=${st['cash']:.2f} equity=${st['equity']:.2f} "
+              f"open={st['n_open']} realized_pnl=${st['realized_pnl']:.2f}")
+        # heartbeat: real file mtime + summary that the dashboard health probe reads
+        try:
+            with open(os.getenv("HARNESS_HEARTBEAT", ".heartbeat.json"), "w") as _hb:
+                json.dump({"ts": time.time(), "cycle": {"phase": "loop", **summary,
+                           "cash": round(st["cash"], 2), "equity": round(st["equity"], 2),
+                           "realized_pnl": round(st["realized_pnl"], 2)}}, _hb)
+        except Exception:
+            pass
+        if obs:
+            obs.hooks.on_run_end({**summary, "open": st["n_open"]})
+        return summary
 
 
 # ── settlement ────────────────────────────────────────────────────────────────
@@ -237,23 +333,31 @@ def settle_resolved(cfg: LoopConfig | None = None) -> list[dict]:
         seen.setdefault(p["market_id"], p["question"])
     print(f"[settle] {len(seen)} markets with open paper positions to check…")
     for mid, question in seen.items():
-        try:
-            m = gamma.fetch_market_by_condition_id(mid)
-            if m is None:
-                print(f"  {mid[:18]}… not found on Gamma — skip"); continue
-            outcome = gamma.resolution_outcome(m)
-            if outcome is None:
-                print(f"  {mid[:18]}… not resolved yet"); continue
-            settled = wallet.settle_market(mid, outcome)
-            n = resolve_forecast(question, outcome, market_id=mid)
-            challenger.resolve_baseline(outcome, mid)   # score the A/B baseline too
-            pnl = sum(s["realized_pnl"] for s in settled)
-            results.append({"market_id": mid, "outcome": outcome, "positions": len(settled),
-                            "brier_rows": n, "realized_pnl": pnl})
-            print(f"  {mid[:18]}… RESOLVED outcome={outcome} settled={len(settled)} "
-                  f"brier_rows={n} pnl=${pnl:+.2f}")
-        except Exception as e:
-            print(f"  {mid[:18]}… ERROR {type(e).__name__}: {e}")
+        with contextlib.ExitStack() as _mes:
+            if obs:
+                _mes.enter_context(obs.market_ctx(market_id=mid, question=question))
+            try:
+                m = gamma.fetch_market_by_condition_id(mid)
+                if m is None:
+                    print(f"  {mid[:18]}… not found on Gamma — skip"); continue
+                outcome = gamma.resolution_outcome(m)
+                if outcome is None:
+                    print(f"  {mid[:18]}… not resolved yet"); continue
+                if obs:
+                    obs.hooks.on_resolution(mid, outcome, "gamma")
+                settled = wallet.settle_market(mid, outcome)
+                n = resolve_forecast(question, outcome, market_id=mid)
+                challenger.resolve_baseline(outcome, mid)   # score the A/B baseline too
+                pnl = sum(s["realized_pnl"] for s in settled)
+                results.append({"market_id": mid, "outcome": outcome, "positions": len(settled),
+                                "brier_rows": n, "realized_pnl": pnl})
+                print(f"  {mid[:18]}… RESOLVED outcome={outcome} settled={len(settled)} "
+                      f"brier_rows={n} pnl=${pnl:+.2f}")
+            except Exception as e:
+                if obs:
+                    obs.hooks.on_error(where="loop.settle_resolved", exc=e, action="skip",
+                                       context={"market_id": mid})
+                print(f"  {mid[:18]}… ERROR {type(e).__name__}: {e}")
     st = wallet.get_state()
     journal.record_snapshot(st["cash"], st["equity"], st["realized_pnl"], st["open_exposure"], st["n_open"])
     print(f"[wallet] cash=${st['cash']:.2f} equity=${st['equity']:.2f} "
@@ -274,6 +378,8 @@ def daemon(cfg: LoopConfig, interval_sec: int = 10_800) -> None:
         except KeyboardInterrupt:
             print("[daemon] stopped."); return
         except Exception as e:
+            if obs:
+                obs.hooks.on_error(where="loop.daemon", exc=e, action="retry")
             print(f"[daemon] pass error: {type(e).__name__}: {e}")
         print(f"[daemon] sleeping {interval_sec}s…\n")
         time.sleep(interval_sec)

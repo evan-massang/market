@@ -24,9 +24,15 @@ defensive parsing that never raises on a single malformed field, clear docstring
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import httpx
+
+try:
+    from harness import obs
+except Exception:
+    obs = None
 
 # ── endpoint config (public, keyless) ────────────────────────────────────────
 GAMMA_BASE = "https://gamma-api.polymarket.com"
@@ -184,9 +190,21 @@ def _fetch_paginated(status: dict, limit: int, order: str, ascending: bool,
             page = min(PAGE, limit - len(out))
             params = {**status, **(extra or {}), "limit": page, "offset": offset, "order": order,
                       "ascending": "true" if ascending else "false"}
+            _t0 = time.perf_counter()
             resp = client.get(MARKETS_URL, params=params)
+            _latency_ms = (time.perf_counter() - _t0) * 1000.0
             resp.raise_for_status()
             data = resp.json()
+            if obs:
+                try:
+                    obs.hooks.on_data_fetch(
+                        source="gamma", endpoint=MARKETS_URL, params=dict(params),
+                        raw_text=resp.text,
+                        item_count=(len(data) if isinstance(data, list) else 0),
+                        latency_ms=_latency_ms,
+                    )
+                except Exception:
+                    pass
             if not isinstance(data, list) or not data:
                 break
             out.extend(normalize_market(m) for m in data if isinstance(m, dict))
@@ -242,37 +260,55 @@ def yes_price(market: dict) -> float | None:
 
 # ── resolution lookup (for settling paper positions) ──────────────────────────
 def fetch_market_by_condition_id(market_id: str, *, timeout: float = DEFAULT_TIMEOUT) -> dict | None:
-    """Fetch ONE market by its conditionId, INCLUDING closed/resolved markets
-    (no active/closed filter). Returns a normalized market dict or None. Read-only."""
+    """Fetch ONE market by its conditionId, INCLUDING closed/resolved/archived markets.
+    Returns a normalized market dict or None. Read-only.
+
+    Gamma's bare `/markets?condition_ids=…` query returns ONLY live markets — once a
+    market resolves and Polymarket archives it, that query yields 0 rows. That left
+    settled paper positions stuck at "awaiting result" forever (settle_resolved skipped
+    them as "not found on Gamma"). Fix: try the plain query first (finds still-open
+    markets), and if it misses, retry with closed+archived=true (finds resolved ones).
+    """
     if not market_id:
         return None
-    params = {"condition_ids": market_id, "limit": 1}
+    attempts = (
+        {"condition_ids": market_id, "limit": 1},
+        {"condition_ids": market_id, "closed": "true", "archived": "true", "limit": 1},
+    )
     with httpx.Client(timeout=timeout, headers=_HEADERS) as client:
-        resp = client.get(MARKETS_URL, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-    if isinstance(data, list) and data and isinstance(data[0], dict):
-        return normalize_market(data[0])
+        for params in attempts:
+            resp = client.get(MARKETS_URL, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                return normalize_market(data[0])
     return None
 
 
 def resolution_outcome(market: dict) -> float | None:
     """Return 1.0 if the market resolved YES, 0.0 if NO, None if not (cleanly) resolved.
 
-    A market is settled when Gamma marks it closed AND the prices have snapped to
-    ~1/0. We require an unambiguous snap so a still-trading 'closed' edge case never
-    settles a paper position at the wrong outcome.
+    We settle a paper position when the OUTCOME IS IN and the price has snapped to ~1/0.
+    "Outcome is in" = Gamma has marked the market closed, OR the UMA oracle already holds a
+    proposed/resolved (non-disputed) answer — i.e. the event is over and the result has been
+    submitted, even if on-chain finalization (the ~2h challenge window) hasn't cleared yet.
+    Without this, a finished game sits at "awaiting result" for hours while UMA finalizes.
+    We still require an unambiguous price snap so a mid-event blip never settles wrongly.
     """
     raw = market.get("raw", {}) or {}
     closed = raw.get("closed")
     is_closed = (closed is True) or (str(closed).strip().lower() == "true")
-    if not is_closed:
+    uma = str(raw.get("umaResolutionStatus") or "").strip().lower()
+    result_in = is_closed or uma in ("proposed", "resolved", "settled")
+    if not result_in:
         return None
+    # Tighter snap threshold when leaning on a not-yet-finalized UMA proposal.
+    hi, lo = (0.99, 0.01) if is_closed else (0.985, 0.015)
     yp = yes_price(market)
     if yp is not None:
-        if yp >= 0.99:
+        if yp >= hi:
             return 1.0
-        if yp <= 0.01:
+        if yp <= lo:
             return 0.0
         return None
     # No 'Yes' label: use the highest-priced outcome if it has clearly won.
@@ -280,7 +316,7 @@ def resolution_outcome(market: dict) -> float | None:
     prices = market.get("outcome_prices") or []
     if prices:
         win = max(range(len(prices)), key=lambda i: prices[i])
-        if prices[win] >= 0.99 and win < len(outcomes):
+        if prices[win] >= hi and win < len(outcomes):
             name = str(outcomes[win]).strip().lower()
             if name == "yes":
                 return 1.0

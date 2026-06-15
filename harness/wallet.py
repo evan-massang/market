@@ -26,6 +26,11 @@ import sqlite3
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
+try:
+    from harness import obs
+except Exception:
+    obs = None
+
 DB_PATH = os.getenv("DATABASE_URL", "polyswarm.db").replace("sqlite+aiosqlite:///./", "")
 
 DEFAULT_STARTING_BANKROLL = 1000.0
@@ -143,23 +148,39 @@ def open_position(market_id: str, question: str, side: str, model_p: float, mark
     """Open a simulated paper position with a realistic (worse-than-mid) fill.
     Enforces the per-bet cap and the max-exposure guardrail; returns FillResult."""
     cfg = cfg or WalletConfig()
+
+    def _skip(fr):
+        # obs (leaf emit): record a guardrail rejection. Returns fr UNCHANGED so the
+        # caller's return value is byte-identical to before instrumentation.
+        if obs:
+            try:
+                obs.hooks.on_trade_skip(
+                    forecast_id=obs.current().get("forecast_id"),
+                    reason=fr.reason,
+                    inputs={"market_id": market_id, "side": side, "stake": stake,
+                            "model_p": model_p, "market_p": market_p, "edge": edge},
+                )
+            except Exception:
+                pass
+        return fr
+
     if side not in ("YES", "NO"):
-        return FillResult(False, f"bad side {side!r}")
+        return _skip(FillResult(False, f"bad side {side!r}"))
     if stake <= 0:
-        return FillResult(False, "non-positive stake")
+        return _skip(FillResult(False, "non-positive stake"))
 
     cash = _cash()
     if stake > cash + 1e-6:
-        return FillResult(False, f"stake {stake:.2f} exceeds cash {cash:.2f}")
+        return _skip(FillResult(False, f"stake {stake:.2f} exceeds cash {cash:.2f}"))
     # Defensive guardrails (the sizer is the primary cap). Use a small relative
     # tolerance so a stake sized EXACTLY at the cap isn't rejected by float rounding
     # — otherwise every high-edge (cap-binding) bet would be refused.
     if stake > cfg.max_bet_frac * cash * (1 + 1e-6) + 1e-9:
-        return FillResult(False, f"stake {stake:.2f} exceeds per-bet cap {cfg.max_bet_frac:.0%} of cash")
+        return _skip(FillResult(False, f"stake {stake:.2f} exceeds per-bet cap {cfg.max_bet_frac:.0%} of cash"))
     exposure = get_open_exposure()
     equity = cash + exposure
     if exposure + stake > cfg.max_exposure_frac * equity * (1 + 1e-6) + 1e-9:
-        return FillResult(False, f"would exceed max exposure {cfg.max_exposure_frac:.0%} of equity")
+        return _skip(FillResult(False, f"would exceed max exposure {cfg.max_exposure_frac:.0%} of equity"))
 
     # fill at a WORSE price than quoted (slippage on the share you actually buy)
     base = market_p if side == "YES" else (1.0 - market_p)
@@ -178,6 +199,20 @@ def open_position(market_id: str, question: str, side: str, model_p: float, mark
     conn.execute("UPDATE paper_wallet SET cash = cash - ?, updated_at=? WHERE id=1",
                  (round(stake + fee, 6), datetime.utcnow().isoformat()))
     conn.commit(); conn.close()
+    if obs:
+        try:
+            obs.hooks.on_trade_open(
+                trade_id=str(pid),
+                market_id=market_id,
+                forecast_id=obs.current().get("forecast_id"),
+                side=side,
+                stake=round(stake, 6),
+                fill_price=fill_price,
+                slippage=cfg.slippage,
+                fee=fee,
+            )
+        except Exception:
+            pass
     return FillResult(True, "filled", pid, side, fill_price, shares, round(stake, 6), fee)
 
 
@@ -201,6 +236,22 @@ def settle_market(market_id: str, outcome: float) -> list[dict]:
                      (payout, realized, datetime.utcnow().isoformat()))
         settled.append({"market_id": market_id, "side": r["side"], "stake": r["stake"],
                         "won": won, "payout": payout, "realized_pnl": realized})
+        if obs:
+            try:
+                _row = conn.execute("SELECT cash FROM paper_wallet WHERE id=1").fetchone()
+                _cash_after = _row["cash"] if _row else None
+                _cash_before = (_cash_after - payout) if _cash_after is not None else None
+                obs.hooks.on_trade_settle(
+                    trade_id=str(r["id"]),
+                    market_id=market_id,
+                    outcome=outcome,
+                    payout=payout,
+                    realized_pnl=realized,
+                    bankroll_before=_cash_before,
+                    bankroll_after=_cash_after,
+                )
+            except Exception:
+                pass
     conn.commit(); conn.close()
     return settled
 

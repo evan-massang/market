@@ -14,6 +14,7 @@ Run:  ./.venv/Scripts/python.exe -m harness.dashboard   (then open http://localh
 from __future__ import annotations
 
 import os
+import glob
 import sqlite3
 import json
 import asyncio
@@ -32,6 +33,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from harness import wallet as paper
 from harness import journal, scoreboard, challenger
 from harness import mirofish_signal
+from harness import health
 
 DB_PATH = os.getenv("DATABASE_URL", "polyswarm.db").replace("sqlite+aiosqlite:///./", "")
 MARKET_BAR = 0.0627   # historical market-price Brier on resolved opinion markets (the bar)
@@ -123,6 +125,109 @@ def api_state():
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(HTML, headers={"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"})
+
+
+@app.get("/api/health")
+def api_health():
+    """Live system-health snapshot — every value is a real HTTP probe, DB row ts, or file mtime."""
+    return JSONResponse(health.snapshot())
+
+
+MF_BACKEND = os.getenv("MIROFISH_BASE", "http://localhost:5001")
+
+
+@app.get("/api/mirofish_graph")
+def api_mirofish_graph(graph_id: str = ""):
+    """Proxy the REAL MiroFish knowledge graph from the :5001 backend (entities + relations).
+    No fabrication — returns exactly what MiroFish extracted into Zep, normalized for the canvas.
+    Default: the newest project graph that actually has nodes."""
+    name = graph_id
+    try:
+        with httpx.Client(timeout=8) as cl:
+            if not graph_id:
+                projs = cl.get(f"{MF_BACKEND}/api/graph/project/list").json().get("data", [])
+                if not projs:
+                    return JSONResponse({"available": False, "reason": "no projects"})
+                gd = None
+                for p in projs:                                   # newest project with >0 nodes
+                    gid = p.get("graph_id")
+                    if not gid:
+                        continue
+                    try:
+                        cand = cl.get(f"{MF_BACKEND}/api/graph/data/{gid}").json().get("data", {})
+                    except Exception:
+                        continue
+                    if cand.get("node_count", 0) > 0:
+                        graph_id, name, gd = gid, p.get("name", gid), cand
+                        break
+                if gd is None:
+                    return JSONResponse({"available": False, "reason": "graphs are empty"})
+            else:
+                gd = cl.get(f"{MF_BACKEND}/api/graph/data/{graph_id}").json().get("data", {})
+    except Exception as e:
+        return JSONResponse({"available": False, "reason": str(e)[:140]})
+    nodes = [{"id": n.get("uuid"), "name": n.get("name"),
+              "type": ((n.get("labels") or ["Entity"])[0] or "Entity"),
+              "summary": n.get("summary"), "attributes": n.get("attributes", {}),
+              "created_at": n.get("created_at"), "labels": n.get("labels", [])}
+             for n in gd.get("nodes", [])]
+    edges = [{"source": e.get("source_node_uuid"), "target": e.get("target_node_uuid"),
+              "type": e.get("name") or e.get("fact_type"), "fact": e.get("fact")}
+             for e in gd.get("edges", []) if e.get("source_node_uuid") and e.get("target_node_uuid")]
+    return JSONResponse({"available": True, "graph_id": gd.get("graph_id", graph_id), "name": name,
+                         "node_count": gd.get("node_count", len(nodes)),
+                         "edge_count": gd.get("edge_count", len(edges)),
+                         "nodes": nodes, "edges": edges})
+
+
+# MiroFish writes its report sections to <repo-parent>/MiroFish/backend/uploads/reports/<id>/section_*.md
+MF_REPORTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                              "MiroFish", "backend", "uploads", "reports")
+
+
+@app.get("/api/mirofish_report")
+def api_mirofish_report(report_id: str = ""):
+    """Proxy MiroFish's REAL written report from the :5001 backend. Uses markdown_content when the
+    report is complete; otherwise assembles the on-disk section_*.md files so a partial report
+    (the agent stalled mid-way) is still shown. No fabrication."""
+    try:
+        with httpx.Client(timeout=8) as cl:
+            if not report_id:
+                lst = cl.get(f"{MF_BACKEND}/api/report/list").json().get("data", [])
+                items = lst if isinstance(lst, list) else lst.get("reports", lst.get("items", []))
+                if not items:
+                    return JSONResponse({"available": False, "reason": "no reports"})
+                items = sorted(items, key=lambda r: (1 if r.get("status") in ("done", "completed") else 0,
+                                                      r.get("created_at", "")), reverse=True)
+                report_id = items[0].get("report_id")
+            rep = cl.get(f"{MF_BACKEND}/api/report/{report_id}").json().get("data", {})
+            try:
+                prog = cl.get(f"{MF_BACKEND}/api/report/{report_id}/progress").json().get("data", {})
+            except Exception:
+                prog = {}
+    except Exception as e:
+        return JSONResponse({"available": False, "reason": str(e)[:140]})
+    md = (rep.get("markdown_content") or "").strip()
+    if not md:                                            # incomplete -> assemble on-disk sections
+        outline = rep.get("outline") or {}
+        parts = []
+        if outline.get("title"):
+            parts.append(f"# {outline['title']}")
+        for fp in sorted(glob.glob(os.path.join(MF_REPORTS_DIR, report_id, "section_*.md"))):
+            try:
+                with open(fp, encoding="utf-8") as fh:
+                    parts.append(fh.read().strip())
+            except Exception:
+                pass
+        md = "\n\n".join([p for p in parts if p])
+    return JSONResponse({
+        "available": True, "report_id": report_id, "simulation_id": rep.get("simulation_id"),
+        "status": rep.get("status"), "progress": prog.get("progress"), "message": prog.get("message"),
+        "sections_done": len(prog.get("completed_sections", []) or []),
+        "sections_total": len((rep.get("outline") or {}).get("sections", []) or []),
+        "requirement": rep.get("simulation_requirement"),
+        "markdown": md or "_(report has no content yet — the crowd-sim is still gathering)_",
+    })
 
 
 @app.get("/api/stream")
@@ -222,25 +327,20 @@ async def ws_llm(ws: WebSocket):
     """Real WebSocket: the local LLM HUNTS for new bets — it scans live same-day markets we
     don't already hold and streams a bet/skip decision for each, token by token."""
     await ws.accept()
-    pool: list[dict] = []
-    seen: set[str] = set()
+    seen: set[str] = set()     # markets already analyzed this session — NEVER re-asked
     try:
         while True:
-            pool = [c for c in pool if c["market_id"] not in seen]
-            if not pool:
-                await ws.send_json({"t": "meta", "msg": "🔎 scanning live same-day markets for new bets…"})
-                pool = [c for c in (await asyncio.to_thread(_bet_candidates, 40)) if c["market_id"] not in seen]
-                if not pool:                       # scouted everything on offer — fresh sweep
-                    seen.clear()
-                    pool = await asyncio.to_thread(_bet_candidates, 40)
-                if not pool:
-                    await ws.send_json({"t": "meta", "msg": "no fresh same-day markets right now — retrying…"})
-                    await asyncio.sleep(8); continue
-            c = pool.pop(0); seen.add(c["market_id"])
-            # re-check the live book: if the daemon bet this since we scanned, it's no longer
-            # a NEW bet — skip it so the panel never re-shows a market already in the portfolio.
-            if c["market_id"] in await asyncio.to_thread(_held_ids):
+            # only GENUINELY NEW markets: not yet analyzed, and not already in the book
+            held = await asyncio.to_thread(_held_ids)
+            fresh = [c for c in (await asyncio.to_thread(_bet_candidates, 40))
+                     if c["market_id"] not in seen and c["market_id"] not in held]
+            if not fresh:
+                # nothing new -> STAY PUT (keep the last analysis on screen), idle, re-check
+                # every 20s. We do NOT re-ask markets we've already analyzed.
+                await ws.send_json({"t": "idle", "msg": "all current same-day markets analyzed — watching for new ones"})
+                await asyncio.sleep(20)
                 continue
+            c = fresh[0]; seen.add(c["market_id"])
             await ws.send_json({"t": "start", "market": c["question"], "model": LLM_LIVE_MODEL,
                                 "price": c["price"], "side": c["side"], "edge": c["edge"], "hours": c["hours"]})
             rule = (f"The favorite-longshot price rule flags {c['side']} (edge ~{c['edge'] * 100:.1f}%)."
@@ -349,6 +449,11 @@ padding:10px 12px;margin-top:4px;font:12px/1.5 'Cascadia Code',Consolas,ui-monos
 .stream .ln.bet{color:#34d399;font-weight:600}
 .stream .ln.dim{color:#566184}
 .livedot{float:right;font-size:11px;color:var(--dim);font-weight:600}
+.health{display:flex;flex-wrap:wrap;gap:8px;margin:2px 0 14px}
+.hbadge{display:inline-flex;align-items:center;gap:6px;background:linear-gradient(180deg,var(--panel),var(--panel2));
+border:1px solid var(--bd);border-radius:20px;padding:5px 11px;font-size:11.5px;color:var(--tx);font-weight:600}
+.hbadge .hdot{width:8px;height:8px;border-radius:50%}
+.hbadge .hsub{color:var(--dim);font-size:10.5px;font-weight:500;margin-left:1px}
 .netwrap{position:relative;overflow:hidden}
 #net{width:100%;height:340px;display:block;border-radius:8px;border:1px solid var(--bd);
 background:radial-gradient(700px 280px at 50% 42%,#0a1330,transparent),#05080f}
@@ -360,9 +465,42 @@ padding-bottom:6px;white-space:normal;word-break:break-word}
 .cursor{display:inline-block;width:7px;height:14px;background:var(--green);margin-left:1px;
 vertical-align:-2px;box-shadow:0 0 8px var(--green);animation:blink 1s steps(1) infinite}
 @keyframes blink{50%{opacity:0}}
+.mfgwrap{position:relative;height:380px;border:1px solid var(--bd);border-radius:8px;overflow:hidden;
+background:radial-gradient(700px 320px at 40% 35%,#0a1330,transparent),#05080f}
+#mfgraph{width:100%;height:100%;display:block;cursor:grab}
+.mfgbtn{float:right;background:var(--panel);color:var(--cyan);border:1px solid var(--bd);border-radius:6px;
+font-size:11px;padding:3px 9px;cursor:pointer;margin-left:8px}
+.mfgbtn:hover{border-color:var(--cyan)}
+.mfglegend{position:absolute;left:10px;bottom:10px;background:#0b1120cc;border:1px solid var(--bd);
+border-radius:8px;padding:8px 10px;font-size:10.5px;max-width:48%;backdrop-filter:blur(4px)}
+.mfglegend .lghdr{color:#aab6d6;font-weight:700;text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:4px;font-size:10px}
+.mfglegend .lgrow{display:inline-flex;align-items:center;gap:5px;margin:2px 8px 2px 0;color:var(--dim)}
+.mfglegend .lgdot{width:8px;height:8px;border-radius:50%}
+.mfgdetails{position:absolute;right:10px;top:10px;width:300px;max-height:92%;overflow:auto;display:none;
+background:#0b1120f2;border:1px solid var(--cyan);border-radius:10px;padding:12px 14px;box-shadow:0 8px 30px #000a;backdrop-filter:blur(4px)}
+.mfgdetails.show{display:block}
+.mfgdetails .dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px}
+.mfgdetails .dh b{font-size:13px}
+.mfgdetails .dx{cursor:pointer;color:var(--dim);font-size:14px}
+.mfgdetails .drow{font-size:11.5px;margin:5px 0;color:#cdd6ee}
+.mfgdetails .dk{color:var(--dim);display:inline-block;min-width:78px}
+.mfgdetails .dmono{font-family:Consolas,monospace;font-size:10.5px;color:#9fb0d8;word-break:break-all}
+.mfgdetails .dsum{font-size:11.5px;color:#c6cfe6;margin-top:4px;line-height:1.5}
+.mfgtag{display:inline-block;padding:2px 8px;border-radius:20px;font-size:10.5px;font-weight:600;margin:2px 4px 0 0}
+.mfrprog{height:6px;background:#121a30;border-radius:5px;overflow:hidden;margin:4px 0 10px}
+.mfrprog .bar{height:100%;background:linear-gradient(90deg,#22d3ee,#34d399);border-radius:5px;transition:width .4s}
+.mfrbody{max-height:420px;overflow:auto;font-size:13px;line-height:1.6;color:#cdd6ee;padding:2px 6px}
+.mfrbody h1{font-size:17px;color:#e6ebf5;margin:6px 0}
+.mfrbody h2{font-size:14px;color:var(--cyan);margin:14px 0 6px;border-bottom:1px solid var(--bd);padding-bottom:4px}
+.mfrbody h3{font-size:13px;color:#aab6d6;margin:10px 0 4px}
+.mfrbody blockquote{border-left:3px solid var(--purple);margin:8px 0;padding:4px 12px;color:#9fb0d8;background:#0b1120;border-radius:0 6px 6px 0;font-style:italic}
+.mfrbody strong{color:#e6ebf5} .mfrbody li{margin:3px 0} .mfrbody p{margin:7px 0}
 </style></head><body>
 <h1><span class=dot></span>Polymarket Harness — Live Paper-Trading Monitor</h1>
 <div class=sub id=sub>paper only · $0 local swarm (qwen2.5:7b) · loading…</div>
+
+<div class=ttl style="margin-bottom:6px">System health <span class=legend>(every badge is a live probe · green &lt;15m · amber 15–60m · red down/&gt;60m)</span></div>
+<div class="health" id=health><span class=hbadge><span class=hdot style="background:var(--dim)"></span>probing…</span></div>
 
 <div id=nextbet style="margin:8px 0 16px;padding:14px 18px;background:linear-gradient(90deg,#11224d,#0d1322);border:1px solid var(--cyan);border-radius:12px;box-shadow:0 0 24px #22d3ee22">
   <span style="color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:.7px">⏱ Next bet resolves in</span>
@@ -414,7 +552,27 @@ vertical-align:-2px;box-shadow:0 0 8px var(--green);animation:blink 1s steps(1) 
     <table id=abtbl><thead><tr><th>Market</th><th>Swarm</th><th>1-LLM</th><th>Market</th></tr></thead><tbody></tbody></table></div>
 </div>
 
-<div class="grid" style="margin-top:14px"><div class=panel><div class=ttl>🐟 MiroFish — crowd-simulation forecaster <span class=legend>(agents debate the market, then we read their verdict)</span></div><div id=mirofish></div></div></div>
+<div class="grid" style="margin-top:14px"><div class=panel>
+  <div class=ttl>🐟 MiroFish — knowledge graph
+    <span class=legend>entities &amp; relations the crowd-sim extracted · real data from :5001 (click a node)</span>
+    <button id=mfgrefresh class=mfgbtn>⟳ refresh</button>
+    <span id=mfgmeta class=livedot>—</span></div>
+  <div class=mfgwrap>
+    <canvas id=mfgraph></canvas>
+    <div id=mfglegend class=mfglegend></div>
+    <div id=mfgdetails class=mfgdetails></div>
+  </div>
+  <div id=mirofish style="margin-top:10px"></div>
+</div></div>
+
+<div class="grid" style="margin-top:14px"><div class=panel>
+  <div class=ttl>🐟 MiroFish report — the crowd-sim's written analysis
+    <span class=legend>generated by MiroFish's report agent (:5001)</span>
+    <button id=mfrrefresh class=mfgbtn>⟳ refresh</button>
+    <span id=mfrmeta class=livedot>—</span></div>
+  <div id=mfrprog class=mfrprog></div>
+  <div id=mfrbody class=mfrbody></div>
+</div></div>
 
 <div class="grid" style="margin-top:14px"><div class=panel><div class=ttl>Decision transcript — why it's betting</div><div class=txn id=txn></div></div></div>
 
@@ -564,6 +722,24 @@ async function tick(){
 }
 tick(); setInterval(tick,5000);
 
+// ── system health strip (every badge is a live probe / real DB ts / real mtime) ──
+function freshColor(sec){ if(sec==null) return 'var(--red)'; if(sec<900) return 'var(--green)'; if(sec<3600) return 'var(--amber)'; return 'var(--red)'; }
+function ago(sec){ if(sec==null) return 'never'; if(sec<60) return Math.round(sec)+'s ago'; if(sec<3600) return Math.round(sec/60)+'m ago'; if(sec<86400) return Math.round(sec/3600)+'h ago'; return Math.round(sec/86400)+'d ago'; }
+function hbadge(label,color,sub){ return `<span class=hbadge><span class=hdot style="background:${color};box-shadow:0 0 6px ${color}"></span>${label}<span class=hsub>${sub}</span></span>`; }
+async function healthTick(){
+  let h; try{ h=await(await fetch('/api/health')).json(); }catch(e){ return; }
+  const o=h.ollama||{}, mf=h.mirofish_backend||{}, d=h.daemon||{}, f=h.freshness_sec||{};
+  const out=[];
+  out.push(hbadge('Ollama', (o.up&&o.model_present)?'var(--green)':'var(--red)',
+     o.up ? (o.model_present ? (o.model||'model')+' ✓' : 'model missing') : 'down'));
+  out.push(hbadge('MiroFish', mf.up?'var(--green)':'var(--amber)', mf.up?'external :5001':(mf.mode||'local fallback')));
+  out.push(hbadge('Daemon', freshColor(d.age_sec), d.age_sec==null?'no heartbeat':ago(d.age_sec)));
+  [['swarm',f.swarm_forecast],['1-LLM',f.challenger],['crowd',f.mirofish],['bet',f.paper_position],['decision',f.decision]]
+    .forEach(([lab,sec])=> out.push(hbadge(lab, freshColor(sec), ago(sec))));
+  const el=document.getElementById('health'); if(el) el.innerHTML=out.join('');
+}
+healthTick(); setInterval(healthTick, 5000);
+
 // ── live agent feed (SSE tail of the daemon console) ──────────────────────────
 (function(){
   const box=document.getElementById('stream'), dot=document.getElementById('streamdot');
@@ -665,6 +841,116 @@ tick(); setInterval(tick,5000);
   setInterval(()=>{ if(!window._netBusy){ const ids=['macro','contra','crypto','quant','retail','data','fish']; activate(ids[Math.floor(tt*7)%ids.length],0.22);} },2600);
 })();
 
+// ── MiroFish knowledge graph (REAL entities/relations from :5001, force-directed) ──
+(function(){
+  const cv=document.getElementById('mfgraph'); if(!cv) return;
+  const ctx=cv.getContext('2d'); const DPR=Math.min(window.devicePixelRatio||1,2);
+  const meta=document.getElementById('mfgmeta'), legend=document.getElementById('mfglegend'), details=document.getElementById('mfgdetails');
+  const TYPECOL={ Person:'#f472b6', PersonEntity:'#f472b6', Company:'#34d399', Organization:'#fb923c',
+    MediaOutlet:'#f59e0b', GovernmentAgency:'#9ca3af', InvestorInstitution:'#60a5fa', PolicyMaker:'#a78bfa',
+    DeveloperCommunity:'#22d3ee', TechExecutive:'#f59e0b', Entity:'#3b82f6', EventEntity:'#eab308' };
+  function colorFor(t){ if(TYPECOL[t]) return TYPECOL[t];
+    let h=0; for(let i=0;i<(t||'').length;i++) h=(h*31+t.charCodeAt(i))%360; return 'hsl('+h+',65%,60%)'; }
+  let W=0,H=0, nodes=[], edges=[], byId={}, sel=null, drag=null;
+  function resize(){ const r=cv.getBoundingClientRect(); W=r.width;H=r.height||380;
+    cv.width=W*DPR;cv.height=H*DPR;ctx.setTransform(DPR,0,0,DPR,0,0); }
+  function layout(){ const cx=W/2,cy=H/2,R=Math.min(W,H)*0.28;
+    nodes.forEach((n,i)=>{ const a=i/Math.max(1,nodes.length)*6.2832;
+      n.x=cx+Math.cos(a)*R+(i%2?12:-12); n.y=cy+Math.sin(a)*R; n.vx=0;n.vy=0; n.deg=0; });
+    edges.forEach(e=>{ if(byId[e.source]) byId[e.source].deg++; if(byId[e.target]) byId[e.target].deg++; }); }
+  async function load(){
+    let d; try{ d=await(await fetch('/api/mirofish_graph')).json(); }
+    catch(e){ if(meta){meta.textContent='backend offline';meta.style.color='var(--amber)';} return; }
+    if(!d.available){ if(meta){meta.textContent=(d.reason||'unavailable');meta.style.color='var(--amber)';}
+      nodes=[];edges=[];byId={}; if(legend) legend.innerHTML=''; return; }
+    if(meta){ meta.textContent='● '+d.name+' · '+d.node_count+' entities · '+d.edge_count+' relations'; meta.style.color='var(--green)'; }
+    nodes=(d.nodes||[]).map(n=>({...n})); byId={}; nodes.forEach(n=>byId[n.id]=n);
+    edges=(d.edges||[]).filter(e=>byId[e.source]&&byId[e.target]);
+    layout();
+    const types=[...new Set(nodes.map(n=>n.type))];
+    if(legend) legend.innerHTML='<span class=lghdr>Entity types</span>'+types.map(t=>'<span class=lgrow><span class=lgdot style="background:'+colorFor(t)+'"></span>'+t+'</span>').join('');
+  }
+  function step(){
+    for(let i=0;i<nodes.length;i++){ for(let j=i+1;j<nodes.length;j++){ const a=nodes[i],b=nodes[j];
+      let dx=a.x-b.x,dy=a.y-b.y,d2=(dx*dx+dy*dy)||1,d=Math.sqrt(d2),f=2600/d2;
+      a.vx+=dx/d*f;a.vy+=dy/d*f;b.vx-=dx/d*f;b.vy-=dy/d*f; }}
+    edges.forEach(e=>{ const a=byId[e.source],b=byId[e.target]; if(!a||!b)return;
+      let dx=b.x-a.x,dy=b.y-a.y,d=Math.hypot(dx,dy)||1,f=(d-130)*0.012;
+      a.vx+=dx/d*f;a.vy+=dy/d*f;b.vx-=dx/d*f;b.vy-=dy/d*f; });
+    const cx=W/2,cy=H/2;
+    nodes.forEach(n=>{ if(n===drag) return; n.vx+=(cx-n.x)*0.002;n.vy+=(cy-n.y)*0.002;
+      n.vx*=0.85;n.vy*=0.85; n.x+=n.vx;n.y+=n.vy;
+      n.x=Math.max(24,Math.min(W-24,n.x)); n.y=Math.max(22,Math.min(H-22,n.y)); });
+    draw(); requestAnimationFrame(step);
+  }
+  function draw(){ ctx.clearRect(0,0,W,H);
+    edges.forEach(e=>{ const a=byId[e.source],b=byId[e.target]; if(!a||!b)return; const hot=sel&&(sel.id===a.id||sel.id===b.id);
+      ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);
+      ctx.strokeStyle=hot?'#f472b6cc':'#f472b63a'; ctx.lineWidth=hot?1.8:0.9; ctx.stroke();
+      if(hot){ const mx=(a.x+b.x)/2,my=(a.y+b.y)/2; ctx.font='9px Segoe UI';ctx.fillStyle='#f472b6';ctx.textAlign='center';
+        ctx.fillText((e.type||'').slice(0,26),mx,my-3); } });
+    nodes.forEach(n=>{ const col=colorFor(n.type), r=7+Math.min(8,(n.deg||0)*2)+(n===sel?3:0);
+      ctx.beginPath();ctx.arc(n.x,n.y,r,0,6.28);ctx.fillStyle=col;
+      ctx.shadowColor=col;ctx.shadowBlur=n===sel?16:7;ctx.fill();ctx.shadowBlur=0;
+      if(n===sel){ctx.lineWidth=2;ctx.strokeStyle='#fff';ctx.stroke();}
+      ctx.font='10px Segoe UI';ctx.fillStyle='rgba(220,228,245,.85)';ctx.textAlign='center';
+      ctx.fillText((n.name||'').slice(0,24),n.x,n.y-r-4); });
+  }
+  function at(mx,my){ let hit=null,best=520; nodes.forEach(n=>{const d=(n.x-mx)**2+(n.y-my)**2; if(d<best){best=d;hit=n;}}); return hit; }
+  function pos(ev){ const r=cv.getBoundingClientRect(); return [ev.clientX-r.left, ev.clientY-r.top]; }
+  cv.addEventListener('mousedown',ev=>{ const p=pos(ev); drag=at(p[0],p[1]); if(drag) selectNode(drag); });
+  cv.addEventListener('mousemove',ev=>{ if(drag){ const p=pos(ev); drag.x=p[0];drag.y=p[1];drag.vx=0;drag.vy=0; } });
+  window.addEventListener('mouseup',()=>{ drag=null; });
+  function selectNode(n){ sel=n; if(!details) return;
+    const attrs=Object.entries(n.attributes||{}).filter(([k])=>k!=='name').map(([k,v])=>'<div class=drow><span class=dk>'+k+'</span>'+v+'</div>').join('');
+    const labs=((n.labels&&n.labels.length?n.labels:[n.type])).map(l=>'<span class=mfgtag style="background:'+colorFor(l)+'22;color:'+colorFor(l)+'">'+l+'</span>').join('');
+    details.innerHTML='<div class=dh><b>'+(n.name||'')+'</b><span class=dx onclick="document.getElementById(\'mfgdetails\').classList.remove(\'show\')">✕</span></div>'
+      +'<div class=drow><span class=dk>type</span>'+n.type+'</div>'
+      +'<div class=drow><span class=dk>uuid</span><span class=dmono>'+(n.id||'')+'</span></div>'
+      +'<div class=drow><span class=dk>created</span>'+(n.created_at?new Date(n.created_at).toLocaleString():'—')+'</div>'
+      +(attrs?'<div class=drow style="margin-top:6px;color:var(--dim);font-weight:600">Properties</div>'+attrs:'')
+      +(n.summary?'<div class=drow style="margin-top:6px;color:var(--dim);font-weight:600">Summary</div><div class=dsum>'+n.summary+'</div>':'')
+      +'<div class=drow style="margin-top:8px">'+labs+'</div>';
+    details.classList.add('show');
+  }
+  const rb=document.getElementById('mfgrefresh'); if(rb) rb.onclick=load;
+  window.addEventListener('resize',resize);
+  resize(); load(); requestAnimationFrame(step); setInterval(load,30000);
+})();
+
+// ── MiroFish report (the crowd-sim's written analysis, real markdown from :5001) ──
+(function(){
+  const body=document.getElementById('mfrbody'), meta=document.getElementById('mfrmeta'), prog=document.getElementById('mfrprog');
+  if(!body) return;
+  function md2html(md){
+    const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const inline=s=>esc(s).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\*(.+?)\*/g,'<em>$1</em>');
+    let html='',inList=false; const close=()=>{ if(inList){html+='</ul>';inList=false;} };
+    (md||'').split('\n').forEach(raw=>{ const l=raw.trim();
+      if(!l){ close(); return; }
+      if(l.startsWith('### ')){ close(); html+='<h3>'+inline(l.slice(4))+'</h3>'; }
+      else if(l.startsWith('## ')){ close(); html+='<h2>'+inline(l.slice(3))+'</h2>'; }
+      else if(l.startsWith('# ')){ close(); html+='<h1>'+inline(l.slice(2))+'</h1>'; }
+      else if(l.startsWith('> ')){ close(); html+='<blockquote>'+inline(l.slice(2))+'</blockquote>'; }
+      else if(/^(-|\*|\d+\.)\s/.test(l)){ if(!inList){html+='<ul>';inList=true;} html+='<li>'+inline(l.replace(/^(-|\*|\d+\.)\s/,''))+'</li>'; }
+      else { close(); html+='<p>'+inline(l)+'</p>'; }
+    });
+    close(); return html;
+  }
+  async function load(){
+    let d; try{ d=await(await fetch('/api/mirofish_report')).json(); }
+    catch(e){ if(meta){meta.textContent='offline';meta.style.color='var(--amber)';} return; }
+    if(!d.available){ if(meta){meta.textContent=d.reason||'no report';meta.style.color='var(--amber)';}
+      body.innerHTML='<p style="color:var(--dim)">No MiroFish report yet — none have completed.</p>'; if(prog)prog.innerHTML=''; return; }
+    const done=d.status==='done'||d.status==='completed';
+    if(meta){ meta.textContent='● '+(d.status||'')+(d.sections_total?(' · '+d.sections_done+'/'+d.sections_total+' sections'):''); meta.style.color=done?'var(--green)':'var(--amber)'; }
+    if(prog){ const p=d.progress!=null?d.progress:(done?100:0); prog.innerHTML='<div class=bar style="width:'+p+'%"></div>'; }
+    body.innerHTML=md2html(d.markdown);
+  }
+  const rb=document.getElementById('mfrrefresh'); if(rb) rb.onclick=load;
+  load(); setInterval(load,30000);
+})();
+
 // ── LLM live: real WebSocket token stream ─────────────────────────────────────
 (function(){
   const wrap=document.getElementById('llmlive'), dot=document.getElementById('llmdot'); if(!wrap) return;
@@ -685,7 +971,8 @@ tick(); setInterval(tick,5000);
         try{ window.netFeed && window.netFeed('Fetching sources single-LLM scouting'); }catch(_){}}
       else if(m.t==='tok'){ setCursor(false); body.appendChild(document.createTextNode(m.v)); setCursor(true); wrap.scrollTop=wrap.scrollHeight; }
       else if(m.t==='meta'){ qEl.textContent='▸ live model'; body.textContent=m.msg||''; setCursor(false); }
-      else if(m.t==='done'){ setCursor(false); body.appendChild(document.createTextNode('\n\n— next market shortly —')); wrap.scrollTop=wrap.scrollHeight; }
+      else if(m.t==='done'){ setCursor(false); body.appendChild(document.createTextNode('\n\n— analysis complete —')); wrap.scrollTop=wrap.scrollHeight; }
+      else if(m.t==='idle'){ setCursor(false); if(dot){ dot.textContent='● idle · caught up'; dot.style.color='var(--dim)'; } }
     };
     ws.onclose=()=>{ dot.textContent='● reconnecting…'; dot.style.color='var(--amber)'; setCursor(false); setTimeout(connect,2500); };
     ws.onerror=()=>{ try{ws.close();}catch(_){} };

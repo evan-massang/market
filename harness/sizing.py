@@ -21,6 +21,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 
+try:
+    from harness import obs
+except Exception:
+    obs = None
+
 # ── conservative defaults ────────────────────────────────────────────────────
 DEFAULT_LAMBDA = 0.25      # quarter-Kelly
 DEFAULT_CAP = 0.02         # hard cap: at most 2% of bankroll on any single bet
@@ -65,12 +70,27 @@ def size_bet(p: float, c: float, bankroll: float,
     abs_edge = abs(edge)
     side, f_star = kelly_fraction(p, c)
 
+    def _emit(final_fraction, stake):
+        # obs (leaf emit): observe the sizing decision; never alters the Sizing return.
+        if obs:
+            try:
+                obs.hooks.on_sizing(
+                    forecast_id=obs.current().get("forecast_id"), trade_id=None,
+                    bankroll=bankroll, edge=edge, side=side, kelly_f_star=f_star,
+                    lam=lam, cap=cap, final_fraction=final_fraction, stake=stake, p=p, c=c,
+                )
+            except Exception:
+                pass
+
     if side is None:
+        _emit(0.0, 0.0)
         return Sizing(None, edge, abs_edge, 0.0, 0.0, 0.0, False, "no edge (p == c or degenerate price)")
     if abs_edge < min_edge:
+        _emit(0.0, 0.0)
         return Sizing(None, edge, abs_edge, f_star, 0.0, 0.0, False,
                       f"edge {abs_edge:.3f} below min_edge {min_edge:.3f}")
     if bankroll <= 0:
+        _emit(0.0, 0.0)
         return Sizing(None, edge, abs_edge, f_star, 0.0, 0.0, False, "bankroll depleted")
 
     scaled = lam * f_star
@@ -78,5 +98,6 @@ def size_bet(p: float, c: float, bankroll: float,
     capped = scaled > cap
     stake = round(fraction * bankroll, 6)
     reason = f"buy {side}: f*={f_star:.3f}, {lam:g}x Kelly={scaled:.4f}" + (f" -> capped at {cap:g}" if capped else "")
+    _emit(fraction, stake)
     return Sizing(side, round(edge, 6), round(abs_edge, 6), round(f_star, 6),
                   round(fraction, 6), stake, capped, reason)

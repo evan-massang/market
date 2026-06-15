@@ -16,8 +16,15 @@ from __future__ import annotations
 import json
 import os
 import re
+import contextlib
 import sqlite3
 from datetime import datetime
+from time import perf_counter
+
+try:
+    from harness import obs
+except Exception:
+    obs = None
 
 DB_PATH = os.getenv("DATABASE_URL", "polyswarm.db").replace("sqlite+aiosqlite:///./", "")
 
@@ -54,7 +61,8 @@ def single_llm_forecast(question: str, market_odds: float | None = None,
         + (f"\nContext:\n{extra_context[:1500]}\n" if extra_context else "")
         + '\nReply with ONLY JSON: {"probability": <number between 0 and 1>}'
     )
-    raw = _hosted_raw(system, user) if _hosted_configured() else _local_raw(system, user, model)
+    with (obs.agent_ctx(role="challenger") if obs else contextlib.nullcontext()):
+        raw = _hosted_raw(system, user) if _hosted_configured() else _local_raw(system, user, model)
     if not raw:
         return None
     try:
@@ -78,10 +86,28 @@ def _hosted_raw(system: str, user: str) -> str | None:
         import openai
         client = openai.OpenAI(api_key=os.getenv("CHALLENGER_API_KEY"),
                                base_url=os.getenv("CHALLENGER_BASE_URL"))
+        t0 = perf_counter()
         r = client.chat.completions.create(
             model=os.getenv("CHALLENGER_MODEL"), max_tokens=300,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
-        return r.choices[0].message.content.strip()
+        ms = (perf_counter() - t0) * 1000.0
+        text = r.choices[0].message.content.strip()
+        if obs:
+            try:
+                ti = to = None
+                try:
+                    ti = r.usage.prompt_tokens
+                    to = r.usage.completion_tokens
+                except Exception:
+                    pass
+                obs.hooks.on_llm_call(
+                    provider="hosted", model=os.getenv("CHALLENGER_MODEL"),
+                    system=system, user=user, completion=text,
+                    tokens_in=ti, tokens_out=to, latency_ms=ms, role="challenger",
+                )
+            except Exception:
+                pass
+        return text
     except Exception:
         return None
 
@@ -121,6 +147,11 @@ def resolve_baseline(outcome: float, market_id: str) -> int:
     for rid, p in rows:
         conn.execute("UPDATE baseline_forecasts SET outcome=?, brier_score=?, resolved_at=? WHERE id=?",
                      (outcome, (p - outcome) ** 2, datetime.utcnow().isoformat(), rid))
+        if obs:
+            obs.hooks.on_score(
+                forecast_id=None, market_id=market_id,
+                model_brier=(p - outcome) ** 2, market_brier=None,
+            )
     conn.commit(); conn.close()
     return len(rows)
 

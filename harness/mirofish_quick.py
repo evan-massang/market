@@ -29,13 +29,20 @@ def main(argv=None):
     q, mid, price = market["question"], market["market_id"], gamma.yes_price(market)
     print(f"[mf-quick] MiroFish crowd sim on: {q}  (market {price:.3f})", flush=True)
 
-    # drive graph -> personas -> start (returns at sim_running on timeout — that's fine,
-    # the crowd generates posts while running)
-    res = mirofish.forecast_market(q, max_wait=1500, verbose=True)
-    sid = res.get("simulation_id")
-    print(f"[mf-quick] sim={sid} stage={res.get('stage_reached')}", flush=True)
-    if not sid:
-        print("[mf-quick] no simulation id — abort"); return
+    # Try the real external MiroFish backend first (short wait); if it's unreachable or
+    # returns no sim id, fall back to the local $0 crowd-sim producer (crowd_local).
+    sid = None
+    try:
+        res = mirofish.forecast_market(q, max_wait=120, verbose=True)   # try real backend, short wait
+        sid = res.get("simulation_id")
+        print(f"[mf-quick] external sim={sid} stage={res.get('stage_reached')}", flush=True)
+    except Exception as e:
+        print(f"[mf-quick] external backend unreachable ({str(e)[:80]})", flush=True)
+        sid = None
+    if not sid:                                                          # backend down -> local crowd
+        from harness import crowd_local
+        sid = crowd_local.run_local_crowd(q, rounds=int(os.getenv("CROWD_ROUNDS", "1")))
+        print(f"[mf-quick] local crowd sim={sid}", flush=True)
 
     # wait for the crowd to produce posts, then distill
     sig = {"n_posts": 0}

@@ -6,6 +6,7 @@ Dempster-Shafer evidence theory, copula dependency modeling, and more.
 
 from __future__ import annotations
 import os
+import contextlib
 from rich.table import Table
 from rich.panel import Panel
 from rich.columns import Columns
@@ -50,6 +51,11 @@ from core.calibration import (
 from agents.personas import build_swarm
 from data.context import build_context
 
+try:
+    from harness import obs
+except Exception:
+    obs = None
+
 
 class Swarm:
     def __init__(self, agents: list[Agent] | None = None):
@@ -59,250 +65,286 @@ class Swarm:
 
     def forecast(self, question: str, market_odds: float | None = None,
                  market_id: str | None = None, extra_context: str = "") -> dict:
-        # ── Question Header ──
-        console.print()
-        console.print(Panel(
-            f"  [bold white]{question}[/]",
-            border_style=COLORS["brand"],
-            title=f"[bold {COLORS['brand']}]<<<>>>  FORECAST[/]",
-            title_align="left",
-            subtitle=f"[{COLORS['dim']}]{self.debate_rounds} rounds  |  {len(self.agents)} agents  |  26 methods[/]",
-            subtitle_align="right",
-            padding=(1, 2),
-        ))
-
-        # ── Data Fetch ──
-        console.print()
-        console.print(f"  [{COLORS['dim']}]Fetching live data from 23 sources...[/]")
-        context = build_context(question)
-        # HARNESS PATCH: inject upstream harness context (GDELT news/tone + WhoIsSharp
-        # microstructure signals) so opinion markets get relevant news context, not
-        # just PolySwarm's crypto-tilted sources. The loop passes this per market.
-        if extra_context:
-            context = f"{context}\n\n{extra_context}"
-        console.print(f"  [{COLORS['positive']}]Context ready[/]")
-
-        calibration_weights = get_calibration_weights()
-        history = get_forecast_history(limit=100)
-
-        round1_estimates: list[AgentEstimate] = []
-        all_estimates: list[AgentEstimate] = []
-
-        # ── Debate Rounds ──
-        for round_num in range(1, self.debate_rounds + 1):
-            section_title = f"ROUND {round_num}"
-            console.print()
-            console.print(f"  [bold {COLORS['brand']}]{'━' * 3} {section_title} {'━' * (50 - len(section_title))}[/]")
-            console.print()
-
-            round_estimates = []
-
-            for agent in self.agents:
-                persona_short = agent.persona[:22].ljust(22)
-                console.print(f"  [{COLORS['dim']}]{persona_short}[/]", end="")
-                est = agent.estimate(
-                    question=question,
-                    context=context,
-                    debate_round=round_num,
-                    other_estimates=all_estimates if round_num > 1 else None,
+        with (obs.forecast_ctx(forecast_id=(obs.current().get('forecast_id') or obs.mint('f')), market_id=market_id, question=question) if obs else contextlib.nullcontext()):
+            if obs:
+                obs.hooks.on_forecast_start(
+                    forecast_id=obs.current().get("forecast_id"),
+                    market_id=market_id, question=question, market_price=market_odds,
                 )
-                round_estimates.append(est)
+            # ── Question Header ──
+            console.print()
+            console.print(Panel(
+                f"  [bold white]{question}[/]",
+                border_style=COLORS["brand"],
+                title=f"[bold {COLORS['brand']}]<<<>>>  FORECAST[/]",
+                title_align="left",
+                subtitle=f"[{COLORS['dim']}]{self.debate_rounds} rounds  |  {len(self.agents)} agents  |  26 methods[/]",
+                subtitle_align="right",
+                padding=(1, 2),
+            ))
 
-                # Mini inline visualization
-                p = est.probability
-                p_color = probability_color(p)
-                conf_bar = progress_bar(est.confidence, width=8, filled_color=COLORS["dim"])
-                console.print(f" [bold {p_color}]{p:5.1%}[/]  {conf_bar}  [{COLORS['dim']}]conf {est.confidence:.0%}[/]")
+            # ── Data Fetch ──
+            console.print()
+            console.print(f"  [{COLORS['dim']}]Fetching live data from 23 sources...[/]")
+            context = build_context(question)
+            # HARNESS PATCH: inject upstream harness context (GDELT news/tone + WhoIsSharp
+            # microstructure signals) so opinion markets get relevant news context, not
+            # just PolySwarm's crypto-tilted sources. The loop passes this per market.
+            if extra_context:
+                context = f"{context}\n\n{extra_context}"
+            console.print(f"  [{COLORS['positive']}]Context ready[/]")
 
-            if round_num == 1:
-                round1_estimates = round_estimates.copy()
-            all_estimates = round_estimates
+            calibration_weights = get_calibration_weights()
+            history = get_forecast_history(limit=100)
 
-        # save to calibration DB
-        for est in all_estimates:
-            save_forecast(question, est.agent_id, est.probability, market_id=market_id)
+            round1_estimates: list[AgentEstimate] = []
+            all_estimates: list[AgentEstimate] = []
 
-        # ══════════════════════════════════════════════════════════
-        #  ANALYSIS PIPELINE — 26 methods
-        # ══════════════════════════════════════════════════════════
-        console.print()
-        console.print(f"  [bold {COLORS['accent2']}]{'━' * 3} ANALYSIS PIPELINE {'━' * 35}[/]")
-        console.print(f"  [{COLORS['dim']}]Running 26 mathematical models...[/]")
-        console.print()
+            # ── Debate Rounds ──
+            for round_num in range(1, self.debate_rounds + 1):
+                section_title = f"ROUND {round_num}"
+                console.print()
+                console.print(f"  [bold {COLORS['brand']}]{'━' * 3} {section_title} {'━' * (50 - len(section_title))}[/]")
+                console.print()
 
-        # ── Classical Aggregation ──
-        # 1. Standard weighted aggregation
-        result = aggregate(all_estimates, calibration_weights)
+                round_estimates = []
 
-        # 2. Bayesian aggregation
-        bayesian = bayesian_aggregate(all_estimates, prior=market_odds or 0.5)
-        result["bayesian"] = bayesian
+                for agent in self.agents:
+                    persona_short = agent.persona[:22].ljust(22)
+                    console.print(f"  [{COLORS['dim']}]{persona_short}[/]", end="")
+                    est = agent.estimate(
+                        question=question,
+                        context=context,
+                        debate_round=round_num,
+                        other_estimates=all_estimates if round_num > 1 else None,
+                    )
+                    round_estimates.append(est)
 
-        # 3. Agent agreement matrix (Jensen-Shannon divergence)
-        agreement = compute_agent_agreement_matrix(all_estimates)
-        result["agreement"] = agreement
+                    # Mini inline visualization
+                    p = est.probability
+                    p_color = probability_color(p)
+                    conf_bar = progress_bar(est.confidence, width=8, filled_color=COLORS["dim"])
+                    console.print(f" [bold {p_color}]{p:5.1%}[/]  {conf_bar}  [{COLORS['dim']}]conf {est.confidence:.0%}[/]")
 
-        # 4. Extremized aggregation (IARPA/Tetlock)
-        ext = extremize(all_estimates)
-        result["extremized"] = ext
+                if round_num == 1:
+                    round1_estimates = round_estimates.copy()
+                all_estimates = round_estimates
 
-        # 5. Surprisingly Popular (Prelec, Nature 2017)
-        sp = surprisingly_popular(all_estimates)
-        result["surprisingly_popular"] = sp
+                if obs:
+                    obs.hooks.on_debate_round(
+                        forecast_id=obs.current().get("forecast_id"),
+                        round_n=round_num,
+                        estimates=[
+                            {"agent_id": e.agent_id, "probability": e.probability,
+                             "confidence": e.confidence, "round": e.round}
+                            for e in round_estimates
+                        ],
+                    )
 
-        # 6. Logarithmic Opinion Pool (Genest & Zidek)
-        logop = logarithmic_opinion_pool(all_estimates)
-        result["log_opinion_pool"] = logop
+            # save to calibration DB
+            for est in all_estimates:
+                save_forecast(question, est.agent_id, est.probability, market_id=market_id)
 
-        # 7. Cooke's Classical Model
-        cooke = cooke_classical_weights(all_estimates, calibration_weights)
-        result["cooke_classical"] = cooke
+            # ══════════════════════════════════════════════════════════
+            #  ANALYSIS PIPELINE — 26 methods
+            # ══════════════════════════════════════════════════════════
+            console.print()
+            console.print(f"  [bold {COLORS['accent2']}]{'━' * 3} ANALYSIS PIPELINE {'━' * 35}[/]")
+            console.print(f"  [{COLORS['dim']}]Running 26 mathematical models...[/]")
+            console.print()
 
-        # 8. Meta-Probability Weighting (Palley & Satopää 2023)
-        mpw = meta_probability_weight(all_estimates)
-        result["meta_probability"] = mpw
+            # ── Classical Aggregation ──
+            # 1. Standard weighted aggregation
+            result = aggregate(all_estimates, calibration_weights)
 
-        # 9. Neutral Pivoting (2024)
-        pivot = neutral_pivot(all_estimates)
-        result["neutral_pivot"] = pivot
+            if obs:
+                obs.hooks.on_blend(
+                    forecast_id=obs.current().get("forecast_id"),
+                    method="weighted_calibrated", prior=market_odds,
+                    output_probability=result["probability"],
+                    consensus_score=result.get("consensus_score"),
+                )
 
-        # ── Statistical Analysis ──
-        # 10. Bootstrap confidence interval
-        bootstrap = bootstrap_confidence_interval(all_estimates)
-        result["confidence_interval"] = bootstrap
+            # 2. Bayesian aggregation
+            bayesian = bayesian_aggregate(all_estimates, prior=market_odds or 0.5)
+            result["bayesian"] = bayesian
 
-        # 11. Monte Carlo simulation (Beta distributions)
-        mc = monte_carlo_scenarios(all_estimates)
-        result["monte_carlo"] = mc
+            # 3. Agent agreement matrix (Jensen-Shannon divergence)
+            agreement = compute_agent_agreement_matrix(all_estimates)
+            result["agreement"] = agreement
 
-        # 12. Kernel Density Estimation (Gaussian KDE, Silverman bandwidth)
-        kde = kernel_density_estimate(all_estimates)
-        result["kde"] = kde
+            # 4. Extremized aggregation (IARPA/Tetlock)
+            ext = extremize(all_estimates)
+            result["extremized"] = ext
 
-        # 13. MCMC Posterior Sampling (Metropolis-Hastings)
-        mcmc = mcmc_posterior(all_estimates)
-        result["mcmc"] = mcmc
+            # 5. Surprisingly Popular (Prelec, Nature 2017)
+            sp = surprisingly_popular(all_estimates)
+            result["surprisingly_popular"] = sp
 
-        # 14. Conformal Prediction (distribution-free intervals)
-        cal_history = [
-            {"forecast": h["probability"], "outcome": h["outcome"]}
-            for h in history if h.get("outcome") is not None
-        ]
-        conformal = conformal_prediction(all_estimates, history=cal_history or None)
-        result["conformal"] = conformal
+            # 6. Logarithmic Opinion Pool (Genest & Zidek)
+            logop = logarithmic_opinion_pool(all_estimates)
+            result["log_opinion_pool"] = logop
 
-        # ── Evidence & Uncertainty ──
-        # 15. Dempster-Shafer Evidence Theory (belief functions)
-        ds = dempster_shafer_combine(all_estimates)
-        result["dempster_shafer"] = ds
+            # 7. Cooke's Classical Model
+            cooke = cooke_classical_weights(all_estimates, calibration_weights)
+            result["cooke_classical"] = cooke
 
-        # 16. Copula Dependency Analysis (Gaussian copula, Kish's n_eff)
-        copula = copula_dependency_analysis(all_estimates)
-        result["copula"] = copula
+            # 8. Meta-Probability Weighting (Palley & Satopää 2023)
+            mpw = meta_probability_weight(all_estimates)
+            result["meta_probability"] = mpw
 
-        # ── Game Theory & Diagnostics ──
-        # 17. Herding detection (HHI-based)
-        herding = detect_herding(all_estimates)
-        result["herding"] = herding
+            # 9. Neutral Pivoting (2024)
+            pivot = neutral_pivot(all_estimates)
+            result["neutral_pivot"] = pivot
 
-        # 18. Information cascade detection
-        cascade = None
-        if self.debate_rounds > 1 and round1_estimates:
-            cascade = compute_information_cascade(round1_estimates, all_estimates)
-            result["cascade"] = cascade
+            # ── Statistical Analysis ──
+            # 10. Bootstrap confidence interval
+            bootstrap = bootstrap_confidence_interval(all_estimates)
+            result["confidence_interval"] = bootstrap
 
-        # 19. Nash equilibrium check
-        nash = nash_equilibrium_check(all_estimates)
-        result["nash_equilibrium"] = nash
+            # 11. Monte Carlo simulation (Beta distributions)
+            mc = monte_carlo_scenarios(all_estimates)
+            result["monte_carlo"] = mc
 
-        # 20. Coherence check (Mandel 2024)
-        coherence = coherence_check(all_estimates)
-        result["coherence"] = coherence
+            # 12. Kernel Density Estimation (Gaussian KDE, Silverman bandwidth)
+            kde = kernel_density_estimate(all_estimates)
+            result["kde"] = kde
 
-        # 21. Scoring Rule Analysis (Brier, incentive compatibility)
-        scoring = scoring_rule_analysis(all_estimates)
-        result["scoring_rules"] = scoring
+            # 13. MCMC Posterior Sampling (Metropolis-Hastings)
+            mcmc = mcmc_posterior(all_estimates)
+            result["mcmc"] = mcmc
 
-        # ── Information Theory ──
-        # 22. Information-theoretic analysis (MI, transfer entropy, redundancy)
-        info_theory = information_analysis(
-            all_estimates,
-            round1_estimates if self.debate_rounds > 1 and round1_estimates else None,
-        )
-        result["information_theory"] = info_theory
+            # 14. Conformal Prediction (distribution-free intervals)
+            cal_history = [
+                {"forecast": h["probability"], "outcome": h["outcome"]}
+                for h in history if h.get("outcome") is not None
+            ]
+            conformal = conformal_prediction(all_estimates, history=cal_history or None)
+            result["conformal"] = conformal
 
-        # ── Attribution & Meta-Analysis ──
-        # 23. Shapley Value Attribution
-        shapley = shapley_values(all_estimates)
-        result["shapley"] = shapley
+            # ── Evidence & Uncertainty ──
+            # 15. Dempster-Shafer Evidence Theory (belief functions)
+            ds = dempster_shafer_combine(all_estimates)
+            result["dempster_shafer"] = ds
 
-        # 24. Regime Detection (Hidden Markov Model)
-        regime_input = {
-            "mean_prob": result["probability"],
-            "std_dev": result["std_dev"],
-            "herding_score": herding["herding_score"],
-            "cascade_rate": cascade["convergence_rate"] if cascade else 0,
-        }
-        regime = detect_regime(regime_input)
-        result["regime"] = regime
+            # 16. Copula Dependency Analysis (Gaussian copula, Kish's n_eff)
+            copula = copula_dependency_analysis(all_estimates)
+            result["copula"] = copula
 
-        # 25. Optimal Transport — method distance & clustering
-        method_probs = {
-            "Weighted": result["probability"],
-            "Bayesian": bayesian["bayesian_probability"],
-            "Extremized": ext["extremized_probability"],
-            "Surp. Popular": sp["sp_adjusted_probability"],
-            "Log Opinion": logop["logop_probability"],
-            "Cooke's": cooke["cooke_probability"],
-            "Meta-Prob": mpw["mpw_probability"],
-            "Neutral Pivot": pivot["pivoted_probability"],
-            "Monte Carlo": mc["percentiles"]["p50"],
-            "DS Pignistic": ds["pignistic_probability"],
-            "Copula-Adj": copula["dependency_adjusted_probability"],
-            "MCMC Post.": mcmc["posterior_median"],
-            "KDE Mode": kde["mode"],
-        }
-        transport = method_distance_analysis(method_probs)
-        result["optimal_transport"] = transport
+            # ── Game Theory & Diagnostics ──
+            # 17. Herding detection (HHI-based)
+            herding = detect_herding(all_estimates)
+            result["herding"] = herding
 
-        # 26. Calibration Curve (isotonic + Platt scaling)
-        cal_curve = calibrate_probability(result["probability"], history=cal_history or None)
-        result["calibration_curve"] = cal_curve
+            # 18. Information cascade detection
+            cascade = None
+            if self.debate_rounds > 1 and round1_estimates:
+                cascade = compute_information_cascade(round1_estimates, all_estimates)
+                result["cascade"] = cascade
 
-        # ── Stacking Ensemble (meta-learner across all methods) ──
-        stacking = stacking_aggregate(method_probs)
-        result["stacking"] = stacking
+            # 19. Nash equilibrium check
+            nash = nash_equilibrium_check(all_estimates)
+            result["nash_equilibrium"] = nash
 
-        save_swarm_forecast(question, result["probability"], result["consensus_score"], market_odds, market_id=market_id)
+            # 20. Coherence check (Mandel 2024)
+            coherence = coherence_check(all_estimates)
+            result["coherence"] = coherence
 
-        # Edge vs market — computed BEFORE display (HARNESS PATCH) so the returned
-        # result always carries it, even if a cosmetic display error occurs.
-        if market_odds is not None:
-            edge = result["probability"] - market_odds
-            bayesian_edge = bayesian["bayesian_probability"] - market_odds
-            result["market_odds"] = market_odds
-            result["edge"] = round(edge, 4)
-            result["edge_pct"] = f"{edge:+.1%}"
-            result["bayesian_edge"] = round(bayesian_edge, 4)
-            result["bayesian_edge_pct"] = f"{bayesian_edge:+.1%}"
+            # 21. Scoring Rule Analysis (Brier, incentive compatibility)
+            scoring = scoring_rule_analysis(all_estimates)
+            result["scoring_rules"] = scoring
 
-        # ══════════════════════════════════════════════════════════
-        #  DISPLAY  (HARNESS PATCH: best-effort only. The forecast is already
-        #  computed and persisted above; the autonomous loop consumes the returned
-        #  dict, so a Rich render error must never kill a forecast in the daemon.)
-        # ══════════════════════════════════════════════════════════
-        try:
-            self._print_agent_table(result, shapley)
-            self._print_methods(result, bayesian, bootstrap, mc, ext, sp, logop, cooke, mpw, pivot)
-            self._print_advanced_methods(ds, copula, mcmc, kde, conformal, transport, cal_curve, stacking)
-            self._print_diagnostics(herding, nash, coherence, cascade, scoring, info_theory)
-            self._print_regime(regime)
-            self._print_agent_attribution(shapley, info_theory)
-            self._print_final(result, market_odds, bayesian, bootstrap, conformal, ds, transport, regime)
-        except Exception as _display_err:
-            console.print(f"  [yellow]display skipped ({type(_display_err).__name__}: {_display_err})[/]")
+            # ── Information Theory ──
+            # 22. Information-theoretic analysis (MI, transfer entropy, redundancy)
+            info_theory = information_analysis(
+                all_estimates,
+                round1_estimates if self.debate_rounds > 1 and round1_estimates else None,
+            )
+            result["information_theory"] = info_theory
 
-        return result
+            # ── Attribution & Meta-Analysis ──
+            # 23. Shapley Value Attribution
+            shapley = shapley_values(all_estimates)
+            result["shapley"] = shapley
+
+            # 24. Regime Detection (Hidden Markov Model)
+            regime_input = {
+                "mean_prob": result["probability"],
+                "std_dev": result["std_dev"],
+                "herding_score": herding["herding_score"],
+                "cascade_rate": cascade["convergence_rate"] if cascade else 0,
+            }
+            regime = detect_regime(regime_input)
+            result["regime"] = regime
+
+            # 25. Optimal Transport — method distance & clustering
+            method_probs = {
+                "Weighted": result["probability"],
+                "Bayesian": bayesian["bayesian_probability"],
+                "Extremized": ext["extremized_probability"],
+                "Surp. Popular": sp["sp_adjusted_probability"],
+                "Log Opinion": logop["logop_probability"],
+                "Cooke's": cooke["cooke_probability"],
+                "Meta-Prob": mpw["mpw_probability"],
+                "Neutral Pivot": pivot["pivoted_probability"],
+                "Monte Carlo": mc["percentiles"]["p50"],
+                "DS Pignistic": ds["pignistic_probability"],
+                "Copula-Adj": copula["dependency_adjusted_probability"],
+                "MCMC Post.": mcmc["posterior_median"],
+                "KDE Mode": kde["mode"],
+            }
+            transport = method_distance_analysis(method_probs)
+            result["optimal_transport"] = transport
+
+            # 26. Calibration Curve (isotonic + Platt scaling)
+            cal_curve = calibrate_probability(result["probability"], history=cal_history or None)
+            result["calibration_curve"] = cal_curve
+
+            # ── Stacking Ensemble (meta-learner across all methods) ──
+            stacking = stacking_aggregate(method_probs)
+            result["stacking"] = stacking
+
+            save_swarm_forecast(question, result["probability"], result["consensus_score"], market_odds, market_id=market_id)
+
+            # Edge vs market — computed BEFORE display (HARNESS PATCH) so the returned
+            # result always carries it, even if a cosmetic display error occurs.
+            if market_odds is not None:
+                edge = result["probability"] - market_odds
+                bayesian_edge = bayesian["bayesian_probability"] - market_odds
+                result["market_odds"] = market_odds
+                result["edge"] = round(edge, 4)
+                result["edge_pct"] = f"{edge:+.1%}"
+                result["bayesian_edge"] = round(bayesian_edge, 4)
+                result["bayesian_edge_pct"] = f"{bayesian_edge:+.1%}"
+
+            if obs:
+                obs.hooks.on_forecast_final(
+                    forecast_id=obs.current().get("forecast_id"),
+                    market_id=market_id,
+                    model_probability=result["probability"],
+                    market_probability=market_odds,
+                    edge=result.get("edge"),
+                    consensus=result.get("consensus_score"),
+                    reasoning_summary="",
+                )
+
+            # ══════════════════════════════════════════════════════════
+            #  DISPLAY  (HARNESS PATCH: best-effort only. The forecast is already
+            #  computed and persisted above; the autonomous loop consumes the returned
+            #  dict, so a Rich render error must never kill a forecast in the daemon.)
+            # ══════════════════════════════════════════════════════════
+            try:
+                self._print_agent_table(result, shapley)
+                self._print_methods(result, bayesian, bootstrap, mc, ext, sp, logop, cooke, mpw, pivot)
+                self._print_advanced_methods(ds, copula, mcmc, kde, conformal, transport, cal_curve, stacking)
+                self._print_diagnostics(herding, nash, coherence, cascade, scoring, info_theory)
+                self._print_regime(regime)
+                self._print_agent_attribution(shapley, info_theory)
+                self._print_final(result, market_odds, bayesian, bootstrap, conformal, ds, transport, regime)
+            except Exception as _display_err:
+                console.print(f"  [yellow]display skipped ({type(_display_err).__name__}: {_display_err})[/]")
+
+            return result
 
     # ══════════════════════════════════════════════════════════
     #  DISPLAY METHODS

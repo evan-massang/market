@@ -9,6 +9,11 @@ import sqlite3
 import os
 from datetime import datetime
 
+try:
+    from harness import obs
+except Exception:
+    obs = None
+
 
 DB_PATH = os.getenv("DATABASE_URL", "polyswarm.db").replace("sqlite+aiosqlite:///./", "")
 
@@ -116,6 +121,12 @@ def resolve_forecast(question: str, outcome: float, market_id: str | None = None
             "UPDATE forecasts SET outcome=?, brier_score=?, resolved_at=? WHERE id=?",
             (outcome, brier, datetime.utcnow().isoformat(), row_id),
         )
+        if obs:
+            try:
+                obs.hooks.on_score(forecast_id=None, market_id=market_id,
+                                   model_brier=brier, market_brier=None)
+            except Exception:
+                pass
     # update swarm forecast
     swarm_rows = conn.execute(
         f"SELECT id, final_probability FROM swarm_forecasts WHERE {where} AND outcome IS NULL",
@@ -127,6 +138,12 @@ def resolve_forecast(question: str, outcome: float, market_id: str | None = None
             "UPDATE swarm_forecasts SET outcome=?, brier_score=?, resolved_at=? WHERE id=?",
             (outcome, brier, datetime.utcnow().isoformat(), row_id),
         )
+        if obs:
+            try:
+                obs.hooks.on_score(forecast_id=None, market_id=market_id,
+                                   model_brier=brier, market_brier=None)
+            except Exception:
+                pass
     conn.commit()
     conn.close()
     return len(rows) + len(swarm_rows)

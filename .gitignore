@@ -16,3 +16,10 @@ output/
 harness_cron.log
 mirofish_result.json
 loop_test*.db
+*.orig
+logs/
+.heartbeat.json
+ai_transcript.md
+ai_transcript.txt
+sameday_live.log
+sameday_err.log

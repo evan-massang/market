@@ -48,6 +48,13 @@ _RAW_SIGNALS: list[tuple[str, int, str]] = [
      r"world cup|champions league|stanley cup|world series|playoff|championship|"
      r"win the (?:game|match|title|cup|series|final)|defeat|vs\.?|ucl|ufc|"
      r"grand prix|formula ?1|\bf1\b|olympic|gold medal|relegat)\b", 3, "mechanical"),
+    # sports — scorelines / dated match results / in-game props (national-team football
+    # etc. that the league-name list above misses). "Exact Score: A x - y B?",
+    # "Will <team> win on 2026-06-13?", "Both Teams to Score", "to score first".
+    (r"\bexact score\b", 4, "mechanical"),
+    (r"\bwin on \d{4}-\d{2}-\d{2}\b", 3, "mechanical"),
+    (r"\b(?:both teams to score|neither team to score|to score first|"
+     r"clean sheet|first half|halftime|full[- ]?time)\b", 3, "mechanical"),
     # weather / natural
     (r"\b(?:temperature|hurricane|earthquake|rainfall|snowfall|degrees|celsius|"
      r"fahrenheit|magnitude|tornado|wildfire)\b", 3, "mechanical"),
@@ -62,6 +69,16 @@ _RAW_SIGNALS: list[tuple[str, int, str]] = [
      r"convicted|indicted|sentenced|found guilty|appeals court)\b", 2, "mechanical"),
     # launches / scientific
     (r"\b(?:spacex|nasa launch|rocket launch|satellite|starship)\b", 2, "mechanical"),
+    # counts / numeric-quantity thresholds the crowd doesn't "drive" (tweet/post/video counts):
+    # "post 65-89 tweets", "post <40 tweets", "40-64 tweets". These arrived as 'unknown' and the
+    # swarm hallucinated a bucket probability — tag mechanical so they're skipped/divergence-gated.
+    (r"\b\d+\s*(?:-|–|to)\s*\d+\s+(?:tweets?|posts?|times|videos?|goals?|points?|hours?)\b", 3, "mechanical"),
+    (r"\b(?:post|tweet|publish|send)\w*\s+(?:<|>|≤|≥|\d|fewer|less|more|at least|at most|under|over|between|exactly)\b", 3, "mechanical"),
+    (r"\b(?:fewer|less|more|greater|at least|at most|no more|under|over|exactly)\s+(?:than\s+)?\d+\s+(?:tweets?|posts?|times|videos?)\b", 3, "mechanical"),
+    # product / software released-by-a-date — an objective ship event, not crowd sentiment:
+    # "GPT-5.6 released by June 15", "launched on …", plus versioned product names.
+    (r"\b(?:released?|launch(?:ed|es)?|ship(?:ped|s)?|unveiled?|drop(?:ped|s)?)\s+(?:by|before|on)\b", 3, "mechanical"),
+    (r"\b(?:gpt|llama|claude|gemini|grok|chatgpt|ios|android|windows)[\s-]?\d+(?:\.\d+)?\b", 2, "mechanical"),
 
     # ---- OPINION ----
     # elections / political contests (outcome driven by voter/crowd behavior) — weight 4

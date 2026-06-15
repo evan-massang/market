@@ -6,9 +6,17 @@ Supports: Anthropic Claude, OpenAI GPT, Ollama (local models).
 from __future__ import annotations
 import os
 import json
+import re
+import contextlib
+from time import perf_counter
 from dataclasses import dataclass, field
 from typing import Optional
 from pydantic import BaseModel
+
+try:
+    from harness import obs
+except Exception:
+    obs = None
 
 
 class AgentEstimate(BaseModel):
@@ -49,7 +57,9 @@ def _get_llm_client():
     elif provider == "ollama":
         import httpx
         base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        return "ollama", httpx.Client(base_url=base_url, timeout=60)
+        # Slow CPU box: a single 7B call can exceed 60s under load. Allow a longer,
+        # env-tunable timeout so forecasts complete (slowly) instead of ReadTimeout-ing.
+        return "ollama", httpx.Client(base_url=base_url, timeout=float(os.getenv("OLLAMA_TIMEOUT", "240")))
     else:
         raise ValueError(f"Unknown LLM_PROVIDER: {provider}. Use 'anthropic', 'openai', or 'ollama'.")
 
@@ -70,6 +80,8 @@ def _get_model_name() -> str:
 def _call_llm(provider: str, client, system: str, user: str, max_tokens: int = 512) -> str:
     """Unified LLM call across providers."""
     model = _get_model_name()
+    ti = to = None
+    t0 = perf_counter()
 
     if provider == "anthropic":
         response = client.messages.create(
@@ -78,7 +90,12 @@ def _call_llm(provider: str, client, system: str, user: str, max_tokens: int = 5
             system=system,
             messages=[{"role": "user", "content": user}],
         )
-        return response.content[0].text.strip()
+        text = response.content[0].text.strip()
+        try:
+            ti = response.usage.input_tokens
+            to = response.usage.output_tokens
+        except Exception:
+            pass
 
     elif provider == "openai":
         response = client.chat.completions.create(
@@ -89,7 +106,12 @@ def _call_llm(provider: str, client, system: str, user: str, max_tokens: int = 5
                 {"role": "user", "content": user},
             ],
         )
-        return response.choices[0].message.content.strip()
+        text = response.choices[0].message.content.strip()
+        try:
+            ti = response.usage.prompt_tokens
+            to = response.usage.completion_tokens
+        except Exception:
+            pass
 
     elif provider == "ollama":
         resp = client.post("/api/chat", json={
@@ -100,18 +122,52 @@ def _call_llm(provider: str, client, system: str, user: str, max_tokens: int = 5
                 {"role": "user", "content": user},
             ],
         })
-        return resp.json()["message"]["content"].strip()
+        _data = resp.json()
+        text = _data["message"]["content"].strip()
+        try:
+            ti = _data.get("prompt_eval_count")
+            to = _data.get("eval_count")
+        except Exception:
+            pass
 
-    raise ValueError(f"Unknown provider: {provider}")
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
+
+    ms = (perf_counter() - t0) * 1000.0
+    if obs:
+        try:
+            obs.hooks.on_llm_call(
+                provider=provider, model=model, system=system, user=user,
+                completion=text, tokens_in=ti, tokens_out=to, latency_ms=ms,
+                role=(obs.current().get("role") or "agent"),
+            )
+        except Exception:
+            pass
+    return text
 
 
 def _parse_json(raw: str) -> dict:
-    """Parse JSON from LLM response, handling code fences."""
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw.strip())
+    """Parse JSON from an LLM response — tolerant of code fences AND surrounding prose.
+    Small/local models often wrap the JSON in text ('Here is my estimate: {...}'), which
+    used to crash the WHOLE forecast at json.loads. Now we fall back to extracting the first
+    {...} object anywhere in the text; only raise if there is genuinely no JSON."""
+    s = (raw or "").strip()
+    if s.startswith("```"):
+        parts = s.split("```")
+        s = parts[1] if len(parts) > 1 else s
+        if s.lstrip().lower().startswith("json"):
+            s = s.lstrip()[4:]
+    s = s.strip()
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        m = re.search(r"\{.*\}", s, re.DOTALL)   # first JSON object anywhere in the text
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except (json.JSONDecodeError, ValueError):
+                pass
+        raise ValueError(f"no parseable JSON in LLM response: {(raw or '')[:120]!r}")
 
 
 @dataclass
@@ -154,34 +210,46 @@ Output ONLY valid JSON, no other text."""
         debate_round: int = 1,
         other_estimates: Optional[list[AgentEstimate]] = None,
     ) -> AgentEstimate:
-        user_content = f"Question: {question}\n\nContext:\n{context}\n"
+        with (obs.agent_ctx(agent_id=self.agent_id, persona=self.persona) if obs else contextlib.nullcontext()):
+            user_content = f"Question: {question}\n\nContext:\n{context}\n"
 
-        if other_estimates and debate_round > 1:
-            others_summary = "\n".join([
-                f"- {e.persona}: {e.probability:.0%} confidence={e.confidence:.0%} | {e.reasoning[:150]}"
-                for e in other_estimates
-                if e.agent_id != self.agent_id
-            ])
-            user_content += f"\n--- Other agents' estimates (Round {debate_round - 1}) ---\n{others_summary}\n\nConsider their perspectives. You may update your estimate or defend your original position.\n"
+            if other_estimates and debate_round > 1:
+                others_summary = "\n".join([
+                    f"- {e.persona}: {e.probability:.0%} confidence={e.confidence:.0%} | {e.reasoning[:150]}"
+                    for e in other_estimates
+                    if e.agent_id != self.agent_id
+                ])
+                user_content += f"\n--- Other agents' estimates (Round {debate_round - 1}) ---\n{others_summary}\n\nConsider their perspectives. You may update your estimate or defend your original position.\n"
 
-        if self.memory:
-            memory_str = "\n".join(self.memory[-5:])
-            user_content += f"\nYour relevant past observations:\n{memory_str}"
+            if self.memory:
+                memory_str = "\n".join(self.memory[-5:])
+                user_content += f"\nYour relevant past observations:\n{memory_str}"
 
-        raw = _call_llm(self._provider, self._client, self._build_system_prompt(), user_content)
-        data = _parse_json(raw)
+            raw = _call_llm(self._provider, self._client, self._build_system_prompt(), user_content)
+            data = _parse_json(raw)
 
-        estimate = AgentEstimate(
-            agent_id=self.agent_id,
-            persona=self.persona,
-            probability=float(data["probability"]),
-            confidence=float(data["confidence"]),
-            reasoning=data["reasoning"],
-            key_factors=data.get("key_factors", []),
-            round=debate_round,
-        )
-        self.estimates_history.append(estimate)
-        return estimate
+            estimate = AgentEstimate(
+                agent_id=self.agent_id,
+                persona=self.persona,
+                # clamp to [0,1] — small models sometimes return 8 or 1.5 etc. (don't poison the aggregate)
+                probability=min(max(float(data["probability"]), 0.0), 1.0),
+                confidence=min(max(float(data.get("confidence", 0.6) or 0.6), 0.0), 1.0),
+                reasoning=str(data.get("reasoning", "") or ""),
+                key_factors=data.get("key_factors", []) or [],
+                round=debate_round,
+            )
+            self.estimates_history.append(estimate)
+            if obs:
+                obs.hooks.on_agent_estimate(
+                    agent_id=self.agent_id,
+                    forecast_id=obs.current().get("forecast_id"),
+                    persona=self.persona,
+                    probability=estimate.probability,
+                    confidence=estimate.confidence,
+                    reasoning=estimate.reasoning,
+                    round=debate_round,
+                )
+            return estimate
 
     def add_memory(self, memory: str):
         self.memory.append(memory)
