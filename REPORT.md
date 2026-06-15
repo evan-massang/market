@@ -88,3 +88,35 @@ OK: 11 pass, 1 warn, 0 fail  (of 12 checks)
  GATE 2  (paper bankroll grew after costs):                 FAIL   (start $1000.00 -> equity $978.80, realized $-61.63)
  >>> gates not both passed — stay on paper
 ```
+
+## 7. Deep-improvement program (P0–P13)
+
+A subsequent program rebuilt the harness into a serious forecasting + paper-trading bot, one phase per commit, each phase **adversarially verified** and shipped with tests. Guiding rule throughout: **bet BETTER, not MORE** — every decision-path change is a tightening or pure recording, never a loosening; cold-start (thin data, the situation today) leaves the live decision **unchanged**, and the new machinery activates only as resolved data accrues. Paper-only; the LLM-key path was never touched; observability was never deleted or weakened; no gate was faked.
+
+| Phase | What shipped | Key safety property |
+|---|---|---|
+| P0+P1 | `doctor` preflight, no-network test suite + runner, herding_score crash-safety | read-only; daemons survive one bad market |
+| P2 | multi-window, event-aware candidate scanner | transparent sub-scores |
+| P3 | event-level multi-bet portfolio engine (ME outcome math) | rejects incoherent / −EV / over-cap |
+| P4 | 5-way classifier `fine_label` + reason codes + per-label perf → auto observe-only | `.label` backward-compatible |
+| P5 | structured, scored, replayable evidence packs + persistent cache + `no_data`/`low_evidence` guards | swarm input **byte-identical** |
+| P6 | versioned forecasts + isotonic calibration + challenger ensemble + skill-weighted blend | **bit-exact cold-start no-op** |
+| P7 | EV-after-costs gate + CLV + theme P&L + adaptive `min_edge` + experiments | gate reject-only; `min_edge` floor-only-up |
+| P8 | adaptive guards (stale / low-liq / high-spread / correlation / bad-theme) + stricter-when-losing | clean market not over-blocked; fail-open |
+| P9 | bankroll kill switch (drawdown / loss-limit / cooldown) + exposure caps + mark-to-market | pause = observe-only; fail-open |
+| P10 | consolidated metrics (log loss / ROI / hit / profit factor / drawdown / CLV) + gate report | read-only; gates from `scoreboard` (unfaked) |
+| P11 | dashboard command center (skips+reasons, losing-trade diagnosis, next-best-actions, replay) | read-only; never claims profit |
+| P12 | full decision provenance + config-change history + decision diffs | read-only + append-only history |
+| P13 | the 18 acceptance criteria as one re-runnable capstone test | 18/18 PASS |
+
+**Test suite: 41/41 modules, no-network.** `python run_tests.py --no-llm` (includes the 7 obs acceptance criteria + `harness.tests.test_acceptance`'s 18-criterion capstone).
+
+### Acceptance criteria — 18/18 PASS (`python -m harness.tests.test_acceptance`)
+
+C1 doctor read-only · C2 classifier backward-compat · C3 fine_label+reason_code · C4 evidence byte-compat · C5 no-data guard · C6 cold-start blend no-op · C7 calibration passthrough · C8 ensemble default single · C9 EV gate reject-only · C10 adaptive min_edge ≥ floor · C11 CLV sign · C12 guards no over-block · C13 kill switch + fail-open · C14 exposure caps · C15 metrics honest (cold == FAIL) · C16 command center read-only · C17 provenance config-change · C18 obs hash chain clean + paper-only.
+
+### Honest status (`python -m harness.metrics`, live book)
+
+- **GATE 1 FAIL** — 0 resolved *opinion* markets (needs ≥ 50; they accrue over weeks).
+- **GATE 2 FAIL** — equity below the starting bankroll.
+- **Model log loss 0.758 > coin-flip 0.693** over its 10 resolved forecasts — the model is **not** beating chance yet, so observe-only / paper is the correct posture. No profit is claimed. The system exists to *measure* whether the edge is real before any real money, and to bet more selectively (not more often) as the evidence comes in.
