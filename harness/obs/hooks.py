@@ -217,6 +217,47 @@ def on_forecast_final(
     return ev
 
 
+# ── evidence pack (B3 — replayable evidence) ────────────────────────────────────
+@_hook
+def on_evidence_pack(
+    forecast_id,
+    market_id,
+    content_hash,
+    n_sources,
+    total_items,
+    evidence_quality,
+    sources_summary,
+    pack_json,
+):
+    """Freeze the EXACT evidence bundle that backed a forecast so it is replayable.
+
+    Stores the full ``pack_json`` once via ``blobs.store_blob`` (content-addressed
+    and secret-scrubbed before it ever touches disk) and emits an ``evidence.pack``
+    event referencing that blob (``blob_ref`` + ``blob_hash``) alongside the
+    caller's integrity ``content_hash``, a compact per-source ``sources_summary``,
+    the overall ``evidence_quality`` score, the ``n_sources`` / ``total_items``
+    counts, and the ``forecast_id`` / ``market_id`` it belongs to. The heavy pack
+    text lives ONLY in the blob; the JSONL line carries just the hashes + summary
+    so explain()/replay() can join the full evidence back on demand — making the
+    exact evidence used at decision time reconstructable.
+
+    Observation-only; degrades to a no-op on any internal failure.
+    """
+    blob_hash, blob_ref = blobs.store_blob(pack_json if pack_json is not None else "")
+    return eventlog.emit(
+        "evidence.pack",
+        forecast_id=forecast_id,
+        market_id=market_id,
+        content_hash=content_hash,
+        blob_hash=blob_hash,
+        blob_ref=blob_ref,
+        n_sources=n_sources,
+        total_items=total_items,
+        evidence_quality=evidence_quality,
+        sources_summary=sources_summary,
+    )
+
+
 # ── sizing & trading ───────────────────────────────────────────────────────────
 @_hook
 def on_sizing(

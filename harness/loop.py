@@ -100,43 +100,22 @@ class LoopConfig:
 
 # ── context enrichment (fed UPSTREAM to the forecaster) ──────────────────────
 def _build_enrichment(market: dict, cfg: LoopConfig) -> str:
-    blocks: list[str] = []
-    if cfg.use_signals:
-        try:
-            sig = signals_mod.compute_signals(market)
-            fired = sig.get("fired", [])
-            if fired:
-                blocks.append("[Market microstructure signals — WhoIsSharp port]\n"
-                              f"fired: {', '.join(fired)} | metrics: {sig.get('raw_metrics', {})}")
-        except Exception as e:
-            if obs:
-                obs.hooks.on_error(where="loop._build_enrichment.signals", exc=e, action="skip",
-                                   context={"market_id": market.get("market_id")})
-    if cfg.use_gdelt:
-        try:
-            q = gdelt_mod.build_query(market.get("question", ""))
-            ctx = gdelt_mod.gdelt_context(q, timespan="14d", max_records=30)
-            blocks.append("[News & sentiment — GDELT]\n" + gdelt_mod.format_context_for_llm(ctx))
-        except Exception as e:
-            if obs:
-                obs.hooks.on_error(where="loop._build_enrichment.gdelt", exc=e, action="skip",
-                                   context={"market_id": market.get("market_id")})
-    # Wikipedia factual grounding for the question's entities (keyless). Defaults on; set
-    # cfg.use_wiki=False to disable. GDELT = what the press SAYS; Wikipedia = the FACTS.
-    if getattr(cfg, "use_wiki", True):
-        try:
-            from harness import wiki as wiki_mod
-            ents = gdelt_mod.extract_entities(market.get("question", ""))
-            wblock = wiki_mod.wiki_context(ents, n=2)
-            if wblock:
-                blocks.append(wblock)
-        except Exception as e:
-            if obs:
-                obs.hooks.on_error(where="loop._build_enrichment.wiki", exc=e, action="skip",
-                                   context={"market_id": market.get("market_id")})
-    if not blocks:
-        return ""
-    return "=== HARNESS UPSTREAM CONTEXT (facts + news/sentiment + microstructure) ===\n" + "\n\n".join(blocks)
+    """Backwards-compatible GATHER entry point used by the loop / predict_today / place_bet.
+
+    Delegates to the ONE canonical gather path (evidence_pack.build_evidence_pack) and
+    returns its swarm-input text, which is byte-identical to the historical join (same
+    header, per-block headers, ``"\n\n"`` join, ``""`` when no blocks). Signature is
+    unchanged so every existing caller keeps working. Callers that want the structured
+    pack (per-source scores + content hash) should use :func:`build_pack`.
+    """
+    return build_pack(market, cfg).text
+
+
+def build_pack(market: dict, cfg: LoopConfig):
+    """Structured GATHER: the full EvidencePack (sources + freshness/relevance/quality
+    scores + a stable content hash). ``build_pack(m, cfg).text`` == ``_build_enrichment(m, cfg)``."""
+    from harness.evidence_pack import build_evidence_pack
+    return build_evidence_pack(market, cfg)
 
 
 # ── forecast (real swarm or dry-run stub) ─────────────────────────────────────

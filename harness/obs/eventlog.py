@@ -27,6 +27,36 @@ from .ids import current
 _GENESIS = "0" * 64
 
 
+# Canonical registry of every event name emit() may write — the single source of
+# truth for "what events exist". Each name has exactly one payload builder in
+# obs.hooks. emit() itself does NOT validate against this set (logging must never
+# reject a call); the registry exists so tooling (explain/replay/transcript) and
+# tests share one authoritative, APPEND-ONLY list. Never remove or rename an
+# entry — only append. Listed in canonical pipeline order.
+CANONICAL_EVENTS = (
+    "run.start",
+    "data.fetch",
+    "classify.decision",
+    "forecast.start",
+    "llm.call",
+    "agent.estimate",
+    "debate.round",
+    "blend.compute",
+    "forecast.final",
+    "evidence.pack",
+    "sizing.decision",
+    "trade.open",
+    "trade.skip",
+    "event.portfolio",
+    "resolution.observed",
+    "trade.settle",
+    "score.brier",
+    "gate.eval",
+    "run.end",
+    "error",
+)
+
+
 def line_sha(text):
     """sha256 hex of the exact line text (utf-8), WITHOUT any trailing newline."""
     try:

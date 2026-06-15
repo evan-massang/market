@@ -235,6 +235,32 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                             inputs={"market_id": mid, "p": p, "consensus": cons, "price": price, "layer": "guard"},
                         )
                     continue
+                # data-sufficiency gate (mirror of predict_today): "no data, no bet". Gather the
+                # SAME canonical evidence pack here so sameday honors the same no_data / low_evidence
+                # guards and freezes the evidence for replay. Best-effort — build_pack never raises;
+                # a gather failure (pack=None) is treated as no_data (no bet), never as a green light.
+                from harness import loop as _loop
+                from harness.predict_today import (_evidence_guard as _ev_guard,
+                                                   _emit_evidence_pack as _ev_emit)
+                try:
+                    pack = _loop.build_pack(m, _loop.LoopConfig())
+                except Exception as e:
+                    pack = None
+                    if obs:
+                        obs.hooks.on_error(where="sameday.place_sameday.evidence", exc=e, action="skip",
+                                           context={"market_id": mid})
+                _ev_emit(mid, pack)
+                ev_ok, ev_reason = _ev_guard(pack)
+                if not ev_ok:
+                    print(f"  [sameday] DECISION: NO BET — {ev_reason}")
+                    if obs:
+                        obs.hooks.on_trade_skip(
+                            forecast_id=(obs.current().get("forecast_id") if obs else None),
+                            reason=ev_reason,
+                            inputs={"market_id": mid, "p": p, "price": price,
+                                    "quality": (pack.evidence_quality if pack else 0.0), "layer": "evidence"},
+                        )
+                    continue
                 # P3 — MULTI-LEG mutually-exclusive event: evaluate the WHOLE event as a portfolio
                 # (replaces the one-YES Guard D below for ME events) and act ONLY on this leg's slot.
                 # Single-market opinions fall through to the existing conviction-sized per-market path.
@@ -277,7 +303,11 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                     continue
                 # (4) bet ONLY on a real edge — conviction-scaled stake (bigger when surer).
                 from harness.predict_today import _conviction, _conviction_sizing, CONVICTION_CAP_MAX as _CAPMAX
-                conv = _conviction(p, bp, cons, p - price, had_data=False)   # sameday gathers no GDELT
+                # sameday now gathers the same evidence pack (above) -> feed its quality into
+                # conviction so a stronger evidence base raises (and a thin one lowers) the stake.
+                conv = _conviction(p, bp, cons, p - price,
+                                   had_data=bool(pack and pack.text),
+                                   evidence_quality=(pack.evidence_quality if pack else None))
                 lam, cap = _conviction_sizing(conv)
                 print(f"  [sameday] conviction {conv:.2f} → {lam:g}x Kelly, cap {cap:.0%}")
                 sz = sizing.size_bet(p, price, wallet.bankroll_for_sizing(), lam=lam, cap=cap, min_edge=min_edge)

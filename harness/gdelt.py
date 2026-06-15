@@ -54,6 +54,7 @@ MIN_REQUEST_INTERVAL = 6.0   # min spacing between GDELT calls (>=5s, with margi
                              # exactly 5.0 sits on the boundary and GDELT still 429s)
 THROTTLE_BACKOFF = 6.0       # extra spacing imposed after we *see* a throttle body
 CACHE_TTL = 15 * 60.0        # in-memory cache lifetime (seconds)
+PERSIST_TTL = 6 * 3600.0     # persistent (cross-restart) cache lifetime for news (~6h)
 
 # Module-global throttle state. We use time.monotonic() (never wall-clock) so the
 # spacing is immune to clock changes. A lock keeps it correct if the harness ever
@@ -144,6 +145,20 @@ def _get(params: dict) -> dict:
     if cached is not None:
         return cached  # type: ignore[return-value]
 
+    # Persistent (cross-restart) cache — belt-and-suspenders BEHIND the in-memory
+    # one. The in-memory _cache is lost on every Python restart; this survives it.
+    # Best-effort: ANY error here falls through to the unchanged live path below.
+    _pkey = None
+    try:
+        from harness import datacache as _dc
+        _pkey = _dc.make_key("gdelt", repr(key))
+        _pval = _dc.cache_get(_pkey)
+        if isinstance(_pval, dict):
+            _cache_set(key, _pval)   # warm the in-memory cache too
+            return _pval
+    except Exception:
+        _pkey = None
+
     _wait_for_slot()
 
     _t0 = time.perf_counter()
@@ -190,6 +205,13 @@ def _get(params: dict) -> dict:
         return {}
 
     _cache_set(key, data)  # only cache genuine successes (never throttle/empty)
+    # Mirror the genuine success into the persistent cache (best-effort, never raises).
+    if _pkey is not None:
+        try:
+            from harness import datacache as _dc
+            _dc.cache_set(_pkey, data, "gdelt", int(PERSIST_TTL))
+        except Exception:
+            pass
     return data
 
 

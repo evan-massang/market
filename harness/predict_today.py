@@ -24,7 +24,7 @@ except Exception:
     pass
 
 from harness import gamma, classifier, sizing, wallet, journal, challenger, scanner, event_portfolio
-from harness.loop import LoopConfig, _build_enrichment, _forecast, _days_until
+from harness.loop import LoopConfig, _build_enrichment, _forecast, _days_until, build_pack
 
 # ── observability (W1: control-flow / lifecycle / classify / skips / errors) ──
 # Guarded import so a broken/missing obs package can NEVER break a forecast pass.
@@ -82,6 +82,13 @@ MIN_SWARM_CONSENSUS = 0.50                # Guard C: skip if the swarm's interna
 MAX_GROUP_PROB_SUM = 1.20                 # Guard D(b): skip a mutually-exclusive event group whose YES-probs sum above this
 ONE_YES_PER_EVENT = True                  # Guard D(a): at most ONE YES (winner) bet per event group — NO/fade bets are unlimited
 
+# ── data-sufficiency gate (B-series WIRE): "no data, no bet" + thin-evidence observe-only ──
+# These DO NOT touch the forecast: it is ALWAYS computed + logged + frozen (so the calibration
+# backtest keeps learning). They only decide whether the BET is allowed to proceed:
+#   * no_data       — the evidence pack gathered NO real items / no sources -> HARD skip (never bet).
+#   * low_evidence  — 0 < evidence_quality < MIN_EVIDENCE_QUALITY -> observe-only (forecast logged, no bet).
+MIN_EVIDENCE_QUALITY = 0.25
+
 # Daemon idle cadence: when there's no fresh market to forecast, sleep this long instead of
 # spinning every `interval`s (which flooded the log + equity_snapshots with identical rows).
 IDLE_INTERVAL = 600
@@ -100,16 +107,25 @@ CONVICTION_CAP_MAX = 0.10      # up to 10% of bankroll on a maximum-conviction b
 CONVICTION_EDGE_FULL = 0.15    # an absolute edge this large counts as full edge-confidence
 
 
-def _conviction(swarm_p, challenger_p, consensus, edge, had_data):
+def _conviction(swarm_p, challenger_p, consensus, edge, had_data, evidence_quality=None):
     """0..1 conviction from independent reliability signals. Bets that reach this already
-    cleared the guards (so divergence is < threshold, consensus >= MIN, label ok)."""
+    cleared the guards (so divergence is < threshold, consensus >= MIN, label ok).
+
+    `evidence_quality` (optional, 0..1) refines the data term: when supplied, a STRONGER
+    evidence base raises conviction and a thin one lowers it — monotonic in quality and
+    bounded to the same [0.5, 1.0] band the legacy `had_data` flag produced, so weak
+    evidence can NEVER inflate a bet above the had-data baseline. Omitting it preserves the
+    exact legacy behavior (1.0 with data, 0.5 without)."""
     if challenger_p is not None:
         agree = 1.0 - min(1.0, abs(swarm_p - challenger_p) / max(1e-9, MAX_SWARM_CHALLENGER_DIVERGENCE))
     else:
         agree = 0.5
     cons = min(1.0, max(0.0, consensus)) if consensus is not None else 0.5
     edge_conf = min(1.0, abs(edge) / CONVICTION_EDGE_FULL)
-    data = 1.0 if had_data else 0.5
+    if evidence_quality is not None:
+        data = 0.5 + 0.5 * min(1.0, max(0.0, evidence_quality))
+    else:
+        data = 1.0 if had_data else 0.5
     return round(0.40 * agree + 0.30 * cons + 0.20 * edge_conf + 0.10 * data, 3)
 
 
@@ -442,6 +458,51 @@ def _skip(mid, q, reason, *, p=None, price=None):
     return False
 
 
+def _evidence_guard(pack):
+    """Data-sufficiency gate (pure; no I/O). Decides whether the evidence behind a forecast
+    is enough to allow a BET (the forecast itself is logged/frozen regardless). Returns
+    (ok, reason):
+      * (False, "no_data")           — the pack gathered NO real items / no sources at all.
+      * (False, "low_evidence:X.XX") — 0 < evidence_quality < MIN_EVIDENCE_QUALITY (thin).
+      * (True,  "ok")                — enough evidence; the bet may proceed.
+    """
+    if pack is None:
+        return False, "no_data"
+    total = getattr(pack, "total_items", 0) or 0
+    nsrc = getattr(pack, "n_sources", 0) or 0
+    if total <= 0 or nsrc <= 0:
+        return False, "no_data"
+    q = getattr(pack, "evidence_quality", 0.0) or 0.0
+    if 0.0 < q < MIN_EVIDENCE_QUALITY:
+        return False, f"low_evidence:{q:.2f}"
+    return True, "ok"
+
+
+def _emit_evidence_pack(mid, pack):
+    """Best-effort: freeze the EXACT evidence bundle behind this forecast for replay
+    (obs 'evidence.pack'). Observation-only — never changes logic and never raises; the
+    heavy pack text is stored once in a blob, the JSONL line carries hashes + a summary."""
+    if not obs or pack is None:
+        return
+    try:
+        import json as _json
+        summary = "; ".join(f"{s.name}:{s.item_count}(q{s.quality:.2f})"
+                             for s in getattr(pack, "sources", [])) or "(none)"
+        obs.hooks.on_evidence_pack(
+            forecast_id=(obs.current().get("forecast_id") if obs else None),
+            market_id=mid,
+            content_hash=pack.content_hash,
+            n_sources=pack.n_sources,
+            total_items=pack.total_items,
+            evidence_quality=pack.evidence_quality,
+            sources_summary=summary,
+            pack_json=_json.dumps(pack.to_dict(), ensure_ascii=False, default=str),
+        )
+    except Exception as e:
+        if obs:
+            obs.hooks.on_error(where="predict_today._emit_evidence_pack", exc=e, action="skip")
+
+
 def predict_one(m, cfg):
     q, price, mid, hl = m["question"], m["_price"], m["market_id"], m["_hl"]
     label = m.get("_label", "unknown")
@@ -461,13 +522,18 @@ def predict_one(m, cfg):
         if SKIP_MECHANICAL and label == "mechanical":
             return _skip(mid, q, "mechanical", price=price)
 
-        # 2 — GATHER
+        # 2 — GATHER — ONE canonical evidence pack. `enr` (= pack.text) is BYTE-IDENTICAL to
+        #    the legacy _build_enrichment join, so the swarm sees exactly the same context text.
         print("\n[2/4] GATHER — pulling GDELT news/sentiment + microstructure signals…", flush=True)
         t0 = time.time()
-        enr = _build_enrichment(m, cfg)
-        print(f"      gathered {len(enr)} chars of real context in {time.time()-t0:.0f}s")
+        pack = build_pack(m, cfg)
+        enr = pack.text
+        print(f"      gathered {len(enr)} chars of real context in {time.time()-t0:.0f}s "
+              f"({pack.n_sources} sources, {pack.total_items} items, evidence quality {pack.evidence_quality:.2f})")
         for line in (enr.splitlines()[:8] if enr else ["(no external context found for this market)"]):
             print("      | " + line[:100])
+        # freeze the EXACT evidence bundle behind this forecast for replay (best-effort).
+        _emit_evidence_pack(mid, pack)
 
         # 2.5 — REPORT (MiroFish + crowd agents build a report; it is fed to the LLM, not run as one)
         if USE_MIROFISH:
@@ -504,6 +570,15 @@ def predict_one(m, cfg):
         if not ok:
             print("\n[4/4] BET — reliability guard…", flush=True)
             return _skip(mid, q, reason, p=p, price=price)
+
+        # ── data-sufficiency gate ("no data, no bet"): the forecast above is already computed +
+        #    logged + frozen; here we only WITHHOLD the bet. no_data (no real evidence at all) is a
+        #    HARD skip; low_evidence (0 < quality < MIN_EVIDENCE_QUALITY) is observe-only. Runs
+        #    BEFORE sizing AND before the multi-leg event path, so neither path bets without data. ──
+        ev_ok, ev_reason = _evidence_guard(pack)
+        if not ev_ok:
+            print("\n[4/4] BET — evidence gate (no bet)…", flush=True)
+            return _skip(mid, q, ev_reason, p=p, price=price)
 
         # ── P4B: OBSERVE-ONLY label — the forecast above is saved + logged, but this
         #    fine_label historically lost money / didn't beat the market, so NO bet is
@@ -546,7 +621,8 @@ def predict_one(m, cfg):
 
         # 4 — BET — conviction-scaled stake (bigger when surer); size_bet mechanics UNCHANGED
         print("\n[4/4] BET — sizing on the swarm's edge vs the market…", flush=True)
-        conv = _conviction(p, bp, meta.get("consensus"), p - price, bool(enr))
+        conv = _conviction(p, bp, meta.get("consensus"), p - price, bool(enr),
+                           evidence_quality=pack.evidence_quality)
         lam, cap = _conviction_sizing(conv)
         print(f"      conviction {conv:.2f} → {lam:g}x Kelly, cap {cap:.0%}")
         sz = sizing.size_bet(p, price, wallet.bankroll_for_sizing(), lam=lam, cap=cap, min_edge=cfg.min_edge)

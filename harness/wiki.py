@@ -27,12 +27,25 @@ _SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 # Wikimedia's UA policy wants tool name + version + contact; a generic UA gets 403'd.
 _HEADERS = {"User-Agent": "PolymarketResearchHarness/1.0 (paper trading research; harness@example.org)"}
 _TIMEOUT = 15.0
+_PERSIST_TTL = 7 * 86400  # persistent (cross-restart) cache lifetime for facts (~7d)
 
 
 def wiki_summary(term: str, max_chars: int = 600) -> str:
     """Lead-section extract for an entity, trimmed. '' on 404 / error / disambiguation."""
     if not term:
         return ""
+    # Persistent (cross-restart) cache — facts change slowly, so a 7d TTL spares
+    # the live Wikipedia REST call. Best-effort: ANY error falls through to the
+    # unchanged live fetch below, so the returned value stays byte-identical.
+    _pkey = None
+    try:
+        from harness import datacache as _dc
+        _pkey = _dc.make_key("wiki", term.strip().lower(), max_chars)
+        _hit = _dc.cache_get(_pkey)
+        if isinstance(_hit, str) and _hit:
+            return _hit
+    except Exception:
+        _pkey = None
     try:
         _url = _SUMMARY_URL + term.strip().replace(" ", "_")
         _t0 = time.perf_counter()
@@ -53,8 +66,14 @@ def wiki_summary(term: str, max_chars: int = 600) -> str:
         d = r.json() or {}
         if d.get("type") == "disambiguation":
             return ""
-        extract = " ".join((d.get("extract") or "").split())
-        return extract[:max_chars]
+        extract = " ".join((d.get("extract") or "").split())[:max_chars]
+        # Mirror a genuine non-empty extract into the persistent cache (best-effort).
+        if _pkey is not None and extract:
+            try:
+                _dc.cache_set(_pkey, extract, "wiki", _PERSIST_TTL)
+            except Exception:
+                pass
+        return extract
     except Exception:
         return ""
 

@@ -77,6 +77,10 @@ _RANK = {
     "debate.round": 5,
     "blend.compute": 6,
     "forecast.final": 7,
+    # evidence.pack ties with forecast.final: it is the exact evidence bundle
+    # that backed the final decision, surfaced adjacent to it (tie broken by
+    # ts then file/line, so it renders in genuine emission order).
+    "evidence.pack": 7,
     "sizing.decision": 8,
     "trade.open": 9,
     "trade.skip": 9,
@@ -270,6 +274,18 @@ def _fmt_event(idx, e):
         out.extend(
             _indent_block(
                 ctext if ctext is not None else "<blob missing: %s>" % ch
+            )
+        )
+
+    # evidence.pack: pull the FULL evidence bundle back from the blob so the
+    # trail shows the EXACT evidence used at decision time (not just its hash).
+    if ev == "evidence.pack":
+        bh = e.get("blob_hash")
+        etext = blobs.read_blob(bh) if bh else None
+        out.append("     --- EVIDENCE PACK (full text, joined from blob) ---")
+        out.extend(
+            _indent_block(
+                etext if etext is not None else "<blob missing: %s>" % bh
             )
         )
     return "\n".join(out)
