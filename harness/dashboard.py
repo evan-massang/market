@@ -122,6 +122,34 @@ def api_state():
     return JSONResponse(data)
 
 
+@app.get("/api/command_center")
+def api_command_center():
+    """P11: read-only command-center panel — skipped markets + reasons, losing-trade
+    diagnosis, theme/label performance, next-best-actions, replay handles, and the
+    consolidated metrics/gate report. Best-effort: never 500s the dashboard."""
+    try:
+        from harness import command_center
+        data = command_center.command_center()
+    except Exception as e:
+        data = {"error": f"command_center unavailable: {e}"}
+    try:
+        from harness import metrics
+        data["metrics"] = metrics.full_report()
+    except Exception as e:
+        data["metrics"] = {"error": f"metrics unavailable: {e}"}
+    return JSONResponse(data)
+
+
+@app.get("/api/explain/{market_id}")
+def api_explain(market_id: str):
+    """P11: clickable obs replay — the full reconstructed decision trail for a market."""
+    try:
+        from harness.obs import explain as _explain
+        return JSONResponse({"market_id": market_id, "trail": _explain.explain(market_id)})
+    except Exception as e:
+        return JSONResponse({"market_id": market_id, "error": f"explain unavailable: {e}"})
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(HTML, headers={"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"})
