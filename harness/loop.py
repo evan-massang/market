@@ -389,8 +389,13 @@ def settle_resolved(cfg: LoopConfig | None = None) -> list[dict]:
     journal.init_journal()
     positions = wallet.get_open_positions()
     seen, results = {}, []
+    # P7 (B2): snapshot the OPEN positions per market BEFORE they settle — each row
+    # still carries side / fill_price / market_p, which the CLV recorder needs (the
+    # post-settle rows are still present but we capture them here for a clean read).
+    pos_by_market: dict = {}
     for p in positions:
         seen.setdefault(p["market_id"], p["question"])
+        pos_by_market.setdefault(p["market_id"], []).append(p)
     print(f"[settle] {len(seen)} markets with open paper positions to check…")
     for mid, question in seen.items():
         with contextlib.ExitStack() as _mes:
@@ -427,6 +432,36 @@ def settle_resolved(cfg: LoopConfig | None = None) -> list[dict]:
                     if obs:
                         try:
                             obs.hooks.on_error(where="loop.settle_resolved.label_perf",
+                                               exc=_e, action="skip", context={"market_id": mid})
+                        except Exception:
+                            pass
+                # P7 — CLV + experiment-outcome attribution (best-effort; NEVER breaks
+                # settlement, NEVER touches a gate/threshold/bet). Pure recording.
+                try:
+                    from harness import clv as _clv, experiments as _experiments
+                    from harness import scoreboard as _sb, label_perf as _lp
+                    _theme = _sb.theme_of(question)
+                    # CLV: entry = our actual fill_price; closing-line PROXY = the
+                    # pre-resolution market price stored on the position (no live closing
+                    # snapshot exists at on-chain resolution — documented proxy).
+                    for _pos in pos_by_market.get(mid, []):
+                        _clv.record_clv(mid, _pos.get("side"),
+                                        entry_price=_pos.get("fill_price"),
+                                        closing_price=_pos.get("market_p"),
+                                        theme=_theme)
+                    # Experiment outcome: attribute this resolved market's Brier + realized
+                    # P&L to the currently-ACTIVE experiment (baseline today; no auto-switch).
+                    _mp, _kp = _lp.latest_forecast_pq(mid)
+                    _model_brier = None if _mp is None else (_mp - outcome) ** 2
+                    _market_brier = None if _kp is None else (_kp - outcome) ** 2
+                    _exp = _experiments.active_experiment()
+                    _experiments.record_experiment_outcome(
+                        _exp.get("exp_key") if isinstance(_exp, dict) else None,
+                        mid, _model_brier, _market_brier, pnl)
+                except Exception as _e:
+                    if obs:
+                        try:
+                            obs.hooks.on_error(where="loop.settle_resolved.p7",
                                                exc=_e, action="skip", context={"market_id": mid})
                         except Exception:
                             pass

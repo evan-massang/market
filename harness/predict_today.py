@@ -39,6 +39,93 @@ try:
 except Exception:
     obs = None
 
+# ── P7: EV-after-costs gate + per-theme adaptive min_edge + experiment tagging ──
+# Additive + guarded: a broken/missing P7 module can NEVER break a forecast pass.
+# Every wired effect is a pure TIGHTENING or a passive recording (see the helpers
+# below). On ANY import/runtime fault we fall back to the EXACT pre-P7 behavior
+# (the prior gates), so cold-start / thin-data behavior is never LOOSER than pre-P7.
+try:
+    from harness import profitability as _profitability
+except Exception:
+    _profitability = None
+try:
+    from harness import adaptive as _adaptive
+    from harness import scoreboard as _scoreboard_p7
+except Exception:
+    _adaptive = None
+    _scoreboard_p7 = None
+try:
+    from harness import experiments as _experiments
+except Exception:
+    _experiments = None
+
+
+def _p7_adaptive_min_edge(question, base_min_edge):
+    """P7 (B3): per-theme adaptive min_edge, FLOORED at the live base (never looser).
+
+    Returns ``max(adaptive_min_edge(theme, floor=base), base)``. Cold start / thin
+    data / any error -> ``base_min_edge`` EXACTLY (the pre-P7 value), so today's
+    behavior is unchanged. FLOOR-ONLY-UP: the result is never below base_min_edge,
+    so wiring this in can only demand MORE edge, never less."""
+    if _adaptive is None or _scoreboard_p7 is None:
+        return base_min_edge
+    try:
+        theme = _scoreboard_p7.theme_of(question)
+        me = _adaptive.adaptive_min_edge(theme, floor=base_min_edge)
+        return max(float(me), float(base_min_edge))
+    except Exception as e:
+        if obs:
+            try:
+                obs.hooks.on_error(where="predict_today._p7_adaptive_min_edge", exc=e, action="skip")
+            except Exception:
+                pass
+        return base_min_edge
+
+
+def _p7_ev_gate(model_p, market_p, side):
+    """P7 (B1): EV-after-costs HARD GATE. Returns ``(ok, reason)``.
+
+    PURE TIGHTENING: ``ok`` is True unless the slippage-worsened wallet fill makes
+    this share non-positive-EV, in which case ``(False, 'neg_ev_after_costs')``. It
+    uses the wallet's OWN cost model (WalletConfig slippage + fee_frac) so the
+    gate's fill is identical to how the fill actually happens. On any error / if the
+    module is unavailable we fall back to pre-P7 behavior (allow) — never LOOSER
+    than pre-P7 (which had no such gate), and never break a healthy +edge bet on an
+    internal fault."""
+    if _profitability is None:
+        return True, "ev_gate_unavailable"
+    try:
+        return _profitability.ev_gate(model_p, market_p, side)
+    except Exception as e:
+        if obs:
+            try:
+                obs.hooks.on_error(where="predict_today._p7_ev_gate", exc=e, action="skip")
+            except Exception:
+                pass
+        return True, "ev_gate_error"
+
+
+def _p7_experiment_tag():
+    """P7 (B4): the active parameter experiment, materialized + returned best-effort.
+
+    Calling ``active_experiment()`` lazily creates the 'baseline' experiment (whose
+    params ARE the current live defaults) so a forecast always runs under a known,
+    recorded tag. PURELY INFORMATIONAL — there is NO write path back into
+    sizing/gating, so this can never loosen a gate or change a bet. Returns the
+    exp_key or None."""
+    if _experiments is None:
+        return None
+    try:
+        exp = _experiments.active_experiment()
+        return exp.get("exp_key") if isinstance(exp, dict) else None
+    except Exception as e:
+        if obs:
+            try:
+                obs.hooks.on_error(where="predict_today._p7_experiment_tag", exc=e, action="skip")
+            except Exception:
+                pass
+        return None
+
 
 def _obs_run_config(cfg):
     """Effective config snapshot for run.start (observation-only)."""
@@ -633,6 +720,12 @@ def predict_one(m, cfg):
         # P6 step 5/6 (VERSION + OBS): stash the full context (swarm p, ensemble, blend, calibrated
         # decision p, weights, calibration method/n) in the forecast_versions audit table. Passive.
         _record_forecast_version(mid, q, p, ens, blended, final_p, weights, cal)
+        # P7 (B4): tag this forecast with the ACTIVE parameter experiment (baseline today;
+        # no auto-switch). Materializes + logs the tag so the resolved outcome can be
+        # attributed at settle. Passive/best-effort — never feeds back into the decision.
+        _p7_exp_key = _p7_experiment_tag()
+        if _p7_exp_key:
+            print(f"      experiment: running under '{_p7_exp_key}' parameter set")
 
         # ── post-forecast reliability guards B/C/D(b): need swarm p, challenger bp, consensus.
         #    (group re-read here too — a sibling leg may have been bet during the long forecast.) ──
@@ -675,6 +768,12 @@ def predict_one(m, cfg):
             if not (ep.accept and my_pos is not None):
                 return _skip(mid, q, event_leg_reject_reason(ep, mid), p=p, price=price)
             side, stake, edge = my_pos["side"], my_pos["stake"], my_pos["edge"]
+            # P7 (B1): EV-after-costs HARD GATE on the accepted event leg. Side is now
+            # known; reject if the slippage-worsened fill is non-positive-EV (pure
+            # tightening — a healthy +edge leg is unaffected). Uses the wallet cost model.
+            ev_ok, ev_reason = _p7_ev_gate(final_p, price, side)
+            if not ev_ok:
+                return _skip(mid, q, ev_reason, p=p, price=price)
             regime = meta.get("regime", "")
             sig = "LONG (YES)" if side == "YES" else "SHORT (NO)"
             print(f"      event portfolio ACCEPTS this leg → {side} ${stake:.2f} "
@@ -709,7 +808,11 @@ def predict_one(m, cfg):
                            evidence_quality=pack.evidence_quality)
         lam, cap = _conviction_sizing(conv)
         print(f"      conviction {conv:.2f} → {lam:g}x Kelly, cap {cap:.0%}")
-        sz = sizing.size_bet(final_p, price, wallet.bankroll_for_sizing(), lam=lam, cap=cap, min_edge=cfg.min_edge)
+        # P7 (B3): per-theme adaptive min_edge, FLOORED at cfg.min_edge (cold start ==
+        # cfg.min_edge exactly, so sizing is unchanged today; only RAISES for a theme
+        # with a real losing track record). Replaces the hardcoded cfg.min_edge.
+        me = _p7_adaptive_min_edge(q, cfg.min_edge)
+        sz = sizing.size_bet(final_p, price, wallet.bankroll_for_sizing(), lam=lam, cap=cap, min_edge=me)
         print(f"      edge {sz.edge:+.1%} → {sz.reason}")
         regime = meta.get("regime", "")
         sig = "LONG (YES)" if sz.edge > 0 else "SHORT (NO)"
@@ -725,6 +828,12 @@ def predict_one(m, cfg):
                     inputs={"market_id": mid, "p": p, "price": price, "edge": sz.edge, "layer": "sizer"},
                 )
             return False
+        # P7 (B1): EV-after-costs HARD GATE. Side + stake are known and the edge cleared
+        # min_edge; reject a bet whose slippage-worsened fill is non-positive-EV (pure
+        # tightening — a healthy +edge bet passes untouched). Same cost model as the wallet.
+        ev_ok, ev_reason = _p7_ev_gate(final_p, price, sz.side)
+        if not ev_ok:
+            return _skip(mid, q, ev_reason, p=p, price=price)
         # Give the precise AI pipeline its own exposure headroom so the daemon's price-rule
         # positions don't crowd out its (small, Kelly-capped) data-driven bets.
         fr = wallet.open_position(mid, q, sz.side, final_p, price, sz.edge, sz.stake,

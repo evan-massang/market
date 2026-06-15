@@ -150,6 +150,103 @@ def compute() -> dict:
     }
 
 
+def profitability_report() -> dict:
+    """P7 read-only surfacing: per-theme paper P&L, mean CLV (overall + per theme),
+    the adaptive min_edge per theme, edge-decay buckets, and the experiment
+    leaderboard.
+
+    PURELY INFORMATIONAL — this reads analytics tables only and touches NO gate, NO
+    threshold, and NO bet decision. Best-effort: any piece that errors or is too
+    thin degrades to a safe default ({} / None) so a thin-data run simply shows
+    "not yet meaningful". Lazy imports avoid an import cycle (adaptive imports
+    scoreboard)."""
+    out = {"theme_pnl": {}, "adaptive_min_edge": {}, "mean_clv": None,
+           "clv_by_theme": {}, "edge_decay": {}, "experiment_leaderboard": []}
+    try:
+        from harness import adaptive as _adaptive
+        out["theme_pnl"] = _adaptive.theme_pnl() or {}
+        known = {"elections", "approval", "geopolitics", "culture", "other"}
+        themes = sorted(set(out["theme_pnl"].keys()) | known)
+        ame = {"_overall": _adaptive.adaptive_min_edge(None)}
+        for t in themes:
+            ame[t] = _adaptive.adaptive_min_edge(t)
+        out["adaptive_min_edge"] = ame
+    except Exception:
+        pass
+    try:
+        from harness import clv as _clv
+        out["mean_clv"] = _clv.mean_clv()
+        out["clv_by_theme"] = _clv.clv_by_theme()
+        out["edge_decay"] = _clv.edge_decay_report()
+    except Exception:
+        pass
+    try:
+        from harness import experiments as _experiments
+        out["experiment_leaderboard"] = _experiments.experiment_leaderboard()
+    except Exception:
+        pass
+    return out
+
+
+def render_profitability() -> None:
+    """Print the P7 read-only profitability/analytics panel. No gate is shown or
+    changed here — it is clearly labelled as informational."""
+    r = profitability_report()
+    print()
+    print(" P7 ANALYTICS (read-only — informational, changes NO gate/threshold)")
+    print(" " + "-" * 58)
+    # per-theme paper P&L
+    tp = r.get("theme_pnl") or {}
+    if tp:
+        print(f" {'theme':14s} {'n':>4s} {'realized_pnl':>13s} {'win_rate':>9s} {'roi':>8s} {'min_edge':>9s}")
+        ame = r.get("adaptive_min_edge") or {}
+        for theme in sorted(tp):
+            s = tp[theme]
+            me = ame.get(theme)
+            me_s = f"{me:.4f}" if isinstance(me, (int, float)) else "  n/a"
+            print(f" {theme:14s} {s['n']:>4d} {s['realized_pnl']:>+13.4f} "
+                  f"{s['win_rate']:>9.2f} {s['roi']:>+8.3f} {me_s:>9s}")
+    else:
+        print(" per-theme paper P&L: (no settled positions yet)")
+    ame = r.get("adaptive_min_edge") or {}
+    if "_overall" in ame:
+        print(f" adaptive min_edge (overall): {ame['_overall']:.4f}  "
+              f"(floor; only RAISES for a losing theme)")
+    # CLV
+    mc = r.get("mean_clv")
+    if mc:
+        print(f" mean CLV: {mc['mean_clv']:+.4f}  (n={mc['n']}, "
+              f"{mc['pct_positive']*100:.0f}% beat the close)")
+    else:
+        print(" mean CLV: (not yet meaningful — below min_n)")
+    cbt = r.get("clv_by_theme") or {}
+    for theme in sorted(cbt):
+        s = cbt[theme]
+        print(f"   CLV[{theme}]: {s['mean_clv']:+.4f}  (n={s['n']}, {s['pct_positive']*100:.0f}% +)")
+    # edge decay
+    ed = r.get("edge_decay") or {}
+    for bucket in ("<=1d", "1-7d", "7-30d", ">30d", "unknown"):
+        s = ed.get(bucket)
+        if not s:
+            continue
+        cap = s.get("edge_capture")
+        cap_s = f"{cap:+.2f}" if isinstance(cap, (int, float)) else "n/a"
+        print(f"   edge-decay[{bucket:>6s}]: n={s['n']}, realized_ret={s['mean_realized_return']:+.3f}, "
+              f"capture={cap_s}, profitable={s['pct_profitable']*100:.0f}%")
+    # experiment leaderboard
+    lb = r.get("experiment_leaderboard") or []
+    if lb:
+        print(" experiment leaderboard (skill = market_Brier - model_Brier, higher better):")
+        for e in lb:
+            mb, mk = e.get("mean_model_brier"), e.get("mean_market_brier")
+            skill = (mk - mb) if (mb is not None and mk is not None) else None
+            skill_s = f"{skill:+.4f}" if skill is not None else "  n/a"
+            print(f"   {e['exp_key']:16s} n={e['n']:>3d} skill={skill_s} total_pnl={e['total_pnl']:+.2f}")
+    else:
+        print(" experiment leaderboard: (no experiment has enough resolved outcomes yet)")
+    print(" " + "-" * 58)
+
+
 def _fmt(x):
     return f"{x:.4f}" if isinstance(x, (int, float)) else "  n/a "
 
@@ -187,6 +284,11 @@ def render() -> None:
     print(f" GATE 2  (paper bankroll grew after costs):                 "
           f"{'PASS' if g2['pass'] else 'FAIL'}"
           f"   (start ${g2['starting_bankroll']:.2f} -> equity ${g2['equity']:.2f}, realized ${g2['realized_pnl']:+.2f})")
+    # P7 read-only analytics panel (informational; changes NO gate). Best-effort.
+    try:
+        render_profitability()
+    except Exception:
+        pass
     print()
     verdict = "BOTH GATES PASS — real-money phase may be considered (legality first)" if s["both_pass"] \
         else "gates not both passed — stay on paper"

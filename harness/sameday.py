@@ -260,6 +260,13 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                 p, bp, cons, final_p = _ai_scout(m, price)
                 if p is None:
                     continue
+                # P7 (B4): tag this forecast with the ACTIVE parameter experiment (baseline
+                # today; no auto-switch). Materializes + logs the tag so the resolved outcome
+                # can be attributed at settle. Passive — never feeds back into the decision.
+                from harness.predict_today import _p7_experiment_tag as _p7_exp_tag
+                _p7_exp_key = _p7_exp_tag()
+                if _p7_exp_key:
+                    print(f"  [sameday] experiment: '{_p7_exp_key}'")
                 # reliability guards B/C (Guard A = opinion-only filter above, Guard D = bet_events above):
                 # skip when the swarm number is untrustworthy. Thresholds shared with predict_today.
                 # P6: divergence/consensus guards stay on RAW swarm p vs RAW challenger bp.
@@ -333,6 +340,19 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                             )
                         continue
                     side, stake, edge = my_pos["side"], my_pos["stake"], my_pos["edge"]
+                    # P7 (B1): EV-after-costs HARD GATE on the accepted event leg (pure
+                    # tightening — reject a non-positive-EV-after-slippage leg, healthy legs pass).
+                    from harness.predict_today import _p7_ev_gate as _p7_ev_gate_ep
+                    _ev_ok, _ev_reason = _p7_ev_gate_ep(final_p, price, side)
+                    if not _ev_ok:
+                        print(f"  [sameday] DECISION: NO BET — {_ev_reason}")
+                        if obs:
+                            obs.hooks.on_trade_skip(
+                                forecast_id=(obs.current().get("forecast_id") if obs else None),
+                                reason=_ev_reason,
+                                inputs={"market_id": mid, "event": ev, "side": side, "layer": "ev_gate"},
+                            )
+                        continue
                     print(f"  [sameday] event portfolio ACCEPTS this leg → {side} ${stake:.2f} "
                           f"(EV ${ep.portfolio_ev:+.2f}, worst ${ep.worst_case_loss:+.2f})")
                     # P6: size/record on the DECISION probability final_p (== raw swarm p today).
@@ -351,7 +371,8 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                               f"(event portfolio, {hl:.1f}h) {q[:34]}")
                     continue
                 # (4) bet ONLY on a real edge — conviction-scaled stake (bigger when surer).
-                from harness.predict_today import _conviction, _conviction_sizing, CONVICTION_CAP_MAX as _CAPMAX
+                from harness.predict_today import (_conviction, _conviction_sizing, CONVICTION_CAP_MAX as _CAPMAX,
+                                                   _p7_adaptive_min_edge as _p7_min_edge, _p7_ev_gate as _p7_ev_gate_reg)
                 # sameday now gathers the same evidence pack (above) -> feed its quality into
                 # conviction so a stronger evidence base raises (and a thin one lowers) the stake.
                 # P6: conviction + Kelly size on the DECISION probability final_p (== raw p today);
@@ -361,7 +382,10 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                                    evidence_quality=(pack.evidence_quality if pack else None))
                 lam, cap = _conviction_sizing(conv)
                 print(f"  [sameday] conviction {conv:.2f} → {lam:g}x Kelly, cap {cap:.0%}")
-                sz = sizing.size_bet(final_p, price, wallet.bankroll_for_sizing(), lam=lam, cap=cap, min_edge=min_edge)
+                # P7 (B3): per-theme adaptive min_edge, FLOORED at min_edge (cold start ==
+                # min_edge exactly; only RAISES for a theme with a real losing track record).
+                me = _p7_min_edge(q, min_edge)
+                sz = sizing.size_bet(final_p, price, wallet.bankroll_for_sizing(), lam=lam, cap=cap, min_edge=me)
                 if sz.side is None or sz.stake <= 0:
                     print(f"[sameday] no bet: swarm {p:.0%} vs market {price:.0%} ({sz.reason})")
                     if obs:
@@ -369,6 +393,18 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                             forecast_id=(obs.current().get("forecast_id") if obs else None),
                             reason=f"no_edge: {sz.reason}",
                             inputs={"market_id": mid, "p": p, "price": price, "edge": sz.edge, "layer": "sizer"},
+                        )
+                    continue
+                # P7 (B1): EV-after-costs HARD GATE (pure tightening — reject a sized bet
+                # whose slippage-worsened fill is non-positive-EV; a healthy +edge bet passes).
+                _ev_ok, _ev_reason = _p7_ev_gate_reg(final_p, price, sz.side)
+                if not _ev_ok:
+                    print(f"[sameday] no bet: EV-after-costs — {_ev_reason} (swarm {p:.0%} vs market {price:.0%})")
+                    if obs:
+                        obs.hooks.on_trade_skip(
+                            forecast_id=(obs.current().get("forecast_id") if obs else None),
+                            reason=_ev_reason,
+                            inputs={"market_id": mid, "p": final_p, "price": price, "side": sz.side, "layer": "ev_gate"},
                         )
                     continue
                 # Guard D — one YES (winner) per mutually-exclusive event; NO/fade unlimited.
