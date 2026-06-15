@@ -12,6 +12,7 @@ Reuses loop.py's _build_enrichment / _forecast so it shares the exact swarm + da
 
     python -m harness.predict_today [--max 3] [--size 6] [--rounds 1] [--min-edge 0.03]
                                     [--max-hours 24] [--include-mechanical]
+                                    [--window same_day|near_term|weekly]
 """
 from __future__ import annotations
 import os, sys, time, contextlib
@@ -22,7 +23,7 @@ try:
 except Exception:
     pass
 
-from harness import gamma, classifier, sizing, wallet, journal, challenger
+from harness import gamma, classifier, sizing, wallet, journal, challenger, scanner
 from harness.loop import LoopConfig, _build_enrichment, _forecast, _days_until
 
 # ── observability (W1: control-flow / lifecycle / classify / skips / errors) ──
@@ -172,19 +173,47 @@ def _hours_left(m):
     return None if d is None else d * 24.0
 
 
-def find_candidates(max_hours=24.0, max_n=3, include_mechanical=False):
-    """Same-day markets the AI can predict: resolving within the window (TODAY, not days out),
-    liquid, tradeable price, not already held. Opinion (forecastable) markets first."""
+# ── window selector (P2) — same_day default; near_term / weekly are the new capability ──
+# Env SCANNER_WINDOW or CLI --window picks the time-to-resolution band scanned. The daemon
+# stays SAME_DAY by default (resolves TODAY); near_term (1–3d) / weekly (3–7d) exist so the
+# SAME pipeline can be pointed further out without any code change.
+def _window_name(window=None) -> str:
+    """Resolve the scan window: explicit arg > env SCANNER_WINDOW > 'same_day'.
+    Anything outside {same_day, near_term, weekly} falls back to same_day."""
+    name = str(window or os.getenv("SCANNER_WINDOW") or scanner.SAME_DAY).strip().lower()
+    return name if name in scanner.WINDOWS else scanner.SAME_DAY
+
+
+def find_candidates(max_hours=24.0, max_n=3, include_mechanical=False, window=None):
+    """Markets the AI can predict in the selected resolution WINDOW: liquid, tradeable price,
+    not already held, not stale. Opinion (forecastable) markets first.
+
+    P2 wiring: candidates are SOURCED via scanner.scan(window) (default 'same_day' → resolves
+    TODAY) and ORDERED via scanner.rank_candidates — a transparent composite that already folds
+    in exit-risk / liquidity / forecastability — while PRESERVING the same-day contract:
+    opinion-first, held excluded, liquidity floor, untradeable prices dropped. Stale / degenerate
+    rows are DROPPED (observe-only — never bet). Each returned candidate keeps the legacy
+    _label/_hl/_price keys predict_one consumes, plus scanner's _rank_score / _exit_risk / _why
+    for transparency. Sizing and the betting guards are UNCHANGED.
+    """
+    win_name = _window_name(window)
+    same_day = win_name == scanner.SAME_DAY
+    # Same-day preserves the legacy contract exactly: 0.5h .. max_hours (default 24), so
+    # --max-hours still tightens/loosens the today window. Other windows use their fixed band.
+    scan_window = scanner.Window("same_day", 0.5, float(max_hours)) if same_day else scanner.WINDOWS[win_name]
+
     held = {p["market_id"] for p in wallet.get_open_positions()}
     cands = []
-    for m in gamma.fetch_markets_ending_within(max_hours, limit=200):
+    for m in scanner.scan(scan_window, limit=200):
         mid = m.get("market_id")
         if not mid or mid in held:
             if obs and mid:
                 obs.hooks.on_classify(mid, m.get("question"), None, None, False, "held")
             continue
-        hl = _hours_left(m)
-        if hl is None or hl < 0.5 or hl > max_hours:        # resolves today, not a couple days out
+        hl = m.get("_hours_left")
+        if hl is None:
+            hl = _hours_left(m)
+        if hl is None or hl < 0.5:        # scanner.scan already bounded the upper end per window
             if obs:
                 obs.hooks.on_classify(mid, m.get("question"), None, None, False, "hours")
             continue
@@ -197,6 +226,13 @@ def find_candidates(max_hours=24.0, max_n=3, include_mechanical=False):
             if obs:
                 obs.hooks.on_classify(mid, m.get("question"), None, None, False, "illiquid")
             continue
+        # P2: drop stale / degenerate rows — there's nothing to trade or exit against, so the
+        # bettor must never see them (scanner.is_stale also catches expired / never-traded rows).
+        stale, why_stale = scanner.is_stale(m)
+        if stale:
+            if obs:
+                obs.hooks.on_classify(mid, m.get("question"), None, None, False, f"stale: {why_stale}")
+            continue
         cls = classifier.tag_market(m)
         m["_label"] = cls.label
         m["_hl"] = hl
@@ -206,14 +242,31 @@ def find_candidates(max_hours=24.0, max_n=3, include_mechanical=False):
                                   getattr(cls, "signals", None),
                                   cls.label != "mechanical", "candidate")
         cands.append(m)
-    # opinion (forecastable) first; then most-liquid/substantial markets; then soonest
-    cands.sort(key=lambda m: (m["_label"] != "opinion", -(m.get("liquidity") or 0.0), m["_hl"]))
+
+    # P2: transparent composite rank (folds in exit-risk / liquidity / forecastability / …),
+    # producing annotated COPIES (_rank_score / _exit_risk / _subscores / _why). rank_candidates
+    # recomputes _label/_price/_hours_left identically; we re-attach the legacy _hl key so the
+    # rest of the pipeline (predict_one / run_once) is untouched.
+    ranked = scanner.rank_candidates(cands)
+    for c in ranked:
+        c["_hl"] = c.get("_hours_left")
+    if same_day:
+        # SAME-DAY CONTRACT preserved: opinion (forecastable) strictly FIRST; the exit-risk-aware
+        # rank score breaks ties within a label (replacing the old raw-liquidity tiebreak), then
+        # soonest. Non-same-day windows keep the pure composite-rank order.
+        ranked.sort(key=lambda c: (
+            c.get("_label") != "opinion",
+            -(c.get("_rank_score") or 0.0),
+            c["_hl"] if c.get("_hl") is not None else 1e9,
+        ))
+    cands = ranked
+
     if not include_mechanical:
         # Forecastable = anything NOT clearly mechanical. The regex classifier tags genuine
-        # news/geopolitical markets (Iran peace deal, Israel airspace) as "unknown" — they
-        # are exactly what the swarm should forecast, so keep opinion + unknown and only drop
-        # the clearly-mechanical sports/crypto/weather. (sort above already puts opinion first.)
-        forecastable = [c for c in cands if c["_label"] != "mechanical"]
+        # news/geopolitical markets (Iran peace deal, Israel airspace) as "unknown" — they are
+        # exactly what the swarm should forecast, so keep opinion + unknown and only drop the
+        # clearly-mechanical sports/crypto/weather. (sort above already puts opinion first.)
+        forecastable = [c for c in cands if c.get("_label") != "mechanical"]
         if forecastable:
             cands = forecastable
     return cands[:max_n]
@@ -400,19 +453,20 @@ def _heartbeat(st):
         pass
 
 
-def run_once(cfg, max_n=3, max_hours=24.0, include_mech=False):
+def run_once(cfg, max_n=3, max_hours=24.0, include_mech=False, window=None):
+    win = _window_name(window)
     with contextlib.ExitStack() as _es:
         if obs:
             _es.enter_context(obs.run_ctx(run_id=obs.mint("run")))
             obs.hooks.on_run_start(_obs_run_config(cfg), _obs_bankroll())
-        print("[1/4] FIND — scanning same-day markets the AI can predict…", flush=True)
-        cands = find_candidates(max_hours=max_hours, max_n=max_n, include_mechanical=include_mech)
+        print(f"[1/4] FIND — scanning {win} markets the AI can predict…", flush=True)
+        cands = find_candidates(max_hours=max_hours, max_n=max_n, include_mechanical=include_mech, window=win)
         if not cands:
-            print("      No same-day markets fit (resolving today + liquid + tradeable).")
+            print(f"      No {win} markets fit (in window + liquid + tradeable + not stale).")
             if obs:
                 obs.hooks.on_run_end({"bets": 0, "candidates": 0})
             return 0
-        print(f"      Picked {len(cands)} market(s) resolving today:")
+        print(f"      Picked {len(cands)} {win} market(s):")
         for c in cands:
             print(f"        - [{c['_label']}] {c['_hl']:.1f}h - {c['question'][:62]}")
         bets = 0
@@ -433,13 +487,14 @@ def run_once(cfg, max_n=3, max_hours=24.0, include_mech=False):
         return bets
 
 
-def daemon(cfg, max_hours=24.0, interval=60, include_mech=False):
+def daemon(cfg, max_hours=24.0, interval=60, include_mech=False, window=None):
     """Continuous PRECISE pipeline: settle -> ONE deep find/gather/think/bet per cycle -> repeat.
     One forecast per cycle because each is slow (minutes) on the CPU. No price rule."""
+    win = _window_name(window)
     done: set[str] = set()
     last_key = None
     idle_interval = max(interval, IDLE_INTERVAL)
-    print(f"\n  PRECISE AI DAEMON — find->gather->think->bet, same-day only, no price rule. No stopping.\n", flush=True)
+    print(f"\n  PRECISE AI DAEMON — find->gather->think->bet, {win} window, no price rule. No stopping.\n", flush=True)
     while True:
         cands = []
         worked = False
@@ -449,10 +504,11 @@ def daemon(cfg, max_hours=24.0, interval=60, include_mech=False):
                     _es.enter_context(obs.run_ctx(run_id=obs.mint("run")))
                     obs.hooks.on_run_start(_obs_run_config(cfg), _obs_bankroll())
                 worked = bool(_settle())              # a settlement is real work (P&L moved)
-                cands = [c for c in find_candidates(max_hours=max_hours, max_n=12, include_mechanical=include_mech)
+                cands = [c for c in find_candidates(max_hours=max_hours, max_n=12,
+                                                    include_mechanical=include_mech, window=win)
                          if c["market_id"] not in done]
                 if not cands:
-                    print("[predict] no fresh same-day market to forecast right now — waiting…", flush=True)
+                    print(f"[predict] no fresh {win} market to forecast right now — waiting…", flush=True)
                 else:
                     m = cands[0]                      # one deep forecast per cycle (slow)
                     done.add(m["market_id"])
@@ -491,6 +547,7 @@ def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
     cmd = argv[0] if argv and not argv[0].startswith("--") else "once"
     max_n, size, rounds, min_edge, max_hours, include_mech, interval = 3, 6, 1, 0.03, 24.0, False, 60
+    window = None
     global USE_MIROFISH, MF_WAIT
     for i, a in enumerate(argv):
         if a == "--max": max_n = int(argv[i + 1])
@@ -500,19 +557,21 @@ def main(argv=None):
         elif a == "--max-hours": max_hours = float(argv[i + 1])
         elif a == "--interval": interval = int(argv[i + 1])
         elif a == "--include-mechanical": include_mech = True
+        elif a == "--window": window = argv[i + 1]
         elif a == "--with-mirofish": USE_MIROFISH = True
         elif a == "--mf-wait": MF_WAIT = int(argv[i + 1])
 
+    win = _window_name(window)
     from core.calibration import init_db
     init_db(); wallet.init_wallet(1000.0); journal.init_journal()
     cfg = LoopConfig(swarm_size=size, rounds=rounds, min_edge=min_edge,
                      use_gdelt=True, use_signals=True, challenger=True)
 
     if cmd == "daemon":
-        daemon(cfg, max_hours=max_hours, interval=interval, include_mech=include_mech)
+        daemon(cfg, max_hours=max_hours, interval=interval, include_mech=include_mech, window=win)
     else:
-        print(f"\n  PRECISE same-day AI pipeline — find -> gather -> think -> bet (today only, <{max_hours:.0f}h)\n")
-        run_once(cfg, max_n=max_n, max_hours=max_hours, include_mech=include_mech)
+        print(f"\n  PRECISE {win} AI pipeline — find -> gather -> think -> bet ({win}, <{max_hours:.0f}h)\n")
+        run_once(cfg, max_n=max_n, max_hours=max_hours, include_mech=include_mech, window=win)
 
 
 if __name__ == "__main__":
