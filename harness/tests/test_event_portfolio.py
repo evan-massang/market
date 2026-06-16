@@ -277,6 +277,17 @@ def test_exposure_cap_enforced():
         ("max_exposure must not exceed the event-exposure cap", max_exp, cap, accepted)
 
 
+def test_forced_me_single_leg_cannot_fabricate_certainty():
+    # AUDIT #6: a FORCED mutually-exclusive event with only ONE eligible leg must NOT
+    # renormalize p_norm to 1.0 and fabricate a guaranteed win. It falls back to an
+    # independent binary, so the lone YES can lose its full stake (worst_case < 0).
+    legs = [_leg("win", model_p=0.60, price=0.45)]
+    res = _evaluate(legs, BANKROLL, cfg=_make_cfg(mutually_exclusive=True))
+    worst = float(_attr(res, "worst_case_loss"))
+    assert worst < 0.0, f"lone forced-ME leg fabricated a non-losing worst case: {worst}"
+    assert _attr(res, "mutually_exclusive", False) is False   # fell back to independent binary
+
+
 TESTS = [
     ("one_undervalued_yes", test_one_undervalued_yes),
     ("multiple_overvalued_nos", test_multiple_overvalued_nos),
@@ -284,6 +295,7 @@ TESTS = [
     ("valid_arbitrage_accepted", test_valid_arbitrage_accepted),
     ("fake_arbitrage_rejected", test_fake_arbitrage_rejected),
     ("exposure_cap_enforced", test_exposure_cap_enforced),
+    ("forced_me_single_leg_cannot_fabricate_certainty", test_forced_me_single_leg_cannot_fabricate_certainty),
 ]
 
 if __name__ == "__main__":

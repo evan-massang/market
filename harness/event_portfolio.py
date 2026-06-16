@@ -339,6 +339,13 @@ def evaluate_event(legs, bankroll, cfg: Optional[Config] = None) -> EventPortfol
         is_me = len(eligible) >= 2
     else:
         is_me = bool(cfg.mutually_exclusive)
+    # A real ME race needs >= 2 eligible legs. If a FORCED-ME event has only one
+    # eligible leg (siblings dropped for missing data), ME normalization would put
+    # p_norm=1.0 on the lone leg and FABRICATE a guaranteed win — worst-case flips to
+    # a phantom profit and defeats the worst-case risk gate. Fall back to an
+    # independent binary so the lone leg can lose its full stake. (audit #6)
+    if is_me and len(eligible) < 2:
+        is_me = False
 
     # guard: no usable legs / depleted bankroll  →  no portfolio
     if not eligible:

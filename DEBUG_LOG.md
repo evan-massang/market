@@ -173,4 +173,16 @@ Test: +`test_cli_args` 3/3 (bad-arg rejection, `--dry-run` reaches cfg). Suite 4
 Test: +`test_dashboard_endpoints` 4/4 (all endpoints 200 on an EMPTY db; /api/state
 positions = [] not 500; /debug secret-free + PAPER). Suite 46 modules.
 
+### BATCH 6 — event-portfolio fabricated certainty — FIXED
+
+- **#6 🟠 forced-ME event with <2 eligible legs fabricated a guaranteed win.** When
+  `predict_today` forces `Config(mutually_exclusive=True)` but siblings are dropped for
+  missing data, the lone leg got `p_norm = model_p/model_p = 1.0` and `_me_payoffs`
+  emitted ONE "this leg wins" outcome — so a single YES looked risk-free, the worst-case
+  flipped to a phantom **+profit**, and the worst-case risk gate was defeated (a real
+  reject→accept was reproduced). **FIX:** in `evaluate_event`, a forced-ME event with
+  `len(eligible) < 2` falls back to an independent binary (`is_me=False`), so the lone
+  leg can lose its full stake (worst_case < 0). `harness/event_portfolio.py`. Test:
+  `test_event_portfolio::forced_me_single_leg_cannot_fabricate_certainty`. FIXED.
+
 _(remaining batches appended below as each is closed)_
