@@ -64,9 +64,11 @@ class ThemeStat:
         return self.market_brier_sum / self.n if self.n else None
 
 
-def _resolved_opinion_rows() -> list[dict]:
+def _resolved_opinion_rows(include_test=False, include_demo=False, environment=None) -> list[dict]:
     """Resolved swarm forecasts with a stored market price, restricted to OPINION
-    markets (re-classified from the question)."""
+    markets (re-classified from the question). Excludes test/demo/benchmark records by
+    default so they can't contaminate Gate 1 (audit Phase 3)."""
+    from harness import environment as _env
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
@@ -83,6 +85,10 @@ def _resolved_opinion_rows() -> list[dict]:
     conn.close()
     out = []
     for r in rows:
+        # exclude TEST / bench-test / demo legacy rows from the live gate
+        if not _env.is_live(r["market_id"], include_test=include_test,
+                            include_demo=include_demo, environment=environment):
+            continue
         if tag_market(r["question"]).label != "opinion":
             continue
         model_b = r["brier_score"]
@@ -111,8 +117,9 @@ def _baseline_opinion_briers() -> list[float]:
     return [r["brier_score"] for r in rows if tag_market(r["question"]).label == "opinion"]
 
 
-def compute() -> dict:
-    rows = _resolved_opinion_rows()
+def compute(include_test=False, include_demo=False, environment=None) -> dict:
+    rows = _resolved_opinion_rows(include_test=include_test, include_demo=include_demo,
+                                  environment=environment)
     n = len(rows)
     model_b = sum(r["model_brier"] for r in rows) / n if n else None
     market_b = sum(r["market_brier"] for r in rows) / n if n else None
@@ -260,8 +267,10 @@ def _fmt(x):
     return f"{x:.4f}" if isinstance(x, (int, float)) else "  n/a "
 
 
-def render() -> None:
-    s = compute()
+def render(include_test=False, include_demo=False, environment=None) -> None:
+    s = compute(include_test=include_test, include_demo=include_demo, environment=environment)
+    if include_test or include_demo or environment == "all":
+        print(" [including test/demo/benchmark records — NOT the default live gate]")
     print("=" * 66)
     print(" POLYMARKET HARNESS — DUAL-GATE SCOREBOARD  (paper, out-of-sample)")
     print("=" * 66)
@@ -306,4 +315,8 @@ def render() -> None:
 
 
 if __name__ == "__main__":
-    render()
+    import sys as _sys
+    _argv = _sys.argv[1:]
+    render(include_test="--include-test" in _argv,
+           include_demo="--include-demo" in _argv,
+           environment="all" if "all" in _argv or "--environment" in _argv else None)

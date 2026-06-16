@@ -476,11 +476,67 @@ def settle_resolved(cfg: LoopConfig | None = None) -> list[dict]:
                     obs.hooks.on_error(where="loop.settle_resolved", exc=e, action="skip",
                                        context={"market_id": mid})
                 print(f"  {mid[:18]}… ERROR {type(e).__name__}: {e}")
+    # P1 (Gate-1 UNBIAS): also resolve forecasts for markets we FORECAST but did NOT
+    # bet — otherwise Gate 1 only scores the bet-selected subset and overstates skill.
+    # This scores the forecast (Brier) only; it places/settles NO trade (Gate 2 untouched).
+    try:
+        _settle_unbet_forecasts(set(seen.keys()))
+    except Exception as _e:
+        if obs:
+            try:
+                obs.hooks.on_error(where="loop.settle_resolved.unbet_sweep", exc=_e, action="skip")
+            except Exception:
+                pass
     st = wallet.get_state()
     journal.record_snapshot(st["cash"], st["equity"], st["realized_pnl"], st["open_exposure"], st["n_open"])
     print(f"[wallet] cash=${st['cash']:.2f} equity=${st['equity']:.2f} "
           f"open={st['n_open']} realized_pnl=${st['realized_pnl']:.2f}")
     return results
+
+
+def _settle_unbet_forecasts(already_bet: set, cap: int = 40) -> int:
+    """Resolve forecasts for REAL markets we forecast but did NOT bet, so Gate 1 scores
+    the full forecast set (audit Phase 1). Scores the forecast Brier only — no trade is
+    settled, so Gate 2 (paper P&L) is unaffected. Bounded per cycle + best-effort."""
+    from core.calibration import get_open_market_ids, resolve_forecast
+    from harness import environment as _env
+    targets = [m for m in get_open_market_ids()
+               if m not in already_bet and _env.is_real_market(m)][:cap]
+    if not targets:
+        return 0
+    print(f"[settle] {len(targets)} forecasted-but-unbet market(s) to score for Gate 1…")
+    scored = 0
+    for mid in targets:
+        try:
+            m = gamma.fetch_market_by_condition_id(mid)
+            if m is None:
+                continue
+            outcome = gamma.resolution_outcome(m)
+            if outcome is None:
+                continue
+            q = m.get("question") or ""
+            if obs:
+                try:
+                    obs.hooks.on_resolution(mid, outcome, "gamma")
+                except Exception:
+                    pass
+            resolve_forecast(q, outcome, market_id=mid)          # scores the swarm Brier
+            try:
+                challenger.resolve_baseline(outcome, mid)        # and the A/B baseline
+                _record_forecaster_outcomes(mid, outcome)
+            except Exception:
+                pass
+            scored += 1
+        except Exception as e:
+            if obs:
+                try:
+                    obs.hooks.on_error(where="loop._settle_unbet_forecasts", exc=e,
+                                       action="skip", context={"market_id": mid})
+                except Exception:
+                    pass
+    if scored:
+        print(f"[settle] scored {scored} unbet forecast(s) for Gate 1 (no trades placed)")
+    return scored
 
 
 def daemon(cfg: LoopConfig, interval_sec: int = 10_800) -> None:
