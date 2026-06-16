@@ -84,13 +84,23 @@ gate (`profitability.py`) · calibration + decision prob `final_p` (`calibration
 · db_check reconciliation (`db_check.py`) · command-center + system status (`command_center.py`,
 dashboard) · per-daemon heartbeats + crash-safety (supervisor). Suite 51 modules.
 
-### Deferred (documented, not yet done — none block paper-only honesty)
-- **P2** db_check `--repair`/`--repair-dry-run` + audit-event (reconciliation report exists).
-- **P5/P12** canonical `decision_p` storage + Guard-D on final_p (dormant: final_p==p cold).
-- **P6/P7** EV-after-costs spread/liquidity/uncertainty/exit penalties + their config knobs.
-- **P7/CLV** timed 15m/1h/6h snapshots (CLV-at-resolution exists).
-- **P9** `harness.config_check` + remaining `.env.example` vars.
-- **P11** extra dashboard endpoints (`/api/db/reconciliation`, `/api/clv/summary`, …).
+### Done in the follow-up "keep going" push
+- ☑ **P6/P7 EV-after-costs penalties** (`b74c721`): spread/liquidity/uncertainty/exit-risk
+  penalties + `MIN_EV_AFTER_COSTS` + config knobs; wired at the AI bet sites. +tests.
+- ☑ **P9 config_check** (`e10cb35`): `harness.config_check` (required/optional/unread/
+  unknown, secrets masked); flags `SWARM_SIZE` (unread) + a real dead `.env` var. +tests.
+- ☑ **P7/CLV timed snapshots** (`fc9518a`): `clv` 15m/1h/6h snapshots wired into settle;
+  `/api/clv/summary`. +tests.
+- ☑ **P2 db_check repair** (`f0292dc`): `ledger_reconciliation_report` + `repair`
+  (`--repair-dry-run`/`--repair`, audit event, never deletes); `/api/db/reconciliation`. +tests.
+
+### Still deferred (documented; none block paper-only honesty)
+- **P5/P12** a single stored canonical `decision_p` field + Guard-D evaluated on final_p
+  (dormant today: final_p == raw p at cold-start, so no live effect).
+- **P11/15** remaining dashboard panels/endpoints (`/api/gates/detailed`,
+  `/api/event-portfolios/recent`, `/api/config/status`) + HTML wiring of the new panels.
+- **P4** deeper event-portfolio outcome-by-outcome explanation surfacing (engine + lone-leg
+  fix done; richer reporting deferred).
 
 The honest bottom line is in the final report below / in chat: the two measurement-honesty
 fixes (Gate-1 unbias, demo exclusion) and the external-brain decoupling are the load-bearing
