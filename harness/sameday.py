@@ -24,7 +24,7 @@ try:
 except Exception:
     pass
 
-from harness import gamma, classifier, wallet, journal, sizing, challenger
+from harness import gamma, classifier, wallet, journal, sizing, challenger, scanner
 # P6 — same skill-weighted blend + gated calibration + versioned record as predict_today.
 # All three are HARD cold-start passthroughs (see _ai_scout): final_p == swarm p today.
 from harness import calibration_apply, forecast_versions
@@ -137,16 +137,18 @@ def _record_forecast_version(mid, q, swarm_p, ens, blended, final_p, weights, ca
                 pass
 
 
-def _ai_scout(market, price):
-    """Run the AI agents (PolySwarm + challenger ENSEMBLE) on a same-day OPINION market so
-    their forecasts show on the dashboard. Also fires a best-effort MiroFish crowd-sim
-    (subprocess) the first time we see a given market.
+def _ai_scout(market, price, evidence_text: str = ""):
+    """Run the AI agents (PolySwarm + challenger ENSEMBLE) on a same-day OPINION market.
+
+    Plan 5: ``evidence_text`` is the SAME canonical evidence-pack text predict_today
+    feeds its forecast; it is passed to BOTH the swarm (extra_context) and the challenger
+    ensemble (extra_context) so same-day no longer forecasts blind. The caller builds the
+    pack BEFORE calling this.
 
     Returns ``(swarm_p, challenger_bp, consensus, final_p, health)`` where ``final_p`` is
-    the P6 DECISION probability (skill-weighted blend → gated calibration) and ``health``
-    is the Plan-2 swarm-health dict (aborted/degraded/allow_bet/n_agents_*). The swarm
-    SNAPSHOT forecast input is unchanged (the Swarm still saves its raw probability);
-    final_p only governs sizing. COLD-START: final_p == swarm_p to full float precision."""
+    the P6 DECISION probability and ``health`` is the Plan-2 swarm-health dict plus
+    ``evidence_used`` and ``mirofish_used`` (the MiroFish sim is fire-and-forget and is
+    NOT read into this decision — mirofish_used is always False here)."""
     mid = market["market_id"]
     # ONE forecast per market: re-scouting the same market every cycle wastes minutes
     # of CPU and double-counts it toward the gate (and cross-joins the A/B panel).
@@ -159,27 +161,39 @@ def _ai_scout(market, price):
     except Exception as e:
         if obs:
             obs.hooks.on_error(where="sameday._ai_scout.open_ids", exc=e, action="skip")
-    # MiroFish crowd-sim (slow; fire-and-forget so it doesn't block the daemon)
+    # MiroFish crowd-sim (slow; fire-and-forget). HONESTY (Plan 5): this is launched but
+    # its result is NOT read into the same-day decision — it is mirofish_launched_not_used.
     if mid not in _mf_launched:
         _mf_launched.add(mid)
         try:
             subprocess.Popen([sys.executable, "-m", "harness.mirofish_quick", market["question"][:60]],
                              cwd=os.path.dirname(os.path.dirname(__file__)),
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print(f"[sameday] 🐟 MiroFish crowd-sim launched for: {market['question'][:44]}")
+            print(f"[sameday] 🐟 MiroFish crowd-sim launched (mirofish_launched_not_used — "
+                  f"NOT read into this decision): {market['question'][:40]}")
+            if obs:
+                try:
+                    obs.hooks.on_trade_skip(
+                        forecast_id=(obs.current().get("forecast_id") if obs else None),
+                        reason="mirofish_launched_not_used",
+                        inputs={"market_id": mid, "mirofish_used": False, "layer": "mirofish"})
+                except Exception:
+                    pass
         except Exception as e:
             if obs:
                 obs.hooks.on_error(where="sameday._ai_scout.mirofish_launch", exc=e, action="skip")
-    # PolySwarm + challenger ENSEMBLE (the AI agents)
+    # PolySwarm + challenger ENSEMBLE (the AI agents) — BOTH see the evidence pack (Plan 5).
     try:
         from core.swarm import Swarm
         from agents.personas import build_swarm
         os.environ["DEBATE_ROUNDS"] = "1"
-        res = Swarm(agents=build_swarm(5)).forecast(market["question"], market_odds=price, market_id=mid)
+        res = Swarm(agents=build_swarm(5)).forecast(market["question"], market_odds=price,
+                                                    market_id=mid, extra_context=evidence_text)
         sp = float(res["probability"])
         cons = res.get("consensus_score")          # swarm internal agreement (for Guard C)
-        # P6 step 1: challenger ENSEMBLE mean (default 1-model roster == today's single bp).
-        ens = challenger.ensemble_forecast(market["question"], price)
+        # P6 step 1: challenger ENSEMBLE mean (default 1-model roster == today's single bp),
+        # now with the SAME evidence context the swarm saw (Plan 5 parity).
+        ens = challenger.ensemble_forecast(market["question"], price, evidence_text)
         bp = ens.get("mean")
         if bp is not None:
             challenger.save_baseline(mid, market["question"], bp, price)
@@ -206,6 +220,9 @@ def _ai_scout(market, price):
             "n_agents_succeeded": res.get("n_agents_succeeded"),
             "n_agents_failed": res.get("n_agents_failed"),
             "degradation_reason": res.get("degradation_reason"),
+            # Plan 5 honesty: the forecast saw the evidence pack; MiroFish was launch-only.
+            "evidence_used": bool(evidence_text),
+            "mirofish_used": False,
         }
         return sp, bp, cons, final_p, health
     except Exception as e:
@@ -277,20 +294,52 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                     continue
                 # (1) OPINION markets only — the swarm forecasts crowd-driven outcomes, not
                 #     sports/crypto/weather (those are MECHANICAL and get skipped here).
-                if classifier.tag_market(m, use_llm=False).label != "opinion":
+                _cls = classifier.tag_market(m, use_llm=False)
+                if _cls.label != "opinion":
+                    # mechanical/classifier skip — recorded via obs.on_classify (parity with
+                    # predict_today's loop; NOT journaled, to avoid flooding decisions each cycle).
+                    if obs:
+                        obs.hooks.on_classify(mid, q, _cls.label, getattr(_cls, "signals", None),
+                                              False, "mechanical_not_opinion")
+                    continue
+                # (1b) Plan 5 STALE/QUALITY parity — skip a stale book BEFORE the slow forecast
+                #      using the SAME scanner.is_stale predict_today's market-quality guard uses.
+                #      If staleness cannot even be evaluated -> no bet (never forecast on unknown).
+                try:
+                    _stale, _why = scanner.is_stale(m)
+                except Exception as e:
+                    if obs:
+                        obs.hooks.on_error(where="sameday.is_stale", exc=e, action="skip", context={"market_id": mid})
+                    _sd_skip(mid, q, "sameday_market_quality_unknown_no_bet", price=price, layer="stale")
+                    continue
+                if _stale:
+                    _sd_skip(mid, q, f"sameday_stale_market_no_bet ({_why})", price=price, layer="stale")
                     continue
                 # (2) event coherence is checked AFTER the forecast now (so we can bet the winning side
                 #     per leg): one YES per event, NO/fade unlimited. ev is defined here for that check.
                 ev = m.get("event_slug") or mid
                 if not use_ai:
                     continue
-                # (3) the SWARM forecast drives the bet.
-                print(f"[sameday] AI scouting ({hl:.1f}h): {q[:50]}")
+                # (3) Plan 5 EVIDENCE PARITY — build the SAME canonical pack predict_today uses
+                #     BEFORE forecasting, so the swarm + challenger SEE it. A build ERROR -> no bet
+                #     (never forecast blind). A built-but-thin pack still forecasts; the evidence
+                #     GUARD below then gates the BET — matching predict_today's order.
+                from harness import loop as _loop
+                try:
+                    pack = _loop.build_pack(m, _loop.LoopConfig())
+                    evidence_text = (pack.text or "") if pack else ""
+                except Exception as e:
+                    pack = None
+                    if obs:
+                        obs.hooks.on_error(where="sameday.build_pack", exc=e, action="skip", context={"market_id": mid})
+                    _sd_skip(mid, q, "sameday_evidence_build_error_no_bet", price=price, layer="evidence")
+                    continue
+                # (4) the SWARM + challenger forecast (now EVIDENCE-AWARE) drives the bet.
+                print(f"[sameday] AI scouting ({hl:.1f}h, evidence {len(evidence_text)} chars): {q[:44]}")
                 scouted += 1
                 # p = RAW swarm probability (used by the reliability guards); final_p = the P6
                 # decision probability (skill-weighted blend → gated calibration) used for sizing.
-                # COLD-START: final_p == p exactly today.
-                p, bp, cons, final_p, health = _ai_scout(m, price)
+                p, bp, cons, final_p, health = _ai_scout(m, price, evidence_text)
                 if p is None:
                     continue
                 # ── Plan 2: SWARM-HEALTH gate. Block a degraded / aborted / under-strength
@@ -326,48 +375,23 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                 from harness.predict_today import (MAX_SWARM_CHALLENGER_DIVERGENCE as _MAXDIV,
                                                    MIN_SWARM_CONSENSUS as _MINCONS)
                 if bp is not None and abs(p - bp) > _MAXDIV:
-                    print(f"  [sameday] DECISION: NO BET — swarm/challenger divergence {abs(p - bp):.2f}")
-                    if obs:
-                        obs.hooks.on_trade_skip(
-                            forecast_id=(obs.current().get("forecast_id") if obs else None),
-                            reason=f"divergence {abs(p - bp):.2f}",
-                            inputs={"market_id": mid, "p": p, "challenger_p": bp, "price": price, "layer": "guard"},
-                        )
+                    _sd_skip(mid, q, f"sameday_divergence_no_bet (swarm {p:.2f} vs challenger {bp:.2f}, "
+                             f"|delta|={abs(p - bp):.2f} > {_MAXDIV})", p=p, price=price, layer="divergence")
                     continue
                 if cons is not None and cons < _MINCONS:
-                    print(f"  [sameday] DECISION: NO BET — consensus {cons:.2f} < {_MINCONS:.2f}")
-                    if obs:
-                        obs.hooks.on_trade_skip(
-                            forecast_id=(obs.current().get("forecast_id") if obs else None),
-                            reason=f"consensus {cons:.2f} < {_MINCONS:.2f}",
-                            inputs={"market_id": mid, "p": p, "consensus": cons, "price": price, "layer": "guard"},
-                        )
+                    _sd_skip(mid, q, f"sameday_consensus_no_bet (consensus {cons:.2f} < {_MINCONS:.2f})",
+                             p=p, price=price, layer="consensus")
                     continue
-                # data-sufficiency gate (mirror of predict_today): "no data, no bet". Gather the
-                # SAME canonical evidence pack here so sameday honors the same no_data / low_evidence
-                # guards and freezes the evidence for replay. Best-effort — build_pack never raises;
-                # a gather failure (pack=None) is treated as no_data (no bet), never as a green light.
-                from harness import loop as _loop
-                from harness.predict_today import (_evidence_guard as _ev_guard,
-                                                   _emit_evidence_pack as _ev_emit)
-                try:
-                    pack = _loop.build_pack(m, _loop.LoopConfig())
-                except Exception as e:
-                    pack = None
-                    if obs:
-                        obs.hooks.on_error(where="sameday.place_sameday.evidence", exc=e, action="skip",
-                                           context={"market_id": mid})
+                # data-sufficiency gate (mirror of predict_today): the pack was already built BEFORE
+                # the forecast (above) and fed to the swarm + challenger. Freeze it for replay, then
+                # gate the BET on evidence quality with sameday_-prefixed, JOURNALED reasons.
+                from harness.predict_today import _emit_evidence_pack as _ev_emit, _evidence_guard as _ev_guard
                 _ev_emit(mid, pack)
                 ev_ok, ev_reason = _ev_guard(pack)
                 if not ev_ok:
-                    print(f"  [sameday] DECISION: NO BET — {ev_reason}")
-                    if obs:
-                        obs.hooks.on_trade_skip(
-                            forecast_id=(obs.current().get("forecast_id") if obs else None),
-                            reason=ev_reason,
-                            inputs={"market_id": mid, "p": p, "price": price,
-                                    "quality": (pack.evidence_quality if pack else 0.0), "layer": "evidence"},
-                        )
+                    _sd_reason = ("sameday_no_evidence_no_bet" if ev_reason == "no_data"
+                                  else f"sameday_low_evidence_quality_no_bet ({ev_reason})")
+                    _sd_skip(mid, q, _sd_reason, p=p, price=price, layer="evidence")
                     continue
                 # P3 — MULTI-LEG mutually-exclusive event: evaluate the WHOLE event as a portfolio
                 # (replaces the one-YES Guard D below for ME events) and act ONLY on this leg's slot.
@@ -384,19 +408,14 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                     ep, my_pos = _run_event_portfolio(mid, _ep_legs, _event_key, wallet.bankroll_for_sizing())
                     if not (ep.accept and my_pos is not None):
                         reason = _event_leg_reject_reason(ep, mid)
-                        print(f"  [sameday] DECISION: NO BET — {reason}")
-                        if obs:
-                            obs.hooks.on_trade_skip(
-                                forecast_id=(obs.current().get("forecast_id") if obs else None),
-                                reason=reason,
-                                inputs={"market_id": mid, "event": ev, "layer": "event_portfolio"},
-                            )
+                        _sd_skip(mid, q, f"sameday_event_portfolio_no_bet ({reason})",
+                                 p=final_p, price=price, layer="event_portfolio")
                         continue
                     side, stake, edge = my_pos["side"], my_pos["stake"], my_pos["edge"]
-                    # P7 (B1): EV-after-costs HARD GATE on the accepted event leg (pure
-                    # tightening — reject a non-positive-EV-after-slippage leg, healthy legs pass).
+                    # P7 (B1): EV-after-costs HARD GATE on the accepted event leg — Plan 5 parity:
+                    # pass m + confidence so the spread/liquidity/uncertainty/exit-risk penalties run.
                     from harness.predict_today import _p7_ev_gate as _p7_ev_gate_ep
-                    _ev_ok, _ev_reason = _p7_ev_gate_ep(final_p, price, side)
+                    _ev_ok, _ev_reason = _p7_ev_gate_ep(final_p, price, side, m=m, confidence=cons)
                     if not _ev_ok:
                         # FAIL-CLOSED money gate (EV). Record EVERYWHERE (print+obs+journal).
                         _sd_skip(mid, q, _ev_reason, p=final_p, price=price, layer="ev_gate")
@@ -436,7 +455,7 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                         print(f"  [sameday] BET {fr.side} ${fr.stake:.2f} @ {fr.fill_price:.3f} "
                               f"(event portfolio, {hl:.1f}h) {q[:34]}")
                     else:
-                        _sd_skip(mid, q, f"wallet_rejected: {fr.reason}", p=final_p, price=price, layer="wallet")
+                        _sd_skip(mid, q, f"sameday_wallet_rejected_no_bet ({fr.reason})", p=final_p, price=price, layer="wallet")
                     continue
                 # (4) bet ONLY on a real edge — conviction-scaled stake (bigger when surer).
                 from harness.predict_today import (_conviction, _conviction_sizing, CONVICTION_CAP_MAX as _CAPMAX,
@@ -455,17 +474,12 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                 me = _p7_min_edge(q, min_edge)
                 sz = sizing.size_bet(final_p, price, wallet.bankroll_for_sizing(), lam=lam, cap=cap, min_edge=me)
                 if sz.side is None or sz.stake <= 0:
-                    print(f"[sameday] no bet: swarm {p:.0%} vs market {price:.0%} ({sz.reason})")
-                    if obs:
-                        obs.hooks.on_trade_skip(
-                            forecast_id=(obs.current().get("forecast_id") if obs else None),
-                            reason=f"no_edge: {sz.reason}",
-                            inputs={"market_id": mid, "p": p, "price": price, "edge": sz.edge, "layer": "sizer"},
-                        )
+                    _sd_skip(mid, q, f"sameday_no_edge_no_bet ({sz.reason})", p=final_p, price=price, layer="sizer")
                     continue
-                # P7 (B1): EV-after-costs HARD GATE (pure tightening — reject a sized bet
-                # whose slippage-worsened fill is non-positive-EV; a healthy +edge bet passes).
-                _ev_ok, _ev_reason = _p7_ev_gate_reg(final_p, price, sz.side)
+                # P7 (B1): EV-after-costs HARD GATE — Plan 5 parity: pass m + confidence so the
+                # spread/liquidity/uncertainty/exit-risk penalties run (a thin raw-edge bet whose
+                # after-cost EV fails is now rejected, exactly as in predict_today).
+                _ev_ok, _ev_reason = _p7_ev_gate_reg(final_p, price, sz.side, m=m, confidence=cons)
                 if not _ev_ok:
                     # FAIL-CLOSED money gate (EV). Record EVERYWHERE (print+obs+journal).
                     _sd_skip(mid, q, _ev_reason, p=final_p, price=price, layer="ev_gate")
@@ -492,22 +506,13 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                 from harness.predict_today import ONE_YES_PER_EVENT as _ONEYES, MAX_GROUP_PROB_SUM as _MAXSUM
                 if sz.side == "YES":
                     if _ONEYES and ev in yes_events:
-                        print("  [sameday] DECISION: NO BET — already hold the YES (winner) leg in this event")
-                        if obs:
-                            obs.hooks.on_trade_skip(
-                                forecast_id=(obs.current().get("forecast_id") if obs else None),
-                                reason="already hold YES (winner) leg in this event",
-                                inputs={"market_id": mid, "event": ev, "side": sz.side, "layer": "guard"},
-                            )
+                        _sd_skip(mid, q, "sameday_event_already_hold_yes_no_bet",
+                                 p=final_p, price=price, layer="event_coherence")
                         continue
                     if yes_events.get(ev, 0.0) + p > _MAXSUM:
-                        print(f"  [sameday] DECISION: NO BET — incoherent group (YES-prob sum {yes_events.get(ev, 0.0) + p:.2f})")
-                        if obs:
-                            obs.hooks.on_trade_skip(
-                                forecast_id=(obs.current().get("forecast_id") if obs else None),
-                                reason=f"incoherent group (YES-prob sum {yes_events.get(ev, 0.0) + p:.2f})",
-                                inputs={"market_id": mid, "event": ev, "layer": "guard"},
-                            )
+                        _sd_skip(mid, q, f"sameday_event_incoherent_no_bet "
+                                 f"(YES-sum {yes_events.get(ev, 0.0) + p:.2f} > {_MAXSUM})",
+                                 p=final_p, price=price, layer="event_coherence")
                         continue
                 fr = wallet.open_position(mid, q, sz.side, final_p, price, sz.edge, sz.stake,
                                           cfg=wallet.WalletConfig(max_bet_frac=_CAPMAX, max_exposure_frac=0.85),
@@ -523,7 +528,7 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                     print(f"  [sameday] BET {fr.side} ${fr.stake:.2f} @ {fr.fill_price:.3f} "
                           f"(swarm {p:.0%} vs mkt {price:.0%}, {hl:.1f}h) {q[:34]}")
                 else:
-                    _sd_skip(mid, q, f"wallet_rejected: {fr.reason}", p=final_p, price=price, layer="wallet")
+                    _sd_skip(mid, q, f"sameday_wallet_rejected_no_bet ({fr.reason})", p=final_p, price=price, layer="wallet")
         except Exception as e:
             # crash-safety: one bad market must never kill the daemon cycle.
             if obs:
