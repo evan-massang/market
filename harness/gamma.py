@@ -180,6 +180,17 @@ def fetch_closed_markets(limit: int = 200, order: str = "volumeNum", *,
         limit, order, ascending, timeout)
 
 
+def _client_get(client, url, params):
+    """One GET with the right retry semantics: a 4xx (client error) is returned as-is
+    (not retried — the caller surfaces it), a 5xx/transport error raises so the shared
+    retry helper backs off and tries again."""
+    resp = client.get(url, params=params)
+    if 400 <= resp.status_code < 500:
+        return resp
+    resp.raise_for_status()
+    return resp
+
+
 def _fetch_paginated(status: dict, limit: int, order: str, ascending: bool,
                      timeout: float, extra: dict | None = None) -> list[dict]:
     PAGE = 100  # Gamma caps a single response at ~100 rows; paginate via offset.
@@ -191,7 +202,11 @@ def _fetch_paginated(status: dict, limit: int, order: str, ascending: bool,
             params = {**status, **(extra or {}), "limit": page, "offset": offset, "order": order,
                       "ascending": "true" if ascending else "false"}
             _t0 = time.perf_counter()
-            resp = client.get(MARKETS_URL, params=params)
+            # retry transient blips / 5xx with backoff so one hiccup doesn't drop the
+            # whole daemon cycle; 4xx gives up immediately (audit reliability gap).
+            from harness import retry as _retry
+            resp = _retry.call_with_retry(_client_get, client, MARKETS_URL, params,
+                                          retry_on=(httpx.HTTPError,))
             _latency_ms = (time.perf_counter() - _t0) * 1000.0
             resp.raise_for_status()
             data = resp.json()

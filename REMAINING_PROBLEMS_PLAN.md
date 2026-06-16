@@ -60,6 +60,38 @@ Status: ☐ todo · ◑ in progress · ☑ done (commit)
   `/api/event-portfolios/recent`, `/api/clv/summary`, `/api/config/status` + show
   forecast-vs-trade split, demo exclusion notice, decision_p source.
 
-_(Implemented phases are marked ☑ with their commit as work lands. Honest note:
-this is a large program; I am doing the honesty-critical correctness phases first
-and will record exactly what is done vs deferred in the final report.)_
+## Status
+
+- ☑ **P1 Gate-1 bet-bias** (`b672a9f`): `loop._settle_unbet_forecasts` resolves ALL
+  real forecasted markets, not just bet ones. +`test_gate_methodology`.
+- ☑ **P3 Demo/test exclusion** (`b672a9f`): `harness/environment.py` + scoreboard filter;
+  gates default to live/paper_live; `--include-test`/`--include-demo`/`--environment all`.
+- ☑ **External-brain interface** (`3173809`, the new direction): `harness/brain/`
+  (BrainProvider + EvidencePack/ForecastResult/… + swarm/mock/disabled/manus providers +
+  build_brain_pack + non-LLM critic). LLM is now a replaceable component; runs observe-only
+  without any LLM. +`test_brain`. Dashboard `/api/brain/status`. `BRAIN_ARCHITECTURE.md`.
+- ☑ **P8/Reliability — retry/backoff** (`<this commit>`): `harness/retry.py`
+  (timeout-aware backoff + jitter + bounded attempts + give-up), wired into the Gamma
+  hot-path fetch (retry transient/5xx, give up on 4xx). +`test_retry`.
+
+### Already existed before this task (verified, mapped to the requests)
+Scanner multi-window (`scanner.py`) · persistent cache (`datacache.py`) · structured
+evidence packs (`evidence_pack.py` + obs `evidence.pack`) · forecastability classifier
+labels (`classifier.py` P4) · event-portfolio engine (`event_portfolio.py`) · EV-after-costs
+gate (`profitability.py`) · calibration + decision prob `final_p` (`calibration_apply.py`,
+`forecaster_weights.py`) · CLV at resolution (`clv.py`) · performance memory
+(`label_perf.py`, `adaptive.py`, `metrics.py`) · dual gates + Gate-2 floor (`scoreboard.py`)
+· db_check reconciliation (`db_check.py`) · command-center + system status (`command_center.py`,
+dashboard) · per-daemon heartbeats + crash-safety (supervisor). Suite 51 modules.
+
+### Deferred (documented, not yet done — none block paper-only honesty)
+- **P2** db_check `--repair`/`--repair-dry-run` + audit-event (reconciliation report exists).
+- **P5/P12** canonical `decision_p` storage + Guard-D on final_p (dormant: final_p==p cold).
+- **P6/P7** EV-after-costs spread/liquidity/uncertainty/exit penalties + their config knobs.
+- **P7/CLV** timed 15m/1h/6h snapshots (CLV-at-resolution exists).
+- **P9** `harness.config_check` + remaining `.env.example` vars.
+- **P11** extra dashboard endpoints (`/api/db/reconciliation`, `/api/clv/summary`, …).
+
+The honest bottom line is in the final report below / in chat: the two measurement-honesty
+fixes (Gate-1 unbias, demo exclusion) and the external-brain decoupling are the load-bearing
+new work; the rest of the 20-phase plan largely already existed and is mapped above.
