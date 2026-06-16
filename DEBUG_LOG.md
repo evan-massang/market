@@ -135,4 +135,27 @@ still 5/5. Suite 44 modules.
 Tests: +`test_metrics::paper_metrics_includes_cashed_out_closed`; classifier 15/15,
 adaptive/clv/command_center green. Suite 44 modules.
 
+### BATCH 4 — daemon / CLI safety + sameday guard symmetry — FIXED
+
+- **D1/#11 🟠 predict_today CLI crashed / swallowed --dry-run.** Hand-rolled parser
+  `int(argv[i+1])` IndexError-crashed on a trailing flag, ignored unknown flags, and
+  silently swallowed `--dry-run` (ran a real 235s forecast). **FIX:** rewrote
+  `predict_today.main` with **argparse** (rejects bad input with SystemExit 2 + usage),
+  threaded `--dry-run` into `LoopConfig.dry_run`, and short-circuited the slow MiroFish +
+  challenger calls in `predict_one` under dry-run. Added a Phase-5 startup config summary
+  (provider/model/swarm/min_edge/mirofish/dry_run/**PAPER**). FIXED.
+- **#12 🟠 sameday CLI silent no-op / ignored --interval.** Unknown command was a clean
+  exit-0 no-op; `daemon --interval N` ignored N. **FIX:** argparse with choices + wired
+  `--interval` into `daemon()`. FIXED.
+- **#4 🟠 sameday did NOT enforce the P4B observe-only guard** predict_today enforces —
+  a losing label was frozen in one daemon but still bet by the live sameday daemon.
+  **FIX:** after the forecast (still logged for scoring), `_observe_only_for(q)` →
+  withhold the bet, mirroring predict_today. FIXED.
+- **#5 🟠 sameday skips were invisible** (silent wallet-reject; guard skips never reached
+  the journal). **FIX:** new `_sd_skip` helper (print + obs `trade.skip` + `journal`)
+  used for the observe-only + wallet-reject paths, so the dashboard decisions transcript
+  now shows why the live daemon declined. FIXED.
+
+Test: +`test_cli_args` 3/3 (bad-arg rejection, `--dry-run` reaches cfg). Suite 45 modules.
+
 _(remaining batches appended below as each is closed)_

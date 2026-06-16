@@ -737,7 +737,7 @@ def predict_one(m, cfg):
         _emit_evidence_pack(mid, pack)
 
         # 2.5 — REPORT (MiroFish + crowd agents build a report; it is fed to the LLM, not run as one)
-        if USE_MIROFISH:
+        if USE_MIROFISH and not getattr(cfg, "dry_run", False):   # --dry-run skips the slow MiroFish stage
             mf = _mirofish_report(q, mid, price)
             if mf:
                 enr = (enr + "\n\n" + mf) if enr else mf
@@ -755,7 +755,8 @@ def predict_one(m, cfg):
         bp = None
         ens = {"per_model": {}, "probs": [], "mean": None, "n": 0, "models": []}
         try:
-            ens = challenger.ensemble_forecast(q, price, enr)
+            if not getattr(cfg, "dry_run", False):   # --dry-run skips the LLM challenger call
+                ens = challenger.ensemble_forecast(q, price, enr)
             bp = ens.get("mean")
             if bp is not None:
                 challenger.save_baseline(mid, q, bp, price)
@@ -1056,35 +1057,60 @@ def daemon(cfg, max_hours=24.0, interval=60, include_mech=False, window=None):
         time.sleep(interval if cands else idle_interval)   # don't spin when idle
 
 
-def main(argv=None):
-    argv = argv if argv is not None else sys.argv[1:]
-    cmd = argv[0] if argv and not argv[0].startswith("--") else "once"
-    max_n, size, rounds, min_edge, max_hours, include_mech, interval = 3, 6, 1, 0.03, 24.0, False, 60
-    window = None
-    global USE_MIROFISH, MF_WAIT
-    for i, a in enumerate(argv):
-        if a == "--max": max_n = int(argv[i + 1])
-        elif a == "--size": size = int(argv[i + 1])
-        elif a == "--rounds": rounds = int(argv[i + 1])
-        elif a == "--min-edge": min_edge = float(argv[i + 1])
-        elif a == "--max-hours": max_hours = float(argv[i + 1])
-        elif a == "--interval": interval = int(argv[i + 1])
-        elif a == "--include-mechanical": include_mech = True
-        elif a == "--window": window = argv[i + 1]
-        elif a == "--with-mirofish": USE_MIROFISH = True
-        elif a == "--mf-wait": MF_WAIT = int(argv[i + 1])
+def _print_config_summary(cfg, win, args):
+    """Phase-5 startup config summary (no secrets) so the operator sees how the
+    daemon is configured before it runs."""
+    print("  ── config ────────────────────────────────────────────────")
+    print(f"   command={args.command}  window={win}  max_hours={args.max_hours:.0f}h  interval={args.interval}s")
+    print(f"   provider={os.getenv('LLM_PROVIDER', 'ollama')}  model={os.getenv('MODEL_FAST', '(default)')}  "
+          f"swarm_size={cfg.swarm_size}  rounds={cfg.rounds}  min_edge={cfg.min_edge}")
+    print(f"   mirofish={'on' if USE_MIROFISH else 'off'}  dry_run={getattr(cfg, 'dry_run', False)}  "
+          f"trading=PAPER (real-money execution disabled)")
+    print("  ──────────────────────────────────────────────────────────")
 
-    win = _window_name(window)
+
+def main(argv=None):
+    import argparse
+    argv = argv if argv is not None else sys.argv[1:]
+    global USE_MIROFISH, MF_WAIT
+    p = argparse.ArgumentParser(
+        prog="harness.predict_today",
+        description="Precise AI pipeline: find -> gather -> think -> bet (PAPER only).")
+    p.add_argument("command", nargs="?", default="once", choices=["once", "daemon"],
+                   help="once = one pass; daemon = continuous loop")
+    p.add_argument("--max", type=int, default=3, dest="max_n")
+    p.add_argument("--size", type=int, default=6)
+    p.add_argument("--rounds", type=int, default=1)
+    p.add_argument("--min-edge", type=float, default=0.03, dest="min_edge")
+    p.add_argument("--max-hours", type=float, default=24.0, dest="max_hours")
+    p.add_argument("--interval", type=int, default=60)
+    p.add_argument("--include-mechanical", action="store_true", dest="include_mech")
+    p.add_argument("--window", default=None)
+    p.add_argument("--with-mirofish", action="store_true")
+    p.add_argument("--mf-wait", type=int, default=None, dest="mf_wait")
+    p.add_argument("--dry-run", action="store_true",
+                   help="stub forecast — NO LLM/MiroFish; exercises the pipeline fast")
+    # argparse now errors loudly on a missing flag value / unknown flag / bad command,
+    # instead of IndexError-crashing or silently swallowing --dry-run (audit #11).
+    args = p.parse_args(argv)
+
+    if args.with_mirofish:
+        USE_MIROFISH = True
+    if args.mf_wait is not None:
+        MF_WAIT = args.mf_wait
+
+    win = _window_name(args.window)
     from core.calibration import init_db
     init_db(); wallet.init_wallet(1000.0); journal.init_journal()
-    cfg = LoopConfig(swarm_size=size, rounds=rounds, min_edge=min_edge,
-                     use_gdelt=True, use_signals=True, challenger=True)
+    cfg = LoopConfig(swarm_size=args.size, rounds=args.rounds, min_edge=args.min_edge,
+                     use_gdelt=True, use_signals=True, challenger=True, dry_run=args.dry_run)
+    _print_config_summary(cfg, win, args)
 
-    if cmd == "daemon":
-        daemon(cfg, max_hours=max_hours, interval=interval, include_mech=include_mech, window=win)
+    if args.command == "daemon":
+        daemon(cfg, max_hours=args.max_hours, interval=args.interval, include_mech=args.include_mech, window=win)
     else:
-        print(f"\n  PRECISE {win} AI pipeline — find -> gather -> think -> bet ({win}, <{max_hours:.0f}h)\n")
-        run_once(cfg, max_n=max_n, max_hours=max_hours, include_mech=include_mech, window=win)
+        print(f"\n  PRECISE {win} AI pipeline — find -> gather -> think -> bet ({win}, <{args.max_hours:.0f}h)\n")
+        run_once(cfg, max_n=args.max_n, max_hours=args.max_hours, include_mech=args.include_mech, window=win)
 
 
 if __name__ == "__main__":

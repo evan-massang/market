@@ -202,6 +202,26 @@ def _ai_scout(market, price):
         return None, None, None, None
 
 
+def _sd_skip(mid, q, reason, p=None, price=None, layer="guard"):
+    """Record a sameday no-bet decision EVERYWHERE predict_today does: print + obs
+    trade.skip + journal.decisions — so the dashboard's decisions transcript shows
+    why the live sameday daemon declined (audit #5). Returns False."""
+    print(f"  [sameday] DECISION: NO BET — {reason}")
+    if obs:
+        try:
+            obs.hooks.on_trade_skip(
+                forecast_id=(obs.current().get("forecast_id") if obs else None),
+                reason=reason, inputs={"market_id": mid, "question": q, "p": p, "price": price, "layer": layer})
+        except Exception:
+            pass
+    try:
+        journal.record_decision(mid, q, p, price, None, None, 0.0, None, "", layer, "no_bet",
+                                f"Guard skip: {reason}.")
+    except Exception:
+        pass
+    return False
+
+
 def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE):
     """Place same-day paper bets DRIVEN BY THE SWARM forecast (not a hardcoded edge).
 
@@ -260,6 +280,17 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                 p, bp, cons, final_p = _ai_scout(m, price)
                 if p is None:
                     continue
+                # P4B OBSERVE-ONLY (audit #4): the forecast above is logged for scoring,
+                # but if this market's label has a real losing track record, WITHHOLD the
+                # bet — mirror predict_today so both daemons freeze a losing label.
+                try:
+                    from harness.predict_today import _observe_only_for as _oo
+                    _fine, _obs_only = _oo(q)
+                    if _obs_only:
+                        _sd_skip(mid, q, f"observe_only:{_fine}", p=p, price=price, layer="observe_only")
+                        continue
+                except Exception:
+                    pass
                 # P7 (B4): tag this forecast with the ACTIVE parameter experiment (baseline
                 # today; no auto-switch). Materializes + logs the tag so the resolved outcome
                 # can be attributed at settle. Passive — never feeds back into the decision.
@@ -405,6 +436,8 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                                                 f"portfolio EV ${ep.portfolio_ev:+.2f}, worst ${ep.worst_case_loss:+.2f} -> {fr.side}.")
                         print(f"  [sameday] BET {fr.side} ${fr.stake:.2f} @ {fr.fill_price:.3f} "
                               f"(event portfolio, {hl:.1f}h) {q[:34]}")
+                    else:
+                        _sd_skip(mid, q, f"wallet_rejected: {fr.reason}", p=final_p, price=price, layer="wallet")
                     continue
                 # (4) bet ONLY on a real edge — conviction-scaled stake (bigger when surer).
                 from harness.predict_today import (_conviction, _conviction_sizing, CONVICTION_CAP_MAX as _CAPMAX,
@@ -513,6 +546,8 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                                             f"Swarm sees {p:.0%} vs market {price:.0%} ({hl:.1f}h) -> {sz.side}, edge {sz.edge:+.1%}.")
                     print(f"  [sameday] BET {fr.side} ${fr.stake:.2f} @ {fr.fill_price:.3f} "
                           f"(swarm {p:.0%} vs mkt {price:.0%}, {hl:.1f}h) {q[:34]}")
+                else:
+                    _sd_skip(mid, q, f"wallet_rejected: {fr.reason}", p=final_p, price=price, layer="wallet")
         except Exception as e:
             # crash-safety: one bad market must never kill the daemon cycle.
             if obs:
@@ -557,19 +592,26 @@ def daemon(interval=INTERVAL, use_ai=True):
 
 
 def main(argv=None):
+    import argparse
     argv = argv if argv is not None else sys.argv[1:]
-    cmd = argv[0] if argv else "once"
+    p = argparse.ArgumentParser(prog="harness.sameday",
+                                description="Same-day favorite-longshot + AI scout daemon (PAPER only).")
+    p.add_argument("command", nargs="?", default="once", choices=["once", "daemon", "close"])
+    p.add_argument("--interval", type=int, default=None, help="daemon cycle seconds (default INTERVAL)")
+    # argparse rejects an unknown command/flag loudly instead of a silent no-op (audit #12).
+    args = p.parse_args(argv)
     from core.calibration import init_db
     init_db(); wallet.init_wallet(1000.0); journal.init_journal()
-    if cmd == "close":
+    print(f"  [sameday] command={args.command}  interval={args.interval or INTERVAL}s  trading=PAPER (real-money disabled)")
+    if args.command == "close":
         close_long_dated()
         st = wallet.get_state()
         journal.record_snapshot(st["cash"], st["equity"], st["realized_pnl"], st["open_exposure"], st["n_open"])
         print(f"[sameday] after close: open={st['n_open']} cash=${st['cash']:.0f} realized=${st['realized_pnl']:+.2f}")
-    elif cmd == "once":
+    elif args.command == "once":
         run_once()
-    elif cmd == "daemon":
-        daemon()
+    elif args.command == "daemon":
+        daemon(interval=args.interval if args.interval is not None else INTERVAL)
 
 
 if __name__ == "__main__":
