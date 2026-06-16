@@ -7,8 +7,8 @@ Covers:
     high_spread / correlated_exposure)
   * STRICTER WHEN LOSING: a drawn-down book raises tighten>1.0 and blocks a
     borderline market that was allowed when healthy
-  * FAIL-OPEN: an internal error -> allow True (never crashes / wrongly blocks)
-  * predict_today._p8_risk_guards returns (allow, reason) and fails open
+  * FAIL-CLOSED (Plan 1): an internal error -> allow False (unknown risk = no bet)
+  * predict_today._p8_risk_guards returns (allow, reason) and fails CLOSED
 """
 import os
 import sys
@@ -130,26 +130,29 @@ def test_drawdown_tightens_and_blocks_borderline():
     assert v["allow"] is False and v["blocking_reason"] == "high_spread", v
 
 
-# ── 4) FAIL-OPEN ──────────────────────────────────────────────────────────────
-def test_fail_open_on_internal_error():
+# ── 4) FAIL-CLOSED (Plan 1) ───────────────────────────────────────────────────
+def test_fail_closed_on_internal_error():
+    """Plan 1: an internal error in risk_guards.evaluate is UNKNOWN risk -> BLOCK."""
+    from harness import safety_gate as SG
     _reset_wallet()
     def _boom(*a, **k):
         raise RuntimeError("boom")
     with patched(MQ, "evaluate_market_quality", _boom):
         v = RG.evaluate(mk(), "YES", "q")
-    assert v["allow"] is True and v["blocking_reason"] is None, v
+    assert v["allow"] is False and v["blocking_reason"] == SG.RISK_INTERNAL_ERROR, v
 
 
-def test_predict_today_wrapper_allows_clean_and_fails_open():
+def test_predict_today_wrapper_allows_clean_and_fails_closed():
+    from harness import safety_gate as SG
     _reset_wallet()
     ok, reason = PT._p8_risk_guards(mk(), "YES", "Will the incumbent win the 2032 governor race?")
     assert ok is True, (ok, reason)
-    # fail-open: a broken evaluate still returns allow
+    # FAIL-CLOSED: a broken evaluate BLOCKS the bet (was: allow).
     def _boom(*a, **k):
         raise RuntimeError("boom")
     with patched(RG, "evaluate", _boom):
         ok2, reason2 = PT._p8_risk_guards(mk(), "YES", "q")
-    assert ok2 is True, (ok2, reason2)
+    assert ok2 is False and reason2 == SG.RISK_ERROR, (ok2, reason2)
 
 
 TESTS = [
@@ -159,8 +162,8 @@ TESTS = [
     ("high_spread_blocks", test_high_spread_blocks),
     ("correlated_exposure_blocks", test_correlated_exposure_blocks),
     ("drawdown_tightens_and_blocks_borderline", test_drawdown_tightens_and_blocks_borderline),
-    ("fail_open_on_internal_error", test_fail_open_on_internal_error),
-    ("predict_today_wrapper_allows_clean_and_fails_open", test_predict_today_wrapper_allows_clean_and_fails_open),
+    ("fail_closed_on_internal_error", test_fail_closed_on_internal_error),
+    ("predict_today_wrapper_allows_clean_and_fails_closed", test_predict_today_wrapper_allows_clean_and_fails_closed),
 ]
 
 if __name__ == "__main__":

@@ -376,13 +376,8 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                     from harness.predict_today import _p7_ev_gate as _p7_ev_gate_ep
                     _ev_ok, _ev_reason = _p7_ev_gate_ep(final_p, price, side)
                     if not _ev_ok:
-                        print(f"  [sameday] DECISION: NO BET — {_ev_reason}")
-                        if obs:
-                            obs.hooks.on_trade_skip(
-                                forecast_id=(obs.current().get("forecast_id") if obs else None),
-                                reason=_ev_reason,
-                                inputs={"market_id": mid, "event": ev, "side": side, "layer": "ev_gate"},
-                            )
+                        # FAIL-CLOSED money gate (EV). Record EVERYWHERE (print+obs+journal).
+                        _sd_skip(mid, q, _ev_reason, p=final_p, price=price, layer="ev_gate")
                         continue
                     # P8: unified adaptive risk guards (market-quality + correlation +
                     # bad-theme), STRICTER under drawdown. Fail-open; pure tightening.
@@ -391,34 +386,16 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                                                         _p9_exposure_ok as _p9_ex_ep)
                     _rg_ok, _rg_reason = _p8_rg_ep(m, side, q)
                     if not _rg_ok:
-                        print(f"  [sameday] DECISION: NO BET — {_rg_reason}")
-                        if obs:
-                            obs.hooks.on_trade_skip(
-                                forecast_id=(obs.current().get("forecast_id") if obs else None),
-                                reason=_rg_reason,
-                                inputs={"market_id": mid, "event": ev, "side": side, "layer": "risk_guards"},
-                            )
+                        _sd_skip(mid, q, _rg_reason, p=final_p, price=price, layer="risk_guards")
                         continue
                     # P9: bankroll kill switch + per-theme/event stake exposure cap.
                     _ct_ok, _ct_reason = _p9_ct_ep()
                     if not _ct_ok:
-                        print(f"  [sameday] DECISION: NO BET — {_ct_reason}")
-                        if obs:
-                            obs.hooks.on_trade_skip(
-                                forecast_id=(obs.current().get("forecast_id") if obs else None),
-                                reason=_ct_reason,
-                                inputs={"market_id": mid, "event": ev, "side": side, "layer": "bankroll"},
-                            )
+                        _sd_skip(mid, q, _ct_reason, p=final_p, price=price, layer="bankroll")
                         continue
                     _ex_ok, _ex_reason = _p9_ex_ep(q, ev, stake)
                     if not _ex_ok:
-                        print(f"  [sameday] DECISION: NO BET — {_ex_reason}")
-                        if obs:
-                            obs.hooks.on_trade_skip(
-                                forecast_id=(obs.current().get("forecast_id") if obs else None),
-                                reason=_ex_reason,
-                                inputs={"market_id": mid, "event": ev, "side": side, "layer": "exposure"},
-                            )
+                        _sd_skip(mid, q, _ex_reason, p=final_p, price=price, layer="exposure")
                         continue
                     print(f"  [sameday] event portfolio ACCEPTS this leg → {side} ${stake:.2f} "
                           f"(EV ${ep.portfolio_ev:+.2f}, worst ${ep.worst_case_loss:+.2f})")
@@ -468,13 +445,8 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                 # whose slippage-worsened fill is non-positive-EV; a healthy +edge bet passes).
                 _ev_ok, _ev_reason = _p7_ev_gate_reg(final_p, price, sz.side)
                 if not _ev_ok:
-                    print(f"[sameday] no bet: EV-after-costs — {_ev_reason} (swarm {p:.0%} vs market {price:.0%})")
-                    if obs:
-                        obs.hooks.on_trade_skip(
-                            forecast_id=(obs.current().get("forecast_id") if obs else None),
-                            reason=_ev_reason,
-                            inputs={"market_id": mid, "p": final_p, "price": price, "side": sz.side, "layer": "ev_gate"},
-                        )
+                    # FAIL-CLOSED money gate (EV). Record EVERYWHERE (print+obs+journal).
+                    _sd_skip(mid, q, _ev_reason, p=final_p, price=price, layer="ev_gate")
                     continue
                 # P8: unified adaptive risk guards (stale/low-liquidity/high-spread +
                 # correlation + bad-theme), STRICTER under drawdown. Fail-open; tightening.
@@ -483,34 +455,16 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                                                     _p9_exposure_ok as _p9_ex_reg)
                 _rg_ok, _rg_reason = _p8_rg_reg(m, sz.side, q)
                 if not _rg_ok:
-                    print(f"[sameday] no bet: risk guard — {_rg_reason}")
-                    if obs:
-                        obs.hooks.on_trade_skip(
-                            forecast_id=(obs.current().get("forecast_id") if obs else None),
-                            reason=_rg_reason,
-                            inputs={"market_id": mid, "p": final_p, "price": price, "side": sz.side, "layer": "risk_guards"},
-                        )
+                    _sd_skip(mid, q, _rg_reason, p=final_p, price=price, layer="risk_guards")
                     continue
                 # P9: bankroll kill switch + per-theme/event stake exposure cap.
                 _ct_ok, _ct_reason = _p9_ct_reg()
                 if not _ct_ok:
-                    print(f"[sameday] no bet: bankroll — {_ct_reason}")
-                    if obs:
-                        obs.hooks.on_trade_skip(
-                            forecast_id=(obs.current().get("forecast_id") if obs else None),
-                            reason=_ct_reason,
-                            inputs={"market_id": mid, "p": final_p, "price": price, "side": sz.side, "layer": "bankroll"},
-                        )
+                    _sd_skip(mid, q, _ct_reason, p=final_p, price=price, layer="bankroll")
                     continue
                 _ex_ok, _ex_reason = _p9_ex_reg(q, ev, sz.stake)
                 if not _ex_ok:
-                    print(f"[sameday] no bet: exposure — {_ex_reason}")
-                    if obs:
-                        obs.hooks.on_trade_skip(
-                            forecast_id=(obs.current().get("forecast_id") if obs else None),
-                            reason=_ex_reason,
-                            inputs={"market_id": mid, "p": final_p, "price": price, "side": sz.side, "layer": "exposure"},
-                        )
+                    _sd_skip(mid, q, _ex_reason, p=final_p, price=price, layer="exposure")
                     continue
                 # Guard D — one YES (winner) per mutually-exclusive event; NO/fade unlimited.
                 from harness.predict_today import ONE_YES_PER_EVENT as _ONEYES, MAX_GROUP_PROB_SUM as _MAXSUM

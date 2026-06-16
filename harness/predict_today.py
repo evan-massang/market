@@ -40,6 +40,12 @@ try:
 except Exception:
     obs = None
 
+# ── Plan 1: FAIL-CLOSED money gates ──────────────────────────────────────────
+# safety_gate holds the canonical fail-closed reason vocabulary + the coerce()
+# validator. It is a HARD dependency of the bet-decision path: a money gate that
+# cannot be evaluated MUST block the bet, never allow it. (Pure module, no cycle.)
+from harness import safety_gate as _sg
+
 # ── P7: EV-after-costs gate + per-theme adaptive min_edge + experiment tagging ──
 # Additive + guarded: a broken/missing P7 module can NEVER break a forecast pass.
 # Every wired effect is a pure TIGHTENING or a passive recording (see the helpers
@@ -59,6 +65,17 @@ try:
     from harness import experiments as _experiments
 except Exception:
     _experiments = None
+# P8/P9 money-gate modules — held at MODULE level (mirroring _profitability) so the
+# wrappers can detect an unavailable module and FAIL CLOSED, and so tests can
+# simulate "module unavailable" by patching these to None.
+try:
+    from harness import risk_guards as _risk_guards
+except Exception:
+    _risk_guards = None
+try:
+    from harness import bankroll as _bankroll
+except Exception:
+    _bankroll = None
 
 
 def _p7_adaptive_min_edge(question, base_min_edge):
@@ -86,13 +103,28 @@ def _p7_adaptive_min_edge(question, base_min_edge):
 def _p7_ev_gate(model_p, market_p, side, m=None, confidence=None):
     """P7 (B1): EV-after-costs HARD GATE. Returns ``(ok, reason)``.
 
-    PURE TIGHTENING: ``ok`` is True unless the slippage-worsened wallet fill (and,
-    when a market ``m`` is supplied, the spread/liquidity/uncertainty/exit-risk
-    penalties) makes this share's after-cost EV fall at/below MIN_EV_AFTER_COSTS.
-    Uses the wallet's OWN cost model so the gate's fill matches the real fill. On any
-    error / if the module is unavailable we fall back to pre-P7 behavior (allow)."""
+    PURE TIGHTENING: a healthy +EV bet passes; the gate can only REJECT. ``ok`` is
+    True only when the slippage-worsened wallet fill (plus, when a market ``m`` is
+    supplied, the spread/liquidity/uncertainty/exit-risk penalties) keeps this
+    share's after-cost EV above MIN_EV_AFTER_COSTS, using the wallet's OWN cost model.
+
+    FAIL-CLOSED (Plan 1): the EV gate is a money gate. If the profitability module
+    is missing, the inputs are malformed (bad/NaN price, prob out of range, bad
+    side), the call raises, or it returns a malformed result, we BLOCK the bet — we
+    never assume positive EV on a fault."""
     if _profitability is None:
-        return True, "ev_gate_unavailable"
+        return False, _sg.EV_UNAVAILABLE
+    # Validate inputs UP FRONT: a malformed price/probability/side can never be a
+    # pass. market_p must be a tradable price strictly in (0,1); model_p in [0,1].
+    try:
+        mp = float(market_p)
+        pp = float(model_p)
+    except (TypeError, ValueError):
+        return False, _sg.EV_INVALID
+    side_u = str(side).upper() if side is not None else ""
+    if not (_sg.finite(mp) and _sg.finite(pp)) or not (0.0 < mp < 1.0) \
+            or not (0.0 <= pp <= 1.0) or side_u not in ("YES", "NO"):
+        return False, _sg.EV_INVALID
     try:
         spread = liquidity = exit_risk = None
         if m is not None:
@@ -101,17 +133,14 @@ def _p7_ev_gate(model_p, market_p, side, m=None, confidence=None):
                 liquidity = scanner._f(m.get("liquidity"), None)
                 exit_risk = scanner.exit_risk(m)
             except Exception:
-                pass
-        return _profitability.ev_gate(model_p, market_p, side, spread=spread,
-                                      liquidity=liquidity, confidence=confidence,
-                                      exit_risk=exit_risk)
+                pass   # optional penalty signals only; their absence never loosens
+        res = _profitability.ev_gate(model_p, market_p, side, spread=spread,
+                                     liquidity=liquidity, confidence=confidence,
+                                     exit_risk=exit_risk)
     except Exception as e:
-        if obs:
-            try:
-                obs.hooks.on_error(where="predict_today._p7_ev_gate", exc=e, action="skip")
-            except Exception:
-                pass
-        return True, "ev_gate_error"
+        _sg.log_error("predict_today._p7_ev_gate", e)
+        return False, _sg.EV_ERROR
+    return _sg.coerce(res, gate="ev_gate", block_reason=_sg.EV_INVALID)
 
 
 def _p8_risk_guards(m, side, q):
@@ -119,56 +148,59 @@ def _p8_risk_guards(m, side, q):
     high-spread; portfolio: correlation/bad-theme) under a drawdown-derived
     `tighten` (stricter when the book is losing). Returns ``(allow, reason)``.
 
-    PURE TIGHTENING + FAIL-OPEN: any error / unavailability returns (True, ...) so
-    the bettor is never crashed or wrongly blocked — never LOOSER than pre-P8."""
+    PURE TIGHTENING: a clean market in a healthy book passes; the guards can only
+    SKIP. FAIL-CLOSED (Plan 1): if the risk_guards module is missing, ``evaluate``
+    raises, or it returns a malformed verdict, we BLOCK the bet. Only an EXPLICIT
+    ``allow is True`` from a well-formed verdict passes — unknown risk = no bet."""
+    if _risk_guards is None:
+        return False, _sg.RISK_UNAVAILABLE
     try:
-        from harness import risk_guards as _rg
-    except Exception:
-        return True, "risk_guards_unavailable"
-    try:
-        rg = _rg.evaluate(m, side, q)
-        return bool(rg.get("allow", True)), (rg.get("blocking_reason") or "ok")
+        rg = _risk_guards.evaluate(m, side, q)
     except Exception as e:
-        if obs:
-            try:
-                obs.hooks.on_error(where="predict_today._p8_risk_guards", exc=e, action="skip")
-            except Exception:
-                pass
-        return True, "risk_guards_error"
+        _sg.log_error("predict_today._p8_risk_guards", e)
+        return False, _sg.RISK_ERROR
+    if not isinstance(rg, dict) or "allow" not in rg:
+        return False, _sg.RISK_INVALID
+    allow = (rg.get("allow") is True)   # ONLY explicit True passes
+    reason = rg.get("blocking_reason") or ("ok" if allow else "risk_guards_blocked")
+    return allow, reason
 
 
 def _p9_can_trade():
     """P9: pre-bet bankroll KILL SWITCH (drawdown pause / loss limit / losing-streak
-    cooldown). Returns ``(ok, reason)``. FAIL-OPEN: any error -> (True, ...) so the
-    bettor never halts on a bug. A pause withholds only the BET — the forecast is
-    still computed + logged + frozen for scoring (observe-only)."""
+    cooldown). Returns ``(ok, reason)``. A pause withholds only the BET — the
+    forecast is still computed + logged + frozen for scoring (observe-only).
+
+    FAIL-CLOSED (Plan 1): the kill switch is a money gate. If the bankroll module is
+    missing, ``can_trade`` raises, or it returns a malformed result, we BLOCK the
+    bet — we never assume the book is healthy on a fault."""
+    if _bankroll is None:
+        return False, _sg.BANKROLL_UNAVAILABLE
     try:
-        from harness import bankroll as _bank
-        return _bank.can_trade()
+        res = _bankroll.can_trade()
     except Exception as e:
-        if obs:
-            try:
-                obs.hooks.on_error(where="predict_today._p9_can_trade", exc=e, action="skip")
-            except Exception:
-                pass
-        return True, "can_trade_error"
+        _sg.log_error("predict_today._p9_can_trade", e)
+        return False, _sg.BANKROLL_ERROR
+    return _sg.coerce(res, gate="bankroll", block_reason=_sg.BANKROLL_INVALID)
 
 
 def _p9_exposure_ok(q, event, stake):
     """P9: per-theme / per-event STAKE exposure cap. Returns ``(ok, reason)``.
-    FAIL-OPEN. Pure tightening — refuses a bet that would over-concentrate the book."""
+    Pure tightening — refuses a bet that would over-concentrate the book.
+
+    FAIL-CLOSED (Plan 1): if the bankroll module (or the theme tagger) is missing,
+    the call raises, or it returns a malformed result, we BLOCK the bet — an
+    unevaluable concentration check is unsafe."""
+    if _bankroll is None or _scoreboard_p7 is None:
+        # bankroll module or the theme tagger missing -> cannot evaluate the cap -> block
+        return False, _sg.EXPOSURE_UNAVAILABLE
     try:
-        from harness import bankroll as _bank
         theme = _scoreboard_p7.theme_of(q)
-        ok, reason, _detail = _bank.exposure_ok(theme, event, stake)
-        return bool(ok), (reason or "ok")
+        res = _bankroll.exposure_ok(theme, event, stake)
     except Exception as e:
-        if obs:
-            try:
-                obs.hooks.on_error(where="predict_today._p9_exposure_ok", exc=e, action="skip")
-            except Exception:
-                pass
-        return True, "exposure_error"
+        _sg.log_error("predict_today._p9_exposure_ok", e)
+        return False, _sg.EXPOSURE_ERROR
+    return _sg.coerce(res, gate="exposure", block_reason=_sg.EXPOSURE_INVALID)
 
 
 def _p7_experiment_tag():

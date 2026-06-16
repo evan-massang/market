@@ -43,20 +43,23 @@ volume). t == 1.0 is the baseline; the drawdown layer raises t only when the
 book is losing. t < 1.0 is clamped up to 1.0 so the guard can never be loosened
 below baseline.
 
-DEFENSIVE
-=========
+DEFENSIVE — FAIL-CLOSED (Plan 1)
+================================
 Every check is wrapped: it never raises on a missing / malformed field. The
 underlying scanner/classifier helpers already coerce defensively; the extra
-wrapper guarantees that even an unexpected internal error degrades to FAIL-OPEN
-(ok=True, recorded in `detail`) rather than over-blocking a clean market — P8 is
-ADDITIVE on top of the existing P4/P5/P7 guards, so a P8 hiccup must never veto a
-bet the rest of the stack would have allowed.
+wrapper guarantees that even an unexpected internal error degrades to FAIL-CLOSED
+(ok=False, reason ``market_quality_error_fail_closed``, recorded in `detail`).
+Unknown market quality is UNSAFE — a check that cannot be evaluated must BLOCK the
+bet, never silently pass it. (Previously these checks failed OPEN to avoid
+over-blocking; Plan 1 reverses that for safety: a network/parse hiccup must NOT
+look like "market quality OK".)
 
 No network, no LLM, no DB writes. Self-tests:
     python -m harness.tests.test_market_quality
 """
 from __future__ import annotations
 
+from harness import safety_gate as _sg
 from harness import scanner, classifier
 
 # ── tunable thresholds (exposed for the drawdown layer + experiments) ─────────
@@ -85,8 +88,8 @@ def check_stale_price(market) -> tuple[bool, str | None, str]:
     """
     try:
         stale, why = scanner.is_stale(market if isinstance(market, dict) else {})
-    except Exception as exc:  # never raise on a malformed field — fail open
-        return True, None, f"stale_check_error: {exc!r} (fail-open, not blocking)"
+    except Exception as exc:  # FAIL-CLOSED: an unevaluable quality check BLOCKS the bet
+        return False, _sg.MARKET_QUALITY_ERROR, f"stale_check_error: {exc!r} (fail-closed, blocking)"
     if stale:
         return False, "stale_price", str(why)
     return True, None, str(why)  # why == "ok"
@@ -108,8 +111,8 @@ def check_liquidity(market, min_volume: float | None = None,
         vol, liq = classifier._market_floats(market)
         detail = (f"volume=${vol:,.0f} (min ${mv:,.0f}); "
                   f"liquidity=${liq:,.0f} (min ${ml:,.0f})")
-    except Exception as exc:  # fail open rather than over-block
-        return True, None, f"liquidity_check_error: {exc!r} (fail-open, not blocking)"
+    except Exception as exc:  # FAIL-CLOSED: an unevaluable quality check BLOCKS the bet
+        return False, _sg.MARKET_QUALITY_ERROR, f"liquidity_check_error: {exc!r} (fail-closed, blocking)"
     if not ok:
         return False, "low_liquidity", detail
     return True, None, detail
@@ -133,8 +136,8 @@ def check_spread(market, max_spread: float = DEFAULT_MAX_SPREAD,
     try:
         spread = scanner._spread(m)        # price units, or None if no quoted book
         er = scanner.exit_risk(m)          # 0..1 depth/spread proxy
-    except Exception as exc:  # fail open rather than over-block
-        return True, None, f"spread_check_error: {exc!r} (fail-open, not blocking)"
+    except Exception as exc:  # FAIL-CLOSED: an unevaluable quality check BLOCKS the bet
+        return False, _sg.MARKET_QUALITY_ERROR, f"spread_check_error: {exc!r} (fail-closed, blocking)"
 
     blocked = False
     parts: list[str] = []

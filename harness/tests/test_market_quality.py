@@ -11,12 +11,13 @@ from __future__ import annotations
 import sys
 from datetime import datetime, timedelta, timezone
 
-from harness.tests._util import make_temp_env, run_as_main
+from harness.tests._util import make_temp_env, patched, run_as_main
 
 make_temp_env("ps_mktqual_")
 
 from harness import market_quality as MQ  # noqa: E402
 from harness import classifier, scanner    # noqa: E402
+from harness import safety_gate as SG      # noqa: E402
 
 
 def _iso_in(hours):
@@ -167,6 +168,34 @@ def test_check_return_shape():
         assert isinstance(detail, str)
 
 
+# ── 7) FAIL-CLOSED (Plan 1): a check that ERRORS internally must NOT become "OK" ──
+def test_check_error_fails_closed_not_open():
+    """A network/parse hiccup inside a quality check must BLOCK, never silently pass.
+    Each check is forced to raise; it must return (False, market_quality_error_fail_closed)
+    and evaluate_market_quality must then report allow=False with that reason."""
+    m = mk()  # a clean market that WOULD pass if the check didn't blow up
+
+    def _boom(*a, **k):
+        raise RuntimeError("simulated scanner/classifier outage")
+
+    # stale check error -> block
+    with patched(scanner, "is_stale", _boom):
+        ok, reason, _ = MQ.check_stale_price(m)
+        assert ok is False and reason == SG.MARKET_QUALITY_ERROR, (ok, reason)
+        v = MQ.evaluate_market_quality(m)
+        assert v["allow"] is False and SG.MARKET_QUALITY_ERROR in v["reasons"], v
+
+    # liquidity check error -> block
+    with patched(classifier, "passes_liquidity_floor", _boom):
+        ok, reason, _ = MQ.check_liquidity(m)
+        assert ok is False and reason == SG.MARKET_QUALITY_ERROR, (ok, reason)
+
+    # spread check error -> block
+    with patched(scanner, "_spread", _boom):
+        ok, reason, _ = MQ.check_spread(m)
+        assert ok is False and reason == SG.MARKET_QUALITY_ERROR, (ok, reason)
+
+
 TESTS = [
     ("clean_market_passes_all_at_baseline", test_clean_market_passes_all_at_baseline),
     ("stale_end_date_blocks", test_stale_end_date_blocks),
@@ -179,6 +208,7 @@ TESTS = [
     ("tighten_below_one_clamped_to_baseline", test_tighten_below_one_clamped_to_baseline),
     ("never_raises_on_missing_fields", test_never_raises_on_missing_fields),
     ("check_return_shape", test_check_return_shape),
+    ("check_error_fails_closed_not_open", test_check_error_fails_closed_not_open),
 ]
 
 if __name__ == "__main__":

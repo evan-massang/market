@@ -160,15 +160,23 @@ def test_mark_to_market_uses_price_map_else_cost():
     assert marked["mtm_equity"] == round(marked["cash"] + marked["mtm_open_value"], 4)
 
 
-def test_never_raises_on_missing_table():
+def test_db_unavailable_fails_closed():
+    """Plan 1: a missing/locked wallet DB is the money gate being UNAVAILABLE.
+    can_trade + exposure_ok must BLOCK (was: fail-open to allow). The analytics-only
+    helpers (opinion_loss_streak, mark_to_market_equity) still degrade softly because
+    they never on their own approve a bet."""
+    from harness import safety_gate as SG
     conn = sqlite3.connect(os.environ["DATABASE_URL"])
     conn.execute("DROP TABLE IF EXISTS paper_positions")
     conn.execute("DROP TABLE IF EXISTS paper_wallet")
     conn.commit()
     conn.close()
-    assert BK.can_trade()[0] is True            # fail-open
+    ct_ok, ct_reason = BK.can_trade()
+    assert ct_ok is False and SG.is_fail_closed(ct_reason), (ct_ok, ct_reason)
+    ex_ok, ex_reason, _ = BK.exposure_ok("x", "y", 10.0)
+    assert ex_ok is False and SG.is_fail_closed(ex_reason), (ex_ok, ex_reason)
+    # analytics helpers never raise and never themselves approve a bet
     assert BK.opinion_loss_streak() == 0
-    assert BK.exposure_ok("x", "y", 10.0)[0] is True
     assert isinstance(BK.mark_to_market_equity(), dict)
 
 
@@ -184,7 +192,7 @@ TESTS = [
     ("other_theme_exempt_from_theme_cap", test_other_theme_exempt_from_theme_cap),
     ("event_exposure_cap_blocks", test_event_exposure_cap_blocks),
     ("mark_to_market_uses_price_map_else_cost", test_mark_to_market_uses_price_map_else_cost),
-    ("never_raises_on_missing_table", test_never_raises_on_missing_table),
+    ("db_unavailable_fails_closed", test_db_unavailable_fails_closed),
 ]
 
 if __name__ == "__main__":

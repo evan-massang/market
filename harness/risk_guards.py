@@ -11,14 +11,17 @@ so one audit record shows the full guard picture; it does NOT re-enforce P4 / P5
 no_data / P7 EV (those stay at their own call sites — re-enforcing would
 double-skip and muddy the reason codes).
 
-FAIL-OPEN: any internal error -> ``allow=True`` (== pre-P8 behavior), logged via
-obs.on_error. Like every guard in this program it can only ever SKIP a bet, never
-approve one.
+FAIL-CLOSED (Plan 1): any internal error -> ``allow=False`` with blocking_reason
+``risk_guards_internal_error_fail_closed``, logged via obs.on_error. A risk verdict
+that cannot be computed is UNKNOWN, and unknown risk is unsafe — so we BLOCK the
+bet rather than assume the market is safe. Like every guard in this program it can
+only ever SKIP a bet, never approve one.
 """
 from __future__ import annotations
 
 from harness import market_quality
 from harness import portfolio_guards
+from harness import safety_gate as _sg
 from harness import scoreboard
 
 try:
@@ -89,8 +92,11 @@ def evaluate(market, side, question, positions=None, cfg=None) -> dict:
     except Exception as e:
         if obs:
             try:
-                obs.hooks.on_error(where="risk_guards.evaluate", exc=e, action="fail-open-allow")
+                obs.hooks.on_error(where="risk_guards.evaluate", exc=e, action="fail-closed-block")
             except Exception:
                 pass
-        # FAIL-OPEN to pre-P8 behavior: never crash or wrongly block the bettor.
-        return {"allow": True, "blocking_reason": None, "tighten": 1.0, "checks": []}
+        # FAIL-CLOSED (Plan 1): an internal error means the risk verdict is UNKNOWN.
+        # Unknown risk is unsafe -> BLOCK the bet (never assume the market is safe).
+        return {"allow": False, "blocking_reason": _sg.RISK_INTERNAL_ERROR,
+                "tighten": 1.0, "checks": [],
+                "error": f"{type(e).__name__}: {str(e)[:200]}"}

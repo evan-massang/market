@@ -126,16 +126,17 @@ def test_ev_gate_rejects_neg_ev_passes_healthy():
     assert ok3 is False and reason3 == "neg_ev_after_costs", (ok3, reason3)
 
 
-# ── (2b) the gate is a pure-tightening AND with the prior gate (never loosens) ───
-def test_ev_gate_unavailable_falls_back_to_allow():
-    """If the module is unavailable the wired helper ALLOWS (== pre-P7, which had no
-    EV gate) — never LOOSER than pre-P7, never breaks a healthy bet on a fault."""
+# ── (2b) Plan 1 FAIL-CLOSED: an unavailable EV module BLOCKS the bet ─────────────
+def test_ev_gate_unavailable_fails_closed():
+    """Plan 1: the EV gate is a MONEY GATE. If the profitability module is
+    unavailable it BLOCKS the bet (never assumes positive EV on a fault)."""
+    from harness import safety_gate as SG
     with patched(PT, "_profitability", None):
-        ok, reason = PT._p7_ev_gate(0.508, 0.50, "YES")     # would normally reject
-    assert ok is True and reason == "ev_gate_unavailable", (ok, reason)
-    # And a degenerate side is rejected by the real gate (conservative).
-    okd, _ = PT._p7_ev_gate(0.5, 0.5, "MAYBE")
-    assert okd is False, okd
+        ok, reason = PT._p7_ev_gate(0.508, 0.50, "YES")     # would reject anyway
+    assert ok is False and reason == SG.EV_UNAVAILABLE, (ok, reason)
+    # A degenerate side is rejected as INVALID (conservative, fail-closed).
+    okd, rd = PT._p7_ev_gate(0.5, 0.5, "MAYBE")
+    assert okd is False and rd == SG.EV_INVALID, (okd, rd)
 
 
 # ── (2c) the active experiment tag is the baseline (a numeric no-op) at cold start ─
@@ -220,7 +221,7 @@ TESTS = [
     ("cold_start_min_edge_equals_default", test_cold_start_min_edge_equals_default),
     ("losing_theme_raises_min_edge_only_up", test_losing_theme_raises_min_edge_only_up),
     ("ev_gate_rejects_neg_ev_passes_healthy", test_ev_gate_rejects_neg_ev_passes_healthy),
-    ("ev_gate_unavailable_falls_back_to_allow", test_ev_gate_unavailable_falls_back_to_allow),
+    ("ev_gate_unavailable_fails_closed", test_ev_gate_unavailable_fails_closed),
     ("experiment_tag_is_baseline", test_experiment_tag_is_baseline),
     ("settle_records_clv_and_experiment_outcome", test_settle_records_clv_and_experiment_outcome),
     ("settle_p7_hook_never_breaks_settlement", test_settle_p7_hook_never_breaks_settlement),

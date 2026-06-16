@@ -7,10 +7,15 @@ control passes, so today's behavior is unchanged; the controls bite only once th
 book is actually losing or over-concentrated.
 
 Read-only over the paper wallet (paper_wallet + paper_positions). DATABASE_URL-
-aware (resolved at call time, like harness.label_perf) and best-effort: any error
-degrades to the PERMISSIVE default for caps (a bug never vetoes a bet) EXCEPT the
-kill switch, which on a read error stays permissive too (fail-open, never crash
-the bettor) and logs via obs.
+aware (resolved at call time, like harness.label_perf).
+
+FAIL-CLOSED (Plan 1): the kill switch and the exposure cap are MONEY GATES. If the
+wallet/DB is unavailable, unreadable, uninitialized, or returns malformed data,
+they BLOCK (return allow=False with a ``*_fail_closed`` reason) and log via obs —
+they never assume the book is healthy on a fault. A safety gate that cannot be
+evaluated is unsafe, and unsafe = no paper bet. (Analytics-only helpers below —
+opinion_loss_streak, mark_to_market_equity — still degrade softly to 0/empty,
+because they never on their own approve a bet.)
 
 Scope notes:
   * drawdown_pause + loss_limit are BOOK-WIDE (capital preservation protects the
@@ -20,10 +25,12 @@ Scope notes:
 """
 from __future__ import annotations
 
+import math
 import os
 import sqlite3
 
 from harness import portfolio_guards
+from harness import safety_gate as _sg
 
 try:
     from harness import obs
@@ -120,8 +127,33 @@ def can_trade() -> tuple[bool, str]:
       * loss_limit:     realized P&L <= -(MAX_TOTAL_LOSS_FRAC * starting)
       * cooldown:       >= COOLDOWN_STREAK consecutive losing OPINION bets
 
-    FAIL-OPEN: any error -> (True, ...) so the bettor never crashes or wrongly halts.
+    FAIL-CLOSED (Plan 1): the kill switch must be able to READ a real, initialized
+    wallet baseline. If the wallet/DB is unavailable, unreadable, or uninitialized,
+    or any error occurs, we BLOCK (no bet) — we never assume the book is healthy.
+    NOTE: ``portfolio_guards.drawdown_state`` SWALLOWS a DB error into a zeroed,
+    "healthy" state, so relying on it alone would silently fail OPEN on a dead DB.
+    We therefore read ``wallet.get_state`` DIRECTLY first (it raises on a missing/
+    locked table) and require a positive starting_bankroll before trusting any
+    downstream check.
     """
+    # ── readable-baseline precondition: prove we can actually read the wallet ──
+    try:
+        from harness import wallet as _wallet
+        _st = _wallet.get_state()             # raises on a missing / locked DB
+    except Exception as e:
+        _err("bankroll.can_trade.read", e)
+        return False, _sg.BANKROLL_UNAVAILABLE
+    if not isinstance(_st, dict):
+        return False, _sg.BANKROLL_INVALID
+    try:
+        _starting0 = float(_st.get("starting_bankroll") or 0.0)
+    except (TypeError, ValueError):
+        return False, _sg.BANKROLL_INVALID
+    if not math.isfinite(_starting0) or _starting0 <= 0:
+        # no initialized wallet baseline (empty/missing wallet) -> cannot run the
+        # kill switch -> BLOCK rather than wave the bet through.
+        return False, _sg.BANKROLL_UNAVAILABLE
+    # ── kill-switch checks (unchanged arithmetic; healthy book -> ok) ──
     try:
         st = portfolio_guards.drawdown_state()
         starting = st.get("starting_bankroll") or 0.0
@@ -136,7 +168,7 @@ def can_trade() -> tuple[bool, str]:
         return True, "ok"
     except Exception as e:
         _err("bankroll.can_trade", e)
-        return True, "can_trade_error"
+        return False, _sg.BANKROLL_ERROR
 
 
 # ── stake-based exposure caps (per theme / event) ─────────────────────────────
@@ -166,21 +198,34 @@ def exposure_ok(theme, event, new_stake, bankroll=None,
     """Block a new bet that would push open STAKE in its theme/event past the cap.
 
     Returns ``(ok, reason, detail)``. reason in {'theme_exposure_cap',
-    'event_exposure_cap'} on a block. Healthy / under-cap -> (True, None, detail).
+    'event_exposure_cap'} on a normal block. Healthy / under-cap -> (True, None, detail).
     The unclassified 'other' theme is EXEMPT from the theme cap (it is a catch-all
-    of unrelated markets, not a real concentrated cluster). Best-effort -> allow.
+    of unrelated markets, not a real concentrated cluster).
+
+    FAIL-CLOSED (Plan 1): the cap is a fraction of bankroll. If we cannot establish
+    a positive, finite bankroll baseline, the stake is malformed, or any error
+    occurs, we BLOCK (return allow=False with a ``*_fail_closed`` reason) — an
+    unevaluable concentration check is unsafe. (Was: degrade to allow.)
     """
     try:
         if bankroll is None:
-            bankroll = portfolio_guards.drawdown_state().get("equity") or 0.0
-        bankroll = float(bankroll or 0.0)
-        new_stake = float(new_stake or 0.0)
+            ds = portfolio_guards.drawdown_state()
+            bankroll = (ds.get("equity") if isinstance(ds, dict) else None)
+        try:
+            bankroll = float(bankroll) if bankroll is not None else 0.0
+            new_stake = float(new_stake or 0.0)
+        except (TypeError, ValueError):
+            return False, _sg.EXPOSURE_INVALID, {}
+        if not (math.isfinite(bankroll) and math.isfinite(new_stake)):
+            return False, _sg.EXPOSURE_INVALID, {}
         t_sum, e_sum = _open_stake_by(theme, event)
         detail = {"theme": theme, "event": event, "bankroll": round(bankroll, 2),
                   "open_theme_stake": round(t_sum, 2), "open_event_stake": round(e_sum, 2),
                   "new_stake": round(new_stake, 2)}
         if bankroll <= 0:
-            return True, None, detail  # no bankroll signal -> don't veto
+            # no positive bankroll baseline -> cannot size a % cap -> BLOCK (was: allow)
+            detail["reason"] = "no_bankroll_baseline"
+            return False, _sg.EXPOSURE_INVALID, detail
         if event and (e_sum + new_stake) > max_event_frac * bankroll:
             detail["cap"] = round(max_event_frac * bankroll, 2)
             return False, "event_exposure_cap", detail
@@ -190,7 +235,7 @@ def exposure_ok(theme, event, new_stake, bankroll=None,
         return True, None, detail
     except Exception as e:
         _err("bankroll.exposure_ok", e)
-        return True, None, {}
+        return False, _sg.EXPOSURE_ERROR, {}
 
 
 # ── mark-to-market equity ─────────────────────────────────────────────────────
