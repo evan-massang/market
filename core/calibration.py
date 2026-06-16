@@ -15,7 +15,7 @@ except Exception:
     obs = None
 
 
-DB_PATH = os.getenv("DATABASE_URL", "polyswarm.db").replace("sqlite+aiosqlite:///./", "")
+DB_PATH = os.getenv("DATABASE_URL", "polyswarm.db").replace("sqlite+aiosqlite:///./", "").replace("sqlite:///./", "")
 
 
 def _ensure_column(conn, table: str, column: str, coltype: str):

@@ -213,6 +213,18 @@ def replay_handles(limit: int = 25) -> list[dict]:
             for r in rows]
 
 
+# ── loss-cause analysis (P17 dedicated analyzer) ───────────────────────────────
+def loss_analysis() -> dict:
+    """Per-loss CAUSE classification + histogram + honest recommendations (audit #20)."""
+    try:
+        from harness import loss_analysis as la
+        return {"by_trade": la.analyze_losses(), "cause_counts": la.cause_summary(),
+                "recommendations": la.recommendations()}
+    except Exception as e:
+        _err("command_center.loss_analysis", e)
+        return {"by_trade": [], "cause_counts": {}, "recommendations": []}
+
+
 # ── the assembled command center ──────────────────────────────────────────────
 def command_center() -> dict:
     """One read-only payload for the dashboard command-center panel."""
@@ -220,6 +232,7 @@ def command_center() -> dict:
         "skipped_markets": skipped_markets(),
         "skip_reason_counts": skip_reason_counts(),
         "losing_trades": losing_trades(),
+        "loss_analysis": loss_analysis(),
         "theme_label_performance": theme_label_performance(),
         "next_best_actions": next_best_actions(),
         "replay_handles": replay_handles(),

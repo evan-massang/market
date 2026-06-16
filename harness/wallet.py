@@ -31,7 +31,7 @@ try:
 except Exception:
     obs = None
 
-DB_PATH = os.getenv("DATABASE_URL", "polyswarm.db").replace("sqlite+aiosqlite:///./", "")
+DB_PATH = os.getenv("DATABASE_URL", "polyswarm.db").replace("sqlite+aiosqlite:///./", "").replace("sqlite:///./", "")
 
 DEFAULT_STARTING_BANKROLL = 1000.0
 

@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from harness.classifier import tag_market
 from harness import wallet as paper
 
-DB_PATH = os.getenv("DATABASE_URL", "polyswarm.db").replace("sqlite+aiosqlite:///./", "")
+DB_PATH = os.getenv("DATABASE_URL", "polyswarm.db").replace("sqlite+aiosqlite:///./", "").replace("sqlite:///./", "")
 GATE1_MIN_N = 50
 
 # ── coarse theme tagger (opinion markets) ─────────────────────────────────────

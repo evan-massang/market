@@ -185,4 +185,24 @@ positions = [] not 500; /debug secret-free + PAPER). Suite 46 modules.
   leg can lose its full stake (worst_case < 0). `harness/event_portfolio.py`. Test:
   `test_event_portfolio::forced_me_single_leg_cannot_fabricate_certainty`. FIXED.
 
+### BATCH 7 — DB-path robustness + dedicated loss analyzer — FIXED
+
+- **#17 🟠 bare `sqlite:///` DATABASE_URL mis-parsed by 5 OLD modules** (wallet,
+  calibration, challenger, journal, scoreboard) — only stripped the `aiosqlite` prefix,
+  so a bare `sqlite:///./x.db` stayed verbatim → split-brain DB vs the new modules, or a
+  connect crash. **FIX:** chained `.replace("sqlite:///./","")` in all five (matching the
+  new modules / `obs.config`). FIXED.
+- **#20 🟠 no dedicated losing-trade CAUSE analyzer** — the only loss view labelled every
+  loss generically `-> wrong`. **FIX:** new `harness/loss_analysis.py` (`python -m
+  harness.loss_analysis`) classifies each losing settled/closed trade into a primary cause
+  (bad_forecast / expected_variance / thin_edge_selection / cashed_out_early / oversized /
+  bad_timing / bad_theme), with a cause histogram + honest recommendations (never a profit
+  claim — `expected_variance` explicitly flags normal noise). Wired into
+  `command_center` (`loss_analysis` key). On the LIVE book it reveals the dominant cause:
+  **cashed_out_early 32 / bad_forecast 8** → "scanner may be entering too late (check CLV)".
+  FIXED.
+
+Test: +`test_loss_analysis` 6/6 (cause classification, summary, recommendations
+profit-free, sqlite:/// db-path). Suite 47 modules.
+
 _(remaining batches appended below as each is closed)_
