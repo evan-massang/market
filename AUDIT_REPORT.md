@@ -87,9 +87,80 @@ documented `run_tests.py` does not hang on LLM calls.
 
 ---
 
-## PHASE 2-17 — see DEBUG_LOG.md for per-bug detail; this section is updated as fixes land.
+## PHASE 2-17 — deep code audit + fixes
 
-_(Deep code audit in progress — confirmed bugs, fixes, and added tests recorded below as each category is closed.)_
+A 14-subsystem **adversarial** audit (each finding independently reproduced before any
+fix) surfaced **41 confirmed defects + 2 refuted** (1 critical, 18 major, 22 minor).
+Fixed in 8 priority batches; **every fix ships a regression test.** Per-bug detail with
+reproductions and file:line is in `DEBUG_LOG.md`. Summary:
+
+### 1. What was broken (highlights)
+- 🔴 **Settlement double-credit** — `settle_market`/`close_at_price` had no `status='open'`
+  guard on the UPDATE/wallet-credit and no cross-process lock; two daemons could credit a
+  position twice, **silently inflating the realized P&L Gate 2 reads**.
+- 🟠 **Parser fragility** — one malformed LLM reply (`"60%"`/null/prose) crashed the whole
+  swarm forecast; the challenger turned `"60 percent"` into 0.99.
+- 🟠 **P&L inconsistency** — cashed-out (`closed`) trades were excluded from every analytic
+  but counted in Gate 2 → two conflicting realized numbers, hidden losers.
+- 🟠 **Classifier** — approval-rating opinion markets mislabeled mechanical (skipped);
+  non-political "candidate" markets mislabeled opinion.
+- 🟠 **Daemon CLI** — hand-rolled parsers IndexError-crashed / silently swallowed
+  `--dry-run` & unknown commands; **sameday didn't enforce observe-only** and its skips
+  were invisible (never reached the journal/dashboard).
+- 🟠 **Event-portfolio** — a forced-ME event with one eligible leg fabricated a guaranteed
+  win (defeating the worst-case risk gate).
+- 🟠 **Dashboard** — `/api/state` 500'd under DB write contention; `/health` `/debug`
+  `/errors` `/decisions/recent` missing.
+- 🟠 **DB-path** — bare `sqlite:///` mis-parsed by 5 old modules (split-brain / crash).
+- 🟡 **Gate 2** could flash PASS on one trade; `MODEL_FAST` env leak; dead `is_stale`
+  freshness branch; wallet↔ledger drift unreconciled.
+
+### 2. What was fixed (8 batches, commits `6861ce5`…`129d6f2`)
+B1 settlement idempotency (guarded UPDATE + rowcount + busy_timeout) + fee math + new
+`db_check` reconciliation · B2 parser robustness (`_coerce_prob`, per-agent skip, neutral
+degraded forecast) · B3 P&L metrics include `closed` + classifier approval/candidate ·
+B4 argparse + `--dry-run` honored + sameday observe-only + visible skips · B5 dashboard
+`/health` `/debug` `/errors` `/decisions/recent` + `/api/state` crash-safety · B6
+event-portfolio lone-leg fallback · B7 `sqlite:///` db-path + dedicated **loss-cause
+analyzer** · B8 Gate-2 sample floor + env-leak/is_stale/docstring.
+
+### 3. Tests added (suite 41 → 47 modules, all no-network)
+`test_settlement_idempotent` (6), `test_db_check` (4), `test_parser_robust` (5),
+`test_cli_args` (3), `test_dashboard_endpoints` (4), `test_loss_analysis` (6), plus new
+cases in `test_metrics`/`test_event_portfolio`/`test_scoreboard`. **`run_tests.py` → 47/47.**
+
+### 4. What still needs work
+See the "Remaining" list in `DEBUG_LOG.md`: Gate-1 bet-bias (#10), EV-gate-vs-arb (#7) +
+arb-liquidity, Guard-D-on-final_p (#28, dormant), gamma retry/backoff, MiroFish deadline
+cap, `.env.example`/`SWARM_SIZE` hygiene, attention-metric label (no behavior). None block
+paper-only operation. **The live `polyswarm.db` has a real wallet↔ledger drift** (wallet
+realized −42.25 vs ledger −39.43; equity invariant off ~$40) from earlier external row
+deletion — now **surfaced** by `db_check` (was silently trusted). It does not affect the
+gate verdict (both already FAIL) but should be reconciled before reading Gate 2.
+
+---
+
+## PHASE 18 — final status
+
+5. **How to run** (from `polyswarm/`, `PYTHONUTF8=1 ./.venv/Scripts/python.exe …`):
+   - `-m harness.doctor` preflight · `-m harness.db_check` DB integrity/reconciliation
+   - `-m harness.predict_today daemon --with-mirofish` (AI pipeline) · `-m harness.sameday daemon`
+   - `-m harness.dashboard` (:8800) · `-m harness.scoreboard` / `-m harness.metrics` (gates)
+   - `-m harness.loss_analysis` (loss-cause) · `python run_tests.py` (47/47)
+6. **How to verify it works:** `python run_tests.py` → 47/47; `harness.doctor` → 11 PASS/1
+   WARN/0 FAIL; `harness.db_check` → integrity OK (reconcile WARNs on the live drift, by
+   design); `harness.scoreboard`/`harness.metrics` report honest FAILs.
+7. **Known limitations:** swarm forecast ~235s/market on CPU; gates need weeks of resolved
+   opinion markets; the live wallet running-total has drifted (visible via `db_check`).
+8. **Safe to run paper-only?** **Yes.** No real-money execution exists; every change here is
+   a tightening or read-only; `wallet.py` has no signing/order path (asserted by
+   `test_acceptance` C18). The settlement double-credit (the one integrity risk) is fixed.
+9. **Profitability proven?** **No — and not claimed.** GATE1 FAIL (0 resolved opinion
+   markets, needs ≥50), GATE2 FAIL (equity below start), model **log loss 0.758 >
+   coin-flip 0.693**. The system measures whether the edge is real before any real money.
+10. **Next highest-impact:** reconcile the live wallet ledger (a `db_check --fix` or fresh
+    bankroll); fix Gate-1 bet-bias (#10) so calibration is scored on the full forecast set;
+    then accrue ≥50 resolved opinion markets to actually read the gates.
 
 ---
 
