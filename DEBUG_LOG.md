@@ -158,4 +158,19 @@ adaptive/clv/command_center green. Suite 44 modules.
 
 Test: +`test_cli_args` 3/3 (bad-arg rejection, `--dry-run` reaches cfg). Suite 45 modules.
 
+### BATCH 5 — dashboard endpoints + crash-safety — FIXED
+
+- **#14 🟠 requested endpoints missing.** Added `/health` (alias of `/api/health`),
+  `/decisions/recent` (journal decisions), `/errors` (recent obs error events with
+  market_id/stage/exception), `/debug` (effective config + guard tunables via
+  `provenance.config_snapshot` + health + `db_check` summary; secret-free, PAPER-labelled).
+  `harness/dashboard.py`. FIXED.
+- **#15 🟠 `/api/state` 500'd the whole dashboard under DB write contention** —
+  `paper.get_open_positions()/get_closed_positions()` were the only unguarded reads
+  (every sibling read already catches `OperationalError`). **FIX:** a `_safe()` wrapper
+  → `[]` on a transient lock, so a settling daemon can't blank the dashboard. FIXED.
+
+Test: +`test_dashboard_endpoints` 4/4 (all endpoints 200 on an EMPTY db; /api/state
+positions = [] not 500; /debug secret-free + PAPER). Suite 46 modules.
+
 _(remaining batches appended below as each is closed)_

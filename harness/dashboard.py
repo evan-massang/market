@@ -113,8 +113,10 @@ def api_state():
         },
         "pnl_series": [{"ts": s["ts"], "equity": s["equity"], "realized_pnl": s["realized_pnl"],
                         "cash": s["cash"], "n_open": s["n_open"]} for s in snaps],
-        "positions": paper.get_open_positions(),
-        "closed": paper.get_closed_positions(80),
+        # guarded like every other read here — a transient 'database is locked' (a
+        # daemon settling/opening) must not 500 the whole dashboard (audit #15).
+        "positions": _safe(lambda: paper.get_open_positions(), []),
+        "closed": _safe(lambda: paper.get_closed_positions(80), []),
         "decisions": journal.get_decisions(60),
         "ab": _ab_rows(40),
         "mirofish": mirofish_signal.get_signals(8),
@@ -150,6 +152,15 @@ def api_explain(market_id: str):
         return JSONResponse({"market_id": market_id, "error": f"explain unavailable: {e}"})
 
 
+def _safe(fn, default):
+    """Run a read and swallow any error (e.g. transient sqlite lock) -> default,
+    so one contended read never 500s the whole dashboard response."""
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(HTML, headers={"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"})
@@ -158,7 +169,54 @@ def index():
 @app.get("/api/health")
 def api_health():
     """Live system-health snapshot — every value is a real HTTP probe, DB row ts, or file mtime."""
-    return JSONResponse(health.snapshot())
+    return JSONResponse(_safe(lambda: health.snapshot(), {"error": "health unavailable"}))
+
+
+@app.get("/health")
+def health_alias():
+    """Bare /health alias (audit #14) — same snapshot as /api/health."""
+    return JSONResponse(_safe(lambda: health.snapshot(), {"error": "health unavailable"}))
+
+
+@app.get("/decisions/recent")
+def decisions_recent(limit: int = 50):
+    """Recent paper-trade decisions (bets + skips with reasons) — audit #14."""
+    return JSONResponse({"decisions": _safe(lambda: journal.get_decisions(limit), [])})
+
+
+@app.get("/errors")
+def errors_recent(limit: int = 50):
+    """Recent obs error events (market_id / stage / exception) for triage — audit #14."""
+    rows = []
+    try:
+        from harness.obs import explain as _explain
+        events = _safe(lambda: _explain._load_events()[0], [])
+        for ev in events:
+            if isinstance(ev, dict) and ev.get("event") == "error":
+                ctx = ev.get("context") if isinstance(ev.get("context"), dict) else {}
+                rows.append({"ts": ev.get("ts"), "where": ev.get("where"),
+                             "error": ev.get("error"), "action": ev.get("action"),
+                             "market_id": ctx.get("market_id")})
+    except Exception as e:
+        return JSONResponse({"error": f"errors unavailable: {e}", "errors": []})
+    return JSONResponse({"errors": rows[-limit:]})
+
+
+@app.get("/debug")
+def debug_state():
+    """Effective config + guard tunables + daemon heartbeats + DB summary — audit #14.
+    Read-only, secret-free (never prints API keys)."""
+    out = {"trading": "PAPER (real-money execution disabled)"}
+    out["config"] = {
+        "provider": os.getenv("LLM_PROVIDER", "ollama"),
+        "model_fast": os.getenv("MODEL_FAST", "(default)"),
+        "dashboard_port": int(os.getenv("DASH_PORT", "8800")),
+        "db": _safe(lambda: __import__("harness.wallet", fromlist=["DB_PATH"]).DB_PATH, "?"),
+    }
+    out["guards"] = _safe(lambda: __import__("harness.provenance", fromlist=["config_snapshot"]).config_snapshot(), {})
+    out["health"] = _safe(lambda: health.snapshot(), {})
+    out["db_check"] = _safe(lambda: __import__("harness.db_check", fromlist=["run"]).run(), {})
+    return JSONResponse(out)
 
 
 MF_BACKEND = os.getenv("MIROFISH_BASE", "http://localhost:5001")
