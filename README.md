@@ -104,6 +104,54 @@ harness.doctor — read-only health check
 OK: 11 pass, 1 warn, 0 fail  (of 12 checks)
 ```
 
+### Running the full Polymarket AI with one command
+
+You no longer need to open a shell per service. The **supervisor** starts every
+required agent (MiroFish backend if enabled, dashboard, same-day daemon, AI pipeline)
+in the **background** — no extra windows — and keeps them running after the terminal
+closes. It checks (but never starts) external Ollama, records each PID under
+`.runtime/pids/`, logs to `.runtime/logs/<service>.log`, writes per-service heartbeats,
+and a detached watcher auto-restarts a crashed required service (capped). PAPER-ONLY.
+
+```powershell
+# from polyswarm\  (or one level up — the wrapper finds the package either way)
+.\polymarket-ai.ps1 doctor     # readiness check (provider/db/commands/ports) BEFORE starting
+.\polymarket-ai.ps1 start      # start everything in the background
+.\polymarket-ai.ps1 status     # every service + health + pid + restart count
+.\polymarket-ai.ps1 logs       # recent logs from all services
+.\polymarket-ai.ps1 tail dashboard   # follow one service's log
+.\polymarket-ai.ps1 restart    # restart the full system
+.\polymarket-ai.ps1 stop       # stop everything cleanly (only repo-managed PIDs)
+.\start-polymarket-ai.ps1      # human-friendly alias for `start`
+```
+
+The same, cross-platform, via Python (the PowerShell script is only a thin wrapper —
+the Python supervisor is the single source of truth):
+
+```bash
+python -m harness.supervisor start | status | stop | restart | logs | doctor
+python -m harness.supervisor tail <service>           # follow one log
+python -m harness.supervisor start|stop|restart <service>   # one service
+python -m harness.start   # == supervisor start   (also harness.stop / harness.status)
+```
+
+- **Runtime files:** PIDs in `.runtime/pids/`, logs in `.runtime/logs/<service>.log`
+  (rotated 10 MB × 5), heartbeats in `.runtime/heartbeats/`, snapshot in
+  `.runtime/status.json` (all gitignored).
+- **Enable/disable services** in `.env`: `RUN_MIROFISH`, `RUN_MIROFISH_FRONTEND`,
+  `RUN_DASHBOARD`, `RUN_SAMEDAY_DAEMON`, `RUN_AI_PIPELINE`, plus `DASHBOARD_PORT`,
+  `MIROFISH_BACKEND_PORT`, `SUPERVISOR_RESTART_CRASHED`, `SUPERVISOR_MAX_RESTARTS`,
+  `SUPERVISOR_RESTART_WINDOW_SECONDS`. (See `STARTUP_AUDIT.md` for the full service map.)
+- **No duplicates:** `start` run twice prints `already running`; a stale PID is cleaned
+  and restarted; a port held by an **unknown** process is reported, never killed.
+- **Dashboard:** `GET /api/system/status` returns the same data as `supervisor status`;
+  `GET /health` is a structured liveness probe.
+- **Troubleshooting a failed start:** the supervisor names the exact service and reason
+  (and points to `.runtime/logs/<service>.log`); a required-service failure aborts with a
+  clear message, an optional one warns and continues. `supervisor doctor` first.
+
+### Or run the five daemons manually
+
 **The five daemons** are Windows PowerShell launchers that live in `C:\Users\OMEN\Pictures\Polymarket\` — one level **above** the `polyswarm/` package (they are *not* in the git repo root). Launch them in numeric order:
 
 ```powershell

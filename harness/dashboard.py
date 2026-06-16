@@ -174,8 +174,31 @@ def api_health():
 
 @app.get("/health")
 def health_alias():
-    """Bare /health alias (audit #14) — same snapshot as /api/health."""
-    return JSONResponse(_safe(lambda: health.snapshot(), {"error": "health unavailable"}))
+    """Structured health for the supervisor's HTTP check (always 200 if the app is up)."""
+    snap = _safe(lambda: health.snapshot(), {})
+    db_ok = _safe(lambda: __import__("harness.db_check", fromlist=["run"]).run().get("fail", 1) == 0, False)
+    last_hb = None
+    try:
+        last_hb = (snap.get("daemon") or {}).get("age_sec")
+    except Exception:
+        pass
+    return JSONResponse({
+        "ok": True, "service": "dashboard", "time": _safe(lambda: __import__("datetime").datetime
+                       .now(__import__("datetime").timezone.utc).isoformat(timespec="seconds"), None),
+        "db_ok": bool(db_ok), "last_heartbeat": last_hb, "version": "polyswarm-harness",
+        "snapshot": snap,
+    })
+
+
+@app.get("/api/system/status")
+def api_system_status():
+    """Phase 15 — the supervisor/system status (same data as `supervisor status`):
+    every service, running/stopped, pid, health, restart count, log path. Read-only."""
+    try:
+        from harness import supervisor
+        return JSONResponse(supervisor.status(as_dict=True))
+    except Exception as e:
+        return JSONResponse({"error": f"supervisor status unavailable: {e}", "services": {}})
 
 
 @app.get("/decisions/recent")

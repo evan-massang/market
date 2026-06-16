@@ -23,3 +23,6 @@ ai_transcript.md
 ai_transcript.txt
 sameday_live.log
 sameday_err.log
+
+# supervisor runtime state (pids/logs/heartbeats/status)
+.runtime/
