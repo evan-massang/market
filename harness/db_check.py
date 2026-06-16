@@ -122,6 +122,29 @@ def run() -> dict:
     except Exception as e:
         _add("reconcile", "WARN", f"reconciliation error: {e}")
 
+    # 4b) Plan 4 — open-position integrity: duplicate opens, stake/price validity.
+    try:
+        dups = conn.execute(
+            "SELECT market_id, COUNT(*) AS c FROM paper_positions WHERE status='open' "
+            "GROUP BY market_id HAVING c > 1").fetchall()
+        _add("duplicate_open_positions", "WARN" if dups else "OK",
+             (f"{len(dups)} market(s) with >1 open position: "
+              + ", ".join(f"{(r['market_id'] or '?')[:18]}×{r['c']}" for r in dups[:5]))
+             if dups else "no market has more than one open position")
+        bad_stake = conn.execute(
+            "SELECT COUNT(*) FROM paper_positions WHERE status='open' AND (stake IS NULL OR stake <= 0)"
+        ).fetchone()[0]
+        _add("open_stake_positive", "WARN" if bad_stake else "OK",
+             f"{bad_stake} open position(s) with non-positive stake" if bad_stake else "all open stakes > 0")
+        bad_price = conn.execute(
+            "SELECT COUNT(*) FROM paper_positions WHERE status='open' AND "
+            "(fill_price IS NULL OR fill_price <= 0 OR fill_price >= 1)").fetchone()[0]
+        _add("open_price_valid", "WARN" if bad_price else "OK",
+             f"{bad_price} open position(s) with fill_price outside (0,1)" if bad_price
+             else "all open fill prices in (0,1)")
+    except Exception as e:
+        _add("open_position_integrity", "WARN", f"open-position integrity error: {e}")
+
     # 5) settled-vs-closed P&L split (so a hidden cash-out loss bucket is visible)
     try:
         sp = conn.execute("SELECT COALESCE(SUM(realized_pnl),0), COUNT(*) FROM paper_positions WHERE status='settled'").fetchone()

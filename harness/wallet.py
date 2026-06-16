@@ -21,6 +21,7 @@ Shares the ./polyswarm.db calibration DB (same DATABASE_URL convention).
 """
 from __future__ import annotations
 
+import math
 import os
 import sqlite3
 from dataclasses import dataclass, asdict
@@ -152,64 +153,144 @@ class FillResult:
 
 def open_position(market_id: str, question: str, side: str, model_p: float, market_p: float,
                   edge: float, stake: float, cfg: WalletConfig | None = None,
-                  end_date: str | None = None, event_slug: str | None = None) -> FillResult:
-    """Open a simulated paper position with a realistic (worse-than-mid) fill.
-    Enforces the per-bet cap and the max-exposure guardrail; returns FillResult."""
+                  end_date: str | None = None, event_slug: str | None = None,
+                  allow_duplicate: bool = False) -> FillResult:
+    """Open a simulated paper position with a realistic (worse-than-mid) fill — ATOMICALLY.
+
+    Plan 4: the read (cash + open exposure), the affordability / per-bet / exposure /
+    duplicate checks, the guarded cash DEBIT, and the position INSERT all happen inside
+    ONE ``BEGIN IMMEDIATE`` transaction on ONE connection. ``BEGIN IMMEDIATE`` takes the
+    write lock up front, so two concurrent callers are SERIALIZED (the second waits on
+    busy_timeout, then re-reads the debited cash and is rejected). The cash debit is
+    GUARDED (`WHERE id=1 AND cash >= debit`) + rowcount-checked, and the INSERT shares
+    the transaction — so cash can never go negative, the exposure cap can't be bypassed
+    by a race, no duplicate open can slip through, and a failure on either step rolls the
+    WHOLE thing back (no partial write). Returns FillResult (shape unchanged); failure
+    reasons are now canonical ``wallet_*`` codes."""
     cfg = cfg or WalletConfig()
 
-    def _skip(fr):
-        # obs (leaf emit): record a guardrail rejection. Returns fr UNCHANGED so the
-        # caller's return value is byte-identical to before instrumentation.
+    def _skip(reason: str) -> FillResult:
+        # obs (leaf emit): record a guardrail rejection. No DB write happened.
         if obs:
             try:
                 obs.hooks.on_trade_skip(
                     forecast_id=obs.current().get("forecast_id"),
-                    reason=fr.reason,
+                    reason=reason,
                     inputs={"market_id": market_id, "side": side, "stake": stake,
                             "model_p": model_p, "market_p": market_p, "edge": edge},
                 )
             except Exception:
                 pass
-        return fr
+        return FillResult(False, reason)
 
+    # ── pure input validation (no DB, cannot race) ──
     if side not in ("YES", "NO"):
-        return _skip(FillResult(False, f"bad side {side!r}"))
-    if stake <= 0:
-        return _skip(FillResult(False, "non-positive stake"))
+        return _skip("wallet_invalid_side")
+    try:
+        stake = float(stake)
+    except (TypeError, ValueError):
+        return _skip("wallet_invalid_stake")
+    if not math.isfinite(stake) or stake <= 0:
+        return _skip("wallet_invalid_stake")
+    try:
+        mp = float(market_p)
+    except (TypeError, ValueError):
+        return _skip("wallet_invalid_price")
+    if not math.isfinite(mp) or not (0.0 < mp < 1.0):
+        return _skip("wallet_invalid_price")
 
-    cash = _cash()
-    # Affordability must cover what we actually debit (stake + fee), else a fee
-    # could push cash negative. At the default fee_frac=0.0 this == stake.
-    total_cost = stake * (1.0 + cfg.fee_frac)
-    if total_cost > cash + 1e-6:
-        return _skip(FillResult(False, f"stake+fee {total_cost:.2f} exceeds cash {cash:.2f}"))
-    # Defensive guardrails (the sizer is the primary cap). Use a small relative
-    # tolerance so a stake sized EXACTLY at the cap isn't rejected by float rounding
-    # — otherwise every high-edge (cap-binding) bet would be refused.
-    if stake > cfg.max_bet_frac * cash * (1 + 1e-6) + 1e-9:
-        return _skip(FillResult(False, f"stake {stake:.2f} exceeds per-bet cap {cfg.max_bet_frac:.0%} of cash"))
-    exposure = get_open_exposure()
-    equity = cash + exposure
-    if exposure + stake > cfg.max_exposure_frac * equity * (1 + 1e-6) + 1e-9:
-        return _skip(FillResult(False, f"would exceed max exposure {cfg.max_exposure_frac:.0%} of equity"))
-
-    # fill at a WORSE price than quoted (slippage on the share you actually buy)
-    base = market_p if side == "YES" else (1.0 - market_p)
+    # fill math (pure). debit == stake + fee == the affordability/guard amount.
+    base = mp if side == "YES" else (1.0 - mp)
     fill_price = min(max(base + cfg.slippage, 0.01), 0.99)
     fee = round(cfg.fee_frac * stake, 6)
     shares = round(stake / fill_price, 6)
+    debit = round(stake + fee, 6)
+    now = datetime.utcnow().isoformat()
 
-    conn = _conn()
-    cur = conn.execute(
-        """INSERT INTO paper_positions
-           (market_id, question, side, model_p, market_p, edge, stake, fill_price, shares, fee, status, end_date, event_slug)
-           VALUES (?,?,?,?,?,?,?,?,?,?,'open',?,?)""",
-        (market_id, question, side, model_p, market_p, edge, round(stake, 6), fill_price, shares, fee, end_date, event_slug),
-    )
-    pid = cur.lastrowid
-    conn.execute("UPDATE paper_wallet SET cash = cash - ?, updated_at=? WHERE id=1",
-                 (round(stake + fee, 6), datetime.utcnow().isoformat()))
-    conn.commit(); conn.close()
+    # ── ATOMIC transaction: BEGIN IMMEDIATE → read → check → guarded debit → insert → commit ──
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.isolation_level = None          # manual transaction control
+        conn.execute("BEGIN IMMEDIATE")      # take the write lock NOW → serialize concurrent opens
+    except sqlite3.OperationalError:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return _skip("wallet_db_locked_or_unavailable")
+
+    try:
+        w = conn.execute("SELECT cash FROM paper_wallet WHERE id=1").fetchone()
+        if w is None:
+            conn.execute("ROLLBACK")
+            return _skip("wallet_uninitialized")
+        cash = float(w["cash"])
+        exposure = float(conn.execute(
+            "SELECT COALESCE(SUM(stake),0) AS x FROM paper_positions WHERE status='open'"
+        ).fetchone()["x"])
+
+        # affordability (stake+fee must not push cash negative)
+        if debit > cash + 1e-6:
+            conn.execute("ROLLBACK")
+            return _skip("wallet_insufficient_cash")
+        # per-bet cap (relative tolerance so an exactly-at-cap stake isn't float-rejected)
+        if stake > cfg.max_bet_frac * cash * (1 + 1e-6) + 1e-9:
+            conn.execute("ROLLBACK")
+            return _skip("wallet_per_bet_cap_exceeded")
+        # max-exposure cap
+        equity = cash + exposure
+        if exposure + stake > cfg.max_exposure_frac * equity * (1 + 1e-6) + 1e-9:
+            conn.execute("ROLLBACK")
+            return _skip("wallet_exposure_cap_exceeded")
+        # duplicate-open policy (default: one open position per market_id)
+        if not allow_duplicate:
+            dup = conn.execute(
+                "SELECT 1 FROM paper_positions WHERE market_id=? AND status='open' LIMIT 1",
+                (market_id,)).fetchone()
+            if dup is not None:
+                conn.execute("ROLLBACK")
+                return _skip("wallet_duplicate_open_blocked")
+
+        # GUARDED debit — only succeeds if cash STILL covers it (defends the boundary even
+        # under the BEGIN IMMEDIATE lock). rowcount must be exactly 1.
+        cur = conn.execute(
+            "UPDATE paper_wallet SET cash = cash - ?, updated_at=? WHERE id=1 AND cash >= ?",
+            (debit, now, debit))
+        if cur.rowcount != 1:
+            conn.execute("ROLLBACK")
+            return _skip("wallet_atomic_update_failed")
+
+        # INSERT the position in the SAME transaction — debit + insert commit together or not at all.
+        cur2 = conn.execute(
+            """INSERT INTO paper_positions
+               (market_id, question, side, model_p, market_p, edge, stake, fill_price, shares, fee, status, end_date, event_slug)
+               VALUES (?,?,?,?,?,?,?,?,?,?,'open',?,?)""",
+            (market_id, question, side, model_p, mp, edge, round(stake, 6), fill_price, shares, fee, end_date, event_slug),
+        )
+        pid = cur2.lastrowid
+        conn.execute("COMMIT")
+    except sqlite3.OperationalError:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        return _skip("wallet_db_locked_or_unavailable")
+    except Exception as e:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        return _skip(f"wallet_insert_failed_rolled_back:{type(e).__name__}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
     if obs:
         try:
             obs.hooks.on_trade_open(

@@ -84,19 +84,20 @@ def test_no_side_round_trip():
 
 
 def test_guardrails():
+    # Plan 4: canonical wallet_* rejection reasons.
     _reset()
     big = W.open_position("MKT-X", "too big", "YES", 0.6, 0.4, 0.2, stake=50.0)  # > per-bet cap (20)
-    assert (not big.opened) and "cap" in big.reason, big.reason
+    assert (not big.opened) and big.reason == "wallet_per_bet_cap_exceeded", big.reason
     tight = WalletConfig(max_exposure_frac=0.001)
     exp = W.open_position("MKT-Y", "exposure", "YES", 0.6, 0.4, 0.2,
                           stake=W.bankroll_for_sizing() * 0.02, cfg=tight)
-    assert not exp.opened and "exposure" in exp.reason, exp.reason
+    assert not exp.opened and exp.reason == "wallet_exposure_cap_exceeded", exp.reason
     bad = W.open_position("MKT-Z", "bad side", "MAYBE", 0.6, 0.4, 0.2, stake=5.0)
-    assert (not bad.opened) and "side" in bad.reason, bad.reason
+    assert (not bad.opened) and bad.reason == "wallet_invalid_side", bad.reason
     nonpos = W.open_position("MKT-0", "zero", "YES", 0.6, 0.4, 0.2, stake=0.0)
-    assert (not nonpos.opened) and "non-positive" in nonpos.reason, nonpos.reason
+    assert (not nonpos.opened) and nonpos.reason == "wallet_invalid_stake", nonpos.reason
     over = W.open_position("MKT-C", "over cash", "YES", 0.6, 0.4, 0.2, stake=5000.0)
-    assert (not over.opened) and "cash" in over.reason, over.reason
+    assert (not over.opened) and over.reason == "wallet_insufficient_cash", over.reason
 
 
 def test_cap_exact_stake_fills():
