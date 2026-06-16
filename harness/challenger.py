@@ -124,6 +124,7 @@ def _hosted_raw(system: str, user: str) -> str | None:
 
 
 def _local_raw(system: str, user: str, model: str | None) -> str | None:
+    _saved_mf = os.environ.get("MODEL_FAST")   # restore after — don't leak the override
     try:
         from core.agent import _get_llm_client, _call_llm  # type: ignore
         if model:
@@ -132,6 +133,14 @@ def _local_raw(system: str, user: str, model: str | None) -> str | None:
         return _call_llm(provider, client, system, user)
     except Exception:
         return None
+    finally:
+        # scope the MODEL_FAST override to THIS call so a challenger model choice
+        # doesn't permanently re-point every later LLM call in the process. (audit #26)
+        if model:
+            if _saved_mf is None:
+                os.environ.pop("MODEL_FAST", None)
+            else:
+                os.environ["MODEL_FAST"] = _saved_mf
 
 
 def challenger_model_label() -> str:

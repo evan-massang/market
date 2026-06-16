@@ -205,4 +205,38 @@ positions = [] not 500; /debug secret-free + PAPER). Suite 46 modules.
 Test: +`test_loss_analysis` 6/6 (cause classification, summary, recommendations
 profit-free, sqlite:/// db-path). Suite 47 modules.
 
-_(remaining batches appended below as each is closed)_
+### BATCH 8 — scoring honesty + scanner/env hygiene — FIXED
+
+- **🟡 Gate 2 could flash PASS on one lucky settled trade** (no sample floor). **FIX:**
+  `GATE2_MIN_N=30`; `gate2_pass` now also requires ≥30 settled/closed trades, and the
+  gate2 panel reports its `n`/`n_required`. `harness/scoreboard.py`. Test:
+  `test_scoreboard::gate2_needs_a_real_sample`. FIXED.
+- **#26 🟡 `_llm_tiebreak` / challenger `_local_raw` permanently mutated
+  `os.environ['MODEL_FAST']`** (re-pointed every later LLM call). **FIX:** save/restore in
+  a `finally`. Verified MODEL_FAST is unchanged after a tiebreak/challenger call. FIXED.
+- **#22 🟡 is_stale freshness branch dead on real Gamma data.** `_has_freshness` treated
+  `updatedAt`/`acceptingOrdersTimestamp` (last-SYNC timestamps present on EVERY row) as
+  trade-recency, so a never-traded pinned-price market never flagged stale and the
+  freshness subscore was pinned to 1.0. **FIX:** count only genuine trade signals
+  (`lastTradeTime`/`lastTradePrice`/`volume24hr`/`volumeNum`). Now flags an updatedAt-only
+  degenerate market stale. FIXED.
+- **#23 🟡 stale scanner docstring** ("NOT wired into predict_today") — corrected. FIXED.
+
+Tests: scoreboard 8/8, scanner/classifier green. Suite 47 modules.
+
+---
+
+## Remaining (documented, lower-priority — see AUDIT_REPORT.md)
+
+Verified-real but deferred (low frequency / cosmetic / larger scope), none blocking
+paper-only operation:
+- **#10 Gate-1 bet-bias** (settle_resolved only resolves forecasts with an open
+  position → Gate-1 scored on the bet-selected subset). Methodological; needs a Gamma
+  sweep of all unresolved swarm_forecasts at settle.
+- **#7 EV-gate vs arb basket** + **arb-liquidity defense** (low-frequency overround ME
+  events; the P7 per-leg EV gate can drop a model-favored NO leg from a risk-free basket).
+- **#28 Guard D uses raw swarm_p not final_p** (dormant — identical at cold-start).
+- **gamma retry/backoff** + **MiroFish ontology deadline cap** (daemon recovers next
+  cycle; timeout present, retry absent).
+- **.env.example** missing CHALLENGER_*/DASH_PORT/OLLAMA_TIMEOUT; **SWARM_SIZE** advertised
+  but unread. **#24** attention-metric fine_label (no behavioral impact — still skipped).

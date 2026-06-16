@@ -20,8 +20,8 @@ Design principles (mirrors gamma.py / classifier.py):
   * Defensive: never raises on a single malformed field; missing data degrades
     to a neutral score rather than an exception.
 
-NOTE: this module is intentionally NOT wired into predict_today yet (a later
-agent does that to avoid an edit conflict). It self-tests on synthetic markets.
+NOTE: this module IS wired into predict_today.find_candidates (scan / is_stale /
+rank_candidates). It also self-tests on synthetic markets.
 
     python -m harness.scanner          # prints API + synthetic self-test result
 """
@@ -355,12 +355,16 @@ def exit_risk(candidate: dict) -> float:
 
 
 def _has_freshness(candidate: dict) -> bool:
-    """Is there any signal the market is live (traded recently / has a book)?"""
+    """Is there any signal the market actually TRADED recently (not just synced)?
+
+    Excludes 'updatedAt' / 'acceptingOrdersTimestamp' — those are last-SYNC / creation
+    timestamps that Gamma sets on EVERY row (including never-traded ones), so they
+    defeated the is_stale degenerate-price branch and pinned the freshness subscore to
+    1.0 on real data. Only genuine trade-recency signals count. (audit #22)"""
     if (_f(candidate.get("volume"), 0.0) or 0.0) > 0:
         return True
     raw = candidate.get("raw") or {}
-    for k in ("updatedAt", "lastTradeTime", "lastTradePrice",
-              "acceptingOrdersTimestamp", "volume24hr", "volumeNum"):
+    for k in ("lastTradeTime", "lastTradePrice", "volume24hr", "volumeNum"):
         v = raw.get(k)
         if v not in (None, "", 0, "0"):
             return True

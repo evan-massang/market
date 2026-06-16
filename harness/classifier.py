@@ -358,6 +358,7 @@ def _llm_tiebreak(question: str, description: str, model: str | None = None) -> 
         f"Question: {question}\nResolution: {description[:400]}\n\n"
         'Reply with ONLY JSON: {"label": "opinion" | "mechanical"}'
     )
+    _saved_mf = os.environ.get("MODEL_FAST")   # restore after — don't leak the override
     try:
         if model:
             os.environ["MODEL_FAST"] = model
@@ -368,6 +369,14 @@ def _llm_tiebreak(question: str, description: str, model: str | None = None) -> 
         return label if label in ("opinion", "mechanical") else "unknown"
     except Exception:
         return "unknown"
+    finally:
+        # scope the MODEL_FAST override to THIS call — never permanently mutate the
+        # process env (which would silently re-point every later LLM call). (audit #26)
+        if model:
+            if _saved_mf is None:
+                os.environ.pop("MODEL_FAST", None)
+            else:
+                os.environ["MODEL_FAST"] = _saved_mf
 
 
 # ── liquidity floor ──────────────────────────────────────────────────────────

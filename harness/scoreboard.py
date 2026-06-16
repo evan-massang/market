@@ -24,6 +24,7 @@ from harness import wallet as paper
 
 DB_PATH = os.getenv("DATABASE_URL", "polyswarm.db").replace("sqlite+aiosqlite:///./", "").replace("sqlite:///./", "")
 GATE1_MIN_N = 50
+GATE2_MIN_N = 30   # Gate 2 needs a real sample, not one lucky settled trade (audit)
 
 # ── coarse theme tagger (opinion markets) ─────────────────────────────────────
 _THEMES = [
@@ -134,7 +135,14 @@ def compute() -> dict:
         st = paper.get_state()
     except Exception:
         st = {"starting_bankroll": 0.0, "equity": 0.0, "realized_pnl": 0.0, "cash": 0.0, "open_exposure": 0.0}
-    gate2_pass = bool(st["realized_pnl"] > 0 and st["equity"] >= st["starting_bankroll"])
+    # require a real sample so one lucky +$0.01 settled trade can't flash Gate 2 PASS
+    try:
+        _c = sqlite3.connect(DB_PATH)
+        n_settled = _c.execute("SELECT COUNT(*) FROM paper_positions WHERE status IN ('settled','closed')").fetchone()[0]
+        _c.close()
+    except Exception:
+        n_settled = 0
+    gate2_pass = bool(n_settled >= GATE2_MIN_N and st["realized_pnl"] > 0 and st["equity"] >= st["starting_bankroll"])
 
     return {
         "n": n, "n_required": GATE1_MIN_N,
@@ -145,7 +153,8 @@ def compute() -> dict:
         "gate1": {"pass": gate1_pass, "model_brier": model_b, "market_brier": market_b,
                   "n": n, "n_required": GATE1_MIN_N},
         "gate2": {"pass": gate2_pass, "starting_bankroll": st["starting_bankroll"],
-                  "equity": st["equity"], "realized_pnl": st["realized_pnl"]},
+                  "equity": st["equity"], "realized_pnl": st["realized_pnl"],
+                  "n": n_settled, "n_required": GATE2_MIN_N},
         "both_pass": gate1_pass and gate2_pass,
     }
 

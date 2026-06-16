@@ -57,6 +57,15 @@ def _rebuild():
     # 2 MECHANICAL rows that MUST be excluded from the opinion gate:
     _insert("Will Bitcoin close above $100k?", "MECH-1", 0.30, 0.0, 0.40)
     _insert("Will the Fed cut interest rates?", "MECH-2", 0.20, 0.0, 0.35)
+    # >= GATE2_MIN_N settled paper positions so Gate 2 has a real sample (audit floor):
+    conn2 = sqlite3.connect(os.environ["DATABASE_URL"])
+    for i in range(SB.GATE2_MIN_N + 2):
+        conn2.execute(
+            "INSERT INTO paper_positions (market_id, question, side, model_p, market_p, edge, stake, "
+            "fill_price, shares, fee, status, outcome, realized_pnl, settled_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?, 'settled', ?, ?, ?)",
+            (f"P-{i}", "Q", "YES", 0.7, 0.5, 0.2, 10.0, 0.51, 19.6, 0.0, 1.0, 2.5, "2026-06-10T00:00:00"))
+    conn2.commit(); conn2.close()
     _set_wallet(1080.0, 80.0)   # bankroll grew (Gate 2 pass)
 
 
@@ -83,6 +92,18 @@ def test_gates_both_pass():
     assert s["gate1"]["pass"] is True, s["gate1"]
     assert s["gate2"]["pass"] is True, s["gate2"]
     assert s["both_pass"] is True
+
+
+def test_gate2_needs_a_real_sample():
+    # audit: Gate 2 must NOT flash PASS on a profitable wallet with too few settled
+    # trades. Bankroll grew (+80) but zero settled positions -> n=0 < GATE2_MIN_N -> FAIL.
+    _rebuild()
+    conn = sqlite3.connect(os.environ["DATABASE_URL"])
+    conn.execute("DELETE FROM paper_positions")   # remove the seeded sample
+    conn.commit(); conn.close()
+    s = SB.compute()
+    assert s["gate2"]["pass"] is False, s["gate2"]
+    assert s["gate2"]["n"] == 0 and s["gate2"]["n_required"] == SB.GATE2_MIN_N, s["gate2"]
 
 
 def test_gate1_fails_below_min_n():
@@ -122,6 +143,7 @@ TESTS = [
     ("theme_and_brier_properties_pure", test_theme_and_brier_properties_pure),
     ("counts_and_brier_math", test_counts_and_brier_math),
     ("gates_both_pass", test_gates_both_pass),
+    ("gate2_needs_a_real_sample", test_gate2_needs_a_real_sample),
     ("gate1_fails_below_min_n", test_gate1_fails_below_min_n),
     ("gate2_fails_when_bankroll_shrank", test_gate2_fails_when_bankroll_shrank),
     ("one_row_per_market_dedupe", test_one_row_per_market_dedupe),
