@@ -279,27 +279,42 @@ def run_once(cfg: LoopConfig) -> dict:
                                     inputs={"market_id": mid, "p": p, "price": price, "edge": sz.edge, "layer": "sizer"},
                                 )
                             continue
-                        fr = wallet.open_position(mid, m["question"], sz.side, p, price, sz.edge, sz.stake,
-                                                  end_date=m.get("end_date"))
-                        if fr.opened:
-                            summary["opened"] += 1
-                            why = (f"Swarm sees {p:.0%} vs the market's {price:.0%} — a {sz.edge:+.1%} edge. "
-                                   f"Buying {fr.side} @ {fr.fill_price:.3f} with ${fr.stake:.2f} ({sz.reason}).")
-                            journal.record_decision(mid, m["question"], p, price, sz.edge, fr.side, fr.stake,
-                                                    fr.fill_price, regime, sig, "bet", why)
-                            print(f"      OPENED {fr.side} stake=${fr.stake:.2f} fill={fr.fill_price:.3f} "
-                                  f"shares={fr.shares:.2f}  bankroll now ${wallet.bankroll_for_sizing():.2f}")
-                        else:
-                            why = f"Sized {sz.side} ${sz.stake:.2f} but wallet rejected: {fr.reason}"
-                            journal.record_decision(mid, m["question"], p, price, sz.edge, sz.side, 0.0, None,
-                                                    regime, sig, "rejected", why)
-                            skip("wallet_rejected"); print(f"      wallet rejected: {fr.reason}")
+                        # ── Plan 3: legacy loop paper-betting is DISABLED BY DEFAULT and, when
+                        #    enabled, routed through the shared safety stack (safe_bet). The
+                        #    forecast + challenger + decision logging ABOVE is KEPT (it feeds
+                        #    settlement / scoring); only the bet OPENING is gated here. ──
+                        from harness import safe_bet
+                        if not safe_bet.legacy_loop_betting_enabled():
+                            journal.record_decision(mid, m["question"], p, price, sz.edge, None, 0.0, None,
+                                                    regime, "no edge", "no_bet",
+                                                    f"{safe_bet.LEGACY_LOOP_DISABLED} (set ENABLE_LEGACY_LOOP_BETTING=true to opt in).")
+                            skip(safe_bet.LEGACY_LOOP_DISABLED); print(f"      {safe_bet.LEGACY_LOOP_DISABLED}")
                             if obs:
-                                obs.hooks.on_trade_skip(
-                                    forecast_id=(obs.current().get("forecast_id") if obs else None),
-                                    reason=f"wallet_rejected: {fr.reason}",
-                                    inputs={"market_id": mid, "side": sz.side, "stake": sz.stake, "layer": "wallet"},
-                                )
+                                obs.hooks.on_trade_skip(forecast_id=(obs.current().get("forecast_id") if obs else None),
+                                                        reason=safe_bet.LEGACY_LOOP_DISABLED,
+                                                        inputs={"market_id": mid, "side": sz.side, "layer": "loop"})
+                            continue
+                        # enabled: a fallback/degraded swarm probability (LLM failed -> default
+                        # 0.5) must NOT bet, even via the shared stack — block with the exact reason.
+                        if (meta.get("allow_bet") is not True or meta.get("aborted") is True
+                                or meta.get("method") == "degraded_all_agents_failed"):
+                            journal.record_decision(mid, m["question"], p, price, sz.edge, None, 0.0, None,
+                                                    regime, "no edge", "no_bet", f"{safe_bet.LEGACY_LOOP_FALLBACK}.")
+                            skip(safe_bet.LEGACY_LOOP_FALLBACK); print(f"      {safe_bet.LEGACY_LOOP_FALLBACK}")
+                            if obs:
+                                obs.hooks.on_trade_skip(forecast_id=(obs.current().get("forecast_id") if obs else None),
+                                                        reason=safe_bet.LEGACY_LOOP_FALLBACK,
+                                                        inputs={"market_id": mid, "layer": "loop"})
+                            continue
+                        res = safe_bet.open_position_if_safe(
+                            source="loop", market=m, side=sz.side, probability=p, price=price,
+                            stake=sz.stake, confidence=meta.get("consensus"), forecast_meta=meta)
+                        if res["opened"]:
+                            summary["opened"] += 1
+                            print(f"      OPENED {res['side']} stake=${res['stake']:.2f} fill={res['fill_price']:.3f} "
+                                  f"bankroll now ${wallet.bankroll_for_sizing():.2f}")
+                        else:
+                            skip("safe_bet_blocked"); print(f"      no bet (safe_bet): {res['reason']}")
                     except Exception as e:
                         skip("error")
                         if obs:

@@ -16,6 +16,7 @@ except Exception:
     pass
 
 from harness import gamma, classifier, wallet, journal, strategy
+from harness import safe_bet   # Plan 3: shared safety-gated opener + disabled-by-default switch
 
 
 def _hours_left(m):
@@ -40,6 +41,17 @@ def main(argv=None):
 
     from core.calibration import init_db
     init_db(); wallet.init_wallet(1000.0); journal.init_journal()
+
+    # ── Plan 3: DISABLED BY DEFAULT. The favorite-longshot strategy bets on a price
+    #    pattern, not a real forecast, so it must not open paper positions unless the
+    #    operator explicitly opts in. When opted in (ENABLE_STRATEGY_BET=true) every
+    #    bet is routed through safe_bet (EV/risk/bankroll/exposure-gated). Returns
+    #    BEFORE any network fetch — no wallet.open_position on the default path. ──
+    if not safe_bet.strategy_bet_enabled():
+        print(f"[strategy] {safe_bet.STRATEGY_DISABLED}: set ENABLE_STRATEGY_BET=true to opt in "
+              f"(bets then pass EV/risk/bankroll/exposure via safe_bet). No paper bets placed.")
+        return safe_bet.STRATEGY_DISABLED
+
     held = {p["market_id"] for p in wallet.get_open_positions()}
 
     print(f"[strategy] fetching markets…")
@@ -70,22 +82,26 @@ def main(argv=None):
         d = strategy.decide_bet(price)
         if d.side is None or d.fraction <= 0:
             continue
+        # HONESTY (Plan 3): the rule must supply a REAL estimated true-YES to be
+        # EV-gated. If it can't, it must NOT pretend the price is its forecast -> no bet.
+        if d.est_true_yes is None:
+            safe_bet.record_no_bet("strategy_bet", m, safe_bet.STRATEGY_MISSING_EV_PROB, price=price)
+            continue
         stake = round(d.fraction * wallet.bankroll_for_sizing(), 6)
-        model_p = d.est_true_yes if d.est_true_yes is not None else price
-        edge = round(model_p - price, 4)   # NO bets -> negative, YES bets -> positive
-        fr = wallet.open_position(mid, m["question"], d.side, model_p, price, edge, stake,
-                                  cfg=wallet.WalletConfig(max_bet_frac=0.05, max_exposure_frac=0.75),
-                                  end_date=m.get("end_date"))
-        if fr.opened:
+        model_p = float(d.est_true_yes)
+        # Plan 3: route through the SHARED safety stack (EV/risk/bankroll/exposure).
+        # No swarm-health — this is a price strategy, not an AI forecast (forecast_meta=None).
+        res = safe_bet.open_position_if_safe(
+            source="strategy_bet", market=m, side=d.side, probability=model_p, price=price,
+            stake=stake, wallet_config=wallet.WalletConfig(max_bet_frac=0.05, max_exposure_frac=0.75),
+            reason_context={"strategy_reason": d.reason})
+        if res["opened"]:
             opened += 1
-            sig = "LONG (YES)" if d.side == "YES" else "SHORT (NO)"
-            why = (f"Favorite-longshot edge — {d.reason}. Bought {fr.side} @ {fr.fill_price:.3f} "
-                   f"with ${fr.stake:.2f} (backtested +EV, ~95% win).")
-            journal.record_decision(mid, m["question"], model_p, price, edge, fr.side, fr.stake,
-                                    fr.fill_price, "edge", sig, "bet", why)
             hrs = f"{hl:.0f}h" if hl is not None else "?"
-            print(f"  [{opened:2d}] {fr.side} ${fr.stake:5.2f} @ {fr.fill_price:.3f} | mkt {price:.0%} "
+            print(f"  [{opened:2d}] {res['side']} ${res['stake']:5.2f} @ {res['fill_price']:.3f} | mkt {price:.0%} "
                   f"| resolves {hrs} | {m['question'][:50]}")
+        else:
+            print(f"  [skip] {safe_bet.STRATEGY_GATE_BLOCKED}: {res['reason']} | {m['question'][:46]}")
 
     st = wallet.get_state()
     journal.record_snapshot(st["cash"], st["equity"], st["realized_pnl"], st["open_exposure"], st["n_open"])

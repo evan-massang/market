@@ -98,15 +98,21 @@ def main(argv=None):
         journal.record_decision(mid, q, p, price2, sz.edge, None, 0.0, None, regime, "no edge", "no_bet", why)
         print(f"[bet] NO BET: {sz.reason}")
     else:
-        fr = wallet.open_position(mid, q, sz.side, p, price2, sz.edge, sz.stake, end_date=end2)
-        status = "bet" if fr.opened else "rejected"
-        why = (f"Swarm sees {p:.0%} vs the market's {price2:.0%} — a {sz.edge:+.1%} edge. "
-               f"Buying {fr.side} @ {fr.fill_price:.3f} with ${fr.stake:.2f} ({sz.reason}).") if fr.opened \
-            else f"Sized {sz.side} ${sz.stake:.2f} but wallet rejected: {fr.reason}"
-        journal.record_decision(mid, q, p, price2, sz.edge, sz.side, fr.stake if fr.opened else 0.0,
-                                fr.fill_price, regime, sig, status, why)
-        print(f"[bet] {'OPENED' if fr.opened else 'REJECTED'}: {sz.side} ${sz.stake:.2f} "
-              f"@ {fr.fill_price if fr.opened else '-'}  | {fr.reason}")
+        # Plan 3: route this manual bet through the SHARED safety stack
+        # (swarm-health → EV → risk → bankroll → exposure) instead of opening directly.
+        from harness import safe_bet
+        fmeta = {
+            "consensus": res.get("consensus_score"), "consensus_status": res.get("consensus_status"),
+            "allow_bet": res.get("allow_bet"), "aborted": res.get("aborted"),
+            "degraded": res.get("degraded"), "method": res.get("method"),
+            "n_agents_succeeded": res.get("n_agents_succeeded"),
+            "n_agents_requested": res.get("n_agents_requested"),
+            "degradation_reason": res.get("degradation_reason"),
+        }
+        out = safe_bet.open_position_if_safe(source="place_bet", market=m2, side=sz.side,
+                                             probability=p, price=price2, stake=sz.stake,
+                                             confidence=res.get("consensus_score"), forecast_meta=fmeta)
+        print(f"[bet] {'OPENED' if out['opened'] else 'NO BET'}: {sz.side} ${sz.stake:.2f} — {out['reason']}")
 
     st = wallet.get_state()
     journal.record_snapshot(st["cash"], st["equity"], st["realized_pnl"], st["open_exposure"], st["n_open"])

@@ -71,6 +71,12 @@ KNOWN = {
     "UNCERTAINTY_PENALTY_MULTIPLIER": (False, True, "EV uncertainty penalty"),
     "EXIT_RISK_PENALTY_MULTIPLIER": (False, True, "EV exit-risk penalty"),
     "DEBATE_ROUNDS": (False, True, "swarm debate rounds"),
+    # Plan 2 — swarm-degradation policy
+    "MIN_SWARM_AGENTS_FOR_BET": (False, True, "min surviving agents to bet (default 3)"),
+    "MIN_SWARM_AGENTS_FOR_CONSENSUS": (False, True, "min agents for a consensus signal (default 2)"),
+    # Plan 3 — shortcut-betting kill switches (BOTH default false = disabled)
+    "ENABLE_STRATEGY_BET": (False, True, "opt-in: route strategy_bet through safe_bet (default false)"),
+    "ENABLE_LEGACY_LOOP_BETTING": (False, True, "opt-in: legacy loop.run_once betting (default false)"),
     # advertised-but-NOT-read (the swarm size comes from the --size CLI flag, not env)
     "SWARM_SIZE": (False, False, "advertised in docs but NOT read by code — use --size"),
 }
