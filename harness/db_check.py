@@ -142,6 +142,16 @@ def run() -> dict:
         _add("open_price_valid", "WARN" if bad_price else "OK",
              f"{bad_price} open position(s) with fill_price outside (0,1)" if bad_price
              else "all open fill prices in (0,1)")
+        # Plan 6 — event coherence: more than one open YES leg in the same event is an
+        # incoherent (multiple-winner) stacked exposure in a mutually-exclusive event.
+        multi_yes = conn.execute(
+            "SELECT event_slug, COUNT(*) AS c FROM paper_positions "
+            "WHERE status='open' AND UPPER(side)='YES' AND event_slug IS NOT NULL AND event_slug<>'' "
+            "GROUP BY event_slug HAVING c > 1").fetchall()
+        _add("event_multiple_open_yes", "WARN" if multi_yes else "OK",
+             (f"{len(multi_yes)} event(s) with >1 open YES leg: "
+              + ", ".join(f"{(r['event_slug'] or '?')[:18]}x{r['c']}" for r in multi_yes[:5]))
+             if multi_yes else "no event has more than one open YES leg")
     except Exception as e:
         _add("open_position_integrity", "WARN", f"open-position integrity error: {e}")
 

@@ -24,6 +24,7 @@ except Exception:
     pass
 
 from harness import gamma, classifier, sizing, wallet, journal, challenger, scanner, event_portfolio
+from harness import event_safety as _esafe   # Plan 6: event-basket EXECUTION safety policy
 # P6 — skill-weighted forecaster blend + gated calibration + versioned forecast record.
 # All three are HARD cold-start passthroughs (see the blend/calibrate site in predict_one).
 from harness import calibration_apply, forecast_versions
@@ -650,8 +651,37 @@ def run_event_portfolio(mid, legs, event_key, bankroll):
     ep = event_portfolio.evaluate_event(
         legs, bankroll, cfg=event_portfolio.Config(mutually_exclusive=True))
     my_pos = None
+    safety_reason = None
     if ep.accept:
         my_pos = next((p for p in ep.positions if p.get("leg_id") == mid), None)
+        # ── Plan 6: EXECUTION safety. A multi-leg / arbitrage basket is recommendation-
+        #    ONLY (no atomic multi-leg executor; we open one leg at a time over an
+        #    incomplete, stale legset) → DISABLED. Only a single-leg edge opportunity
+        #    may execute, and only if it is coherent with the open book (one-YES). ──
+        _label, _executable, _reason = _esafe.classify_event_execution(ep, my_pos)
+        if not _executable:
+            my_pos, safety_reason = None, _reason
+        else:
+            # FAIL-CLOSED (consistent with the Plan-1 money gates): if coherence cannot be
+            # verified, do NOT open the leg — never silently skip the one-YES check.
+            try:
+                _coh = _esafe.check_event_position_coherence(
+                    event_key, (my_pos or {}).get("side"), mid, wallet.get_open_positions())
+            except Exception as _e:
+                _coh = {"ok": False, "reason": _esafe.INCOHERENT_POSITION}
+                if obs:
+                    try:
+                        obs.hooks.on_error(where="predict_today.run_event_portfolio.coherence",
+                                           exc=_e, action="fail-closed-block")
+                    except Exception:
+                        pass
+            if not _coh["ok"]:
+                my_pos, safety_reason = None, _coh["reason"]
+    # stash the Plan-6 reason so event_leg_reject_reason can surface the exact code
+    try:
+        ep._event_safety_reason = safety_reason
+    except Exception:
+        pass
     if obs:
         obs.hooks.on_event_portfolio(
             forecast_id=(obs.current().get("forecast_id") if obs else None),
@@ -674,6 +704,10 @@ def run_event_portfolio(mid, legs, event_key, bankroll):
 
 def event_leg_reject_reason(ep, mid):
     """Human-readable reason THIS leg is not being bet under the event portfolio."""
+    # Plan 6: a multi-leg / arbitrage basket or an incoherent add surfaces its exact code.
+    sr = getattr(ep, "_event_safety_reason", None)
+    if sr:
+        return sr
     if ep.reject_reason:
         return f"event portfolio rejected: {ep.reject_reason}"
     for r in (ep.rejected or []):

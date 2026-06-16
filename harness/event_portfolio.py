@@ -20,9 +20,12 @@ Construction rules (per the plan):
   • NO on every leg the model thinks is OVERVALUED (model_p < price − margin).
   • at most ONE YES, on the single most-undervalued leg (largest model_p − price
     > margin) — mirrors predict_today's Guard D "one YES (winner) per event".
-  • detect a true ARBITRAGE / hedge: buying NO on every leg of an ME event pays
-    out on all-but-the-winner, so if that guaranteed payoff exceeds total cost
-    it is risk-free money — take it, sized to the exposure cap.
+  • detect a candidate ARBITRAGE / hedge: NO on every leg of an ME event pays out
+    on all-but-the-winner. This is RECOMMENDATION-ONLY: it is only risk-free if the
+    FULL legset is held complete + atomic + fresh-priced — which the live consumers
+    do NOT do (they open one leg at a time over an incomplete, stale legset), so
+    Plan 6 DISABLES its execution. The flag below is a detection signal, not a
+    promise of risk-free money.
   • size each leg with fractional-Kelly via sizing.size_bet (the ONE sizer),
     then scale the whole basket down so total capital-at-risk ≤ the event cap.
 
@@ -393,7 +396,9 @@ def evaluate_event(legs, bankroll, cfg: Optional[Config] = None) -> EventPortfol
                 positions.append({
                     "leg": l, "side": "NO", "shares": shares, "per_share_cost": c,
                     "cost": shares * c, "edge": l.model_p - l.price,
-                    "reason": "arbitrage hedge: NO on every ME leg — guaranteed payoff (N−1 shares) exceeds total cost",
+                    "reason": "verified-basket candidate (NO on every ME leg) — RECOMMENDATION ONLY; "
+                              "NOT executed leg-by-leg (a single leg is not risk-free without the complete, "
+                              "atomic, fresh-priced basket)",
                 })
 
     # (2) normal edge-based construction (skipped when an arbitrage basket was built)
@@ -545,8 +550,10 @@ def _explain(cfg, is_me, bankroll, eligible, positions, rejected, portfolio_ev,
     br = bankroll if (bankroll is not None) else 0.0
     L = [f"Event portfolio ({kind}; {len(eligible)} legs with data; bankroll ${br:,.2f})."]
     if is_arb:
-        L.append("ARBITRAGE: NO on every ME leg pays out on N−1 shares whichever leg wins; "
-                 "guaranteed payoff exceeds total cost ⇒ risk-free.")
+        L.append("VERIFIED-BASKET CANDIDATE: NO on every ME leg would pay out on N−1 shares "
+                 "whichever leg wins IF the full legset were held complete + atomic + fresh-priced. "
+                 "RECOMMENDATION ONLY — the live consumers open one leg at a time over an incomplete, "
+                 "stale legset, so this is NOT executed and a single leg is NOT risk-free.")
     if positions:
         L.append("Selected positions:")
         for p in positions:
