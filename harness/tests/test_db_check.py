@@ -74,8 +74,55 @@ def test_run_is_read_only():
     assert before == after, (before, after)
 
 
+def _drift_wallet():
+    _reset()
+    wallet.open_position("M", "Q", "YES", 0.6, 0.5, 0.1, 20.0,
+                         cfg=wallet.WalletConfig(max_bet_frac=0.95, max_exposure_frac=0.99))
+    wallet.settle_market("M", 1.0)
+    # corrupt the wallet running totals (simulate the live drift)
+    conn = sqlite3.connect(os.environ["DATABASE_URL"])
+    conn.execute("UPDATE paper_wallet SET cash=cash+30, realized_pnl=realized_pnl+5 WHERE id=1")
+    conn.commit(); conn.close()
+
+
+def test_reconciliation_report_detects_drift():
+    _drift_wallet()
+    rep = DC.ledger_reconciliation_report()
+    assert rep["ok"] and abs(rep["cash_delta"] - 30.0) < 1e-6, rep
+    assert abs(rep["realized_delta"] - 5.0) < 1e-6, rep
+
+
+def test_repair_dry_run_changes_nothing():
+    _drift_wallet()
+    before = wallet.get_state()
+    r = DC.repair(dry_run=True)
+    assert r["applied"] is False and r["needs_repair"] is True
+    assert wallet.get_state() == before          # untouched
+
+
+def test_repair_applies_and_reconciles():
+    _drift_wallet()
+    r = DC.repair(dry_run=False)
+    assert r["applied"] is True, r
+    rep = DC.ledger_reconciliation_report()
+    assert abs(rep["cash_delta"]) < 0.01 and abs(rep["realized_delta"]) < 0.01, rep
+
+
+def test_repair_noop_when_consistent():
+    _reset()
+    wallet.open_position("M", "Q", "YES", 0.6, 0.5, 0.1, 20.0,
+                         cfg=wallet.WalletConfig(max_bet_frac=0.95, max_exposure_frac=0.99))
+    wallet.settle_market("M", 1.0)
+    r = DC.repair(dry_run=False)
+    assert r["applied"] is False and r["needs_repair"] is False
+
+
 TESTS = [
     ("clean_wallet_reconciles_ok", test_clean_wallet_reconciles_ok),
+    ("reconciliation_report_detects_drift", test_reconciliation_report_detects_drift),
+    ("repair_dry_run_changes_nothing", test_repair_dry_run_changes_nothing),
+    ("repair_applies_and_reconciles", test_repair_applies_and_reconciles),
+    ("repair_noop_when_consistent", test_repair_noop_when_consistent),
     ("drifted_wallet_warns", test_drifted_wallet_warns),
     ("missing_core_table_fails", test_missing_core_table_fails),
     ("run_is_read_only", test_run_is_read_only),

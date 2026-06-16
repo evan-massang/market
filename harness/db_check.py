@@ -154,6 +154,81 @@ def _summary(path: str) -> dict:
     return {"db": path, "checks": list(CHECKS), "ok": n_ok, "warn": n_warn, "fail": n_fail}
 
 
+def ledger_reconciliation_report() -> dict:
+    """Structured wallet-vs-ledger reconciliation: expected (from the positions ledger)
+    vs actual (the wallet running totals) for cash + realized P&L, the deltas, and any
+    suspicious rows. Read-only."""
+    path = _db_path()
+    out = {"db": path, "ok": False}
+    if not os.path.exists(path):
+        out["error"] = "db missing"
+        return out
+    try:
+        conn = _ro_conn(path)
+        w = conn.execute("SELECT starting_bankroll, cash, realized_pnl FROM paper_wallet WHERE id=1").fetchone()
+        starting = float(w["starting_bankroll"] or 0.0)
+        wallet_cash = float(w["cash"] or 0.0)
+        wallet_realized = float(w["realized_pnl"] or 0.0)
+        agg = conn.execute(
+            "SELECT COALESCE(SUM(stake),0) s, COALESCE(SUM(fee),0) f, "
+            "COALESCE(SUM(CASE WHEN status IN ('settled','closed') THEN payout ELSE 0 END),0) p, "
+            "COALESCE(SUM(CASE WHEN status IN ('settled','closed') THEN realized_pnl ELSE 0 END),0) r "
+            "FROM paper_positions").fetchone()
+        expected_cash = starting - float(agg["s"]) - float(agg["f"]) + float(agg["p"])
+        expected_realized = float(agg["r"])
+        susp = conn.execute(
+            "SELECT id, market_id, status FROM paper_positions "
+            "WHERE status IN ('settled','closed') AND realized_pnl IS NULL LIMIT 20").fetchall()
+        conn.close()
+        out.update({
+            "ok": True, "starting_bankroll": round(starting, 4),
+            "expected_cash": round(expected_cash, 4), "actual_cash": round(wallet_cash, 4),
+            "cash_delta": round(wallet_cash - expected_cash, 4),
+            "expected_realized": round(expected_realized, 4), "actual_realized": round(wallet_realized, 4),
+            "realized_delta": round(wallet_realized - expected_realized, 4),
+            "suspicious_rows": [dict(r) for r in susp],
+        })
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
+def repair(dry_run: bool = True) -> dict:
+    """The ONE safe, deterministic repair: reconcile paper_wallet.cash / realized_pnl to
+    the positions LEDGER (the single source of truth). dry_run changes NOTHING (prints
+    the plan); a real repair applies it and writes a tamper-evident obs audit event.
+    It NEVER deletes a row and never touches positions — only the two wallet aggregates."""
+    rep = ledger_reconciliation_report()
+    if not rep.get("ok"):
+        return {"ok": False, "error": rep.get("error", "reconcile failed")}
+    plan = {"set_cash": rep["expected_cash"], "set_realized": rep["expected_realized"],
+            "from_cash": rep["actual_cash"], "from_realized": rep["actual_realized"],
+            "cash_delta": rep["cash_delta"], "realized_delta": rep["realized_delta"]}
+    needs = abs(rep["cash_delta"]) > 0.01 or abs(rep["realized_delta"]) > 0.01
+    if dry_run:
+        return {"ok": True, "applied": False, "dry_run": True, "needs_repair": needs, "plan": plan}
+    if not needs:
+        return {"ok": True, "applied": False, "needs_repair": False, "plan": plan,
+                "note": "already consistent"}
+    try:
+        import sqlite3 as _sq
+        from datetime import datetime as _dt
+        conn = _sq.connect(_db_path(), timeout=10.0)
+        conn.execute("UPDATE paper_wallet SET cash=?, realized_pnl=?, updated_at=? WHERE id=1",
+                     (rep["expected_cash"], rep["expected_realized"], _dt.utcnow().isoformat()))
+        conn.commit(); conn.close()
+        try:   # tamper-evident audit event (hash-chained obs log)
+            from harness import obs
+            obs.hooks.on_error(where="db_check.repair",
+                               exc=RuntimeError("ledger reconcile applied"),
+                               action="reconciled_wallet_to_ledger", context=plan)
+        except Exception:
+            pass
+        return {"ok": True, "applied": True, "plan": plan}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def render(res: dict) -> None:
     print("harness.db_check — read-only DB integrity + reconciliation")
     print(f"  db: {res['db']}")
@@ -165,10 +240,31 @@ def render(res: dict) -> None:
 
 
 def main(argv=None) -> int:
+    import json
     argv = argv if argv is not None else sys.argv[1:]
+
+    if "--repair-dry-run" in argv or "--repair" in argv:
+        rec = ledger_reconciliation_report()
+        print("LEDGER RECONCILIATION")
+        for k in ("expected_cash", "actual_cash", "cash_delta",
+                  "expected_realized", "actual_realized", "realized_delta"):
+            print(f"  {k:<18} {rec.get(k)}")
+        r = repair(dry_run=("--repair" not in argv))
+        if "--json" in argv:
+            print(json.dumps({"reconciliation": rec, "repair": r}, indent=2))
+        elif r.get("applied"):
+            print(f"  REPAIRED — wallet reconciled to ledger (cash {r['plan']['from_cash']} -> "
+                  f"{r['plan']['set_cash']}, realized {r['plan']['from_realized']} -> "
+                  f"{r['plan']['set_realized']}); audit event written.")
+        elif r.get("needs_repair") is False:
+            print("  already consistent — nothing to repair.")
+        else:
+            print("  DRY-RUN — wallet would be reconciled to the ledger above. "
+                  "Re-run with --repair to apply (writes an audit event).")
+        return 0
+
     res = run()
     if "--json" in argv:
-        import json
         print(json.dumps(res, indent=2))
     else:
         render(res)

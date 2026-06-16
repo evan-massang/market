@@ -196,6 +196,17 @@ def health_alias():
     })
 
 
+@app.get("/api/db/reconciliation")
+def api_db_reconciliation():
+    """Wallet↔ledger reconciliation (expected vs actual cash/realized + deltas) so you can
+    see whether Gate 2's number is trustworthy. Read-only (never repairs)."""
+    try:
+        from harness import db_check
+        return JSONResponse(db_check.ledger_reconciliation_report())
+    except Exception as e:
+        return JSONResponse({"error": f"reconciliation unavailable: {e}"})
+
+
 @app.get("/api/clv/summary")
 def api_clv_summary():
     """Closing-line-value: at-resolution CLV + timed 15m/1h/6h snapshots + per-theme.
