@@ -1,0 +1,201 @@
+================================================================================
+CLAUDE CODE — WORK LOG
+Polymarket forecasting + paper-trading harness
+A first-person, chronological record of what I (Claude Code) was asked to do and
+what I actually did. Times are the real git commit timestamps (UTC). Honest
+account — paper-only throughout; no profitability was ever claimed or faked.
+================================================================================
+
+WHO / WHAT
+  - I am Claude Code (Anthropic's CLI), working in C:\Users\OMEN\Pictures\Polymarket\polyswarm.
+  - The project: an autonomous Polymarket OPINION-market forecaster + PAPER trader
+    built on a cloned PolySwarm multi-agent LLM engine, with a MiroFish crowd-sim,
+    a live dashboard, and a full observability/audit layer.
+  - Repo pushed to: github.com/evan-massang/market (branch main).
+  - Hard rules the owner set and I kept the whole way through:
+      * PAPER ONLY — never add real-money execution.
+      * Don't touch the LLM API-key path (owner handles that separately).
+      * Don't fake gate results. Don't weaken safety to look better.
+      * Don't delete observability. Bet BETTER, not MORE.
+
+
+--------------------------------------------------------------------------------
+PHASE A — "Run the whole thing" + first bug fixes   (2026-06-13 → 2026-06-14)
+--------------------------------------------------------------------------------
+I was told: "run the bot, and I mean run everything — even the MiroFish."
+Then: "usually when everything's ready there's four shells." Then: "run everything."
+  -> I brought up all the services: MiroFish backend (:5001), MiroFish UI, the
+     same-day daemon, the dashboard (:8800), and the AI pipeline. Made the five
+     PowerShell launchers (1_..5_) so each runs in its own shell.
+
+I was told: "there's a bet that already has a result but the AI still says
+'awaiting result'."
+  -> Found the settlement bug: the market lookup was live-only, so resolved
+     markets never settled. Fixed it (live query -> closed+archived fallback).
+
+I was told: the swarm/bet/LLM/crowd/decision panels aren't on; the equity/PnL
+graph isn't moving; "is the AI actually searching for a bet?"
+  -> Wired the dashboard panels, fixed a false-red heartbeat, and confirmed the
+     pipeline was finding/forecasting markets.
+
+I was told: "I want the AI to turn on and run the entire night ... searching
+which one the AI can predict -> gather data -> make a report (MiroFish + other
+agents, not the LLM) -> send to the LLM -> decide the position." And: "make the
+dashboard work like the MiroFish knowledge graph."
+  -> Built the FIND -> GATHER -> REPORT(MiroFish) -> THINK(swarm+challenger) ->
+     DECIDE pipeline and made the dashboard the live command center.
+  (committed) 2026-06-14 04:53  Polymarket forecasting + paper-trading harness
+  (committed) 2026-06-14 04:54  HARNESS.md operator's manual
+  (committed) 2026-06-14 07:17  Live command-center dashboard + same-day daemon
+
+I was told: "give me the transcript of what the AI is doing — the entire
+transcribe since last night."
+  -> Generated the AI activity transcript (ai_transcript.md) from the decision log.
+
+
+--------------------------------------------------------------------------------
+PHASE B — "Make it profitable" + reliability guards   (2026-06-14)
+--------------------------------------------------------------------------------
+I was told (a big task): "work on the betting bot ... show me the code BEFORE
+editing ... /goal make it really REALLY profitable, don't stop until it hits
+$10,000 in profit. I want it FAST, by tonight."
+  -> I was HONEST: $10k by morning is mathematically impossible on a $1,000 paper
+     bankroll (that's 10x/day). I did not fake it. Instead I made the bot bet
+     BETTER: added reliability guards (skip mechanical markets; skip when the swarm
+     and the challenger disagree; skip on low consensus; event-coherence), and
+     conviction-scaled fractional Kelly so only a big, agreed-upon edge gets a big
+     (still capped) bet.
+
+I was told: "bet more than one in the same event — just don't pick the one you
+think will lose, pick the winning one."
+  -> Built the event-portfolio engine: multiple legs per mutually-exclusive event,
+     at most one YES (the winner), unlimited NO/fades, reject incoherent baskets.
+
+I was told: "there's a local AI called gemma — almost 20x lighter — if it's good
+and faster, replace it." And: "is a 31b model usable?" And: "better input, more data."
+  -> Benchmarked the light models honestly: gemma2:2b was too noisy (it tripped the
+     divergence guard on almost everything) and gemma4 returned empty output —
+     unusable. Settled on qwen2.5:3b. Improved the data: fixed the GDELT query
+     builder, added a keyless Wikipedia source, broadened-query fallback.
+
+
+--------------------------------------------------------------------------------
+PHASE C — Observability / audit layer + README + GitHub   (2026-06-14 → 06-15)
+--------------------------------------------------------------------------------
+I was told (a detailed spec): build a 3-layer observability/audit system.
+  -> Built it: a hash-chained append-only event log (tamper/insert/delete + last-
+     line detection), content-addressed blobs, a deterministic human transcript,
+     frozen append-only evidence tables (a forecast can't be altered by a later
+     resolution), explain/replay, a read-only gate evaluator, and secret scrubbing.
+     7/7 acceptance criteria passed.
+
+I was told: "make a README of how you work and what you do — really specific —
+then push everything to GitHub, including the report."
+  -> Wrote README.md + REPORT.md and pushed to github.com/evan-massang/market.
+  (committed) 2026-06-15 19:57  Observability/audit layer + guards + GATHER upgrades + docs
+
+
+--------------------------------------------------------------------------------
+PHASE D — The P0–P13 deep-improvement program   (2026-06-15 21:51 → 06-16 05:49)
+--------------------------------------------------------------------------------
+I was told (a detailed 14-phase program): "deeply improve this project as a
+serious forecasting + paper-trading bot ... do not fake results or claim profit
+without evidence." And then: "finish all of them, don't stop until it's finished."
+  -> I ran the whole program autonomously, one phase per commit, each phase
+     adversarially verified and shipped with tests. Guiding rule: with thin data
+     (today) the decision stays IDENTICAL to before; the new machinery only
+     activates as resolved data accrues. Built it mostly with multi-agent
+     workflows (and directly in the main loop after the workflow hit my account's
+     session limit on P8 — so I salvaged the build and finished by hand).
+
+  2026-06-15 21:51  P0+P1  doctor preflight + no-network test suite + crash-safety
+  2026-06-15 22:29  P2     multi-window, event-aware candidate scanner
+  2026-06-15 23:07  P3     event-level multi-bet portfolio engine
+  2026-06-15 23:27  P4     richer classifier labels + per-label performance
+  2026-06-16 00:02  P5     scored, replayable evidence packs + persistent cache
+  2026-06-16 00:40  P6     versioned forecasts + calibration + challenger ensemble
+  2026-06-16 01:27  P7     EV-after-costs gate + CLV + adaptive min_edge + experiments
+  2026-06-16 05:25  P8     adaptive guards (stale/liquidity/spread/correlation) + stricter-when-losing
+  2026-06-16 05:32  P9     bankroll kill switch + exposure caps + mark-to-market
+  2026-06-16 05:35  P10    consolidated metrics (log loss/ROI/drawdown/CLV) + gate report
+  2026-06-16 05:39  P11    dashboard command center (skips, losing-trade diagnosis, replay)
+  2026-06-16 05:45  P12    full decision provenance + config-change tracking
+  2026-06-16 05:49  P13    18-criterion acceptance capstone (18/18) + program report
+
+  Outcome I reported honestly: both go/no-go gates were NOT met. The model's log
+  loss (0.758) was WORSE than a coin flip (0.693) on its resolved forecasts, so
+  observe-only / paper was the correct posture. No profit claimed.
+
+
+--------------------------------------------------------------------------------
+PHASE E — Full repo AUDIT + stabilize   (2026-06-16 06:48 → 07:54)
+--------------------------------------------------------------------------------
+I was told: "your goal is NOT to add features. Audit the entire repo, find what
+is broken, prove what works, fix bugs, add tests, make it stable enough to run
+continuously WITHOUT lying to the user."
+  -> First I established ground truth: I actually RAN every documented command
+     (doctor, run_tests, scoreboard, loop status, obs.gate, metrics) — they all
+     worked. Then I ran a 14-subsystem ADVERSARIAL audit where every finding had
+     to be reproduced before I was allowed to fix it. Result: 41 confirmed
+     defects (1 critical, 18 major, 22 minor) + 2 refuted. I fixed them in 8
+     batches, each with a regression test, and wrote AUDIT_REPORT.md + DEBUG_LOG.md.
+
+  2026-06-16 06:48  batch 1  CRITICAL: settlement could double-credit cash/realized
+                             P&L (the number Gate 2 reads). Fixed with a guarded,
+                             idempotent UPDATE. + new `db_check` reconciliation.
+  2026-06-16 06:56  batch 2  one malformed LLM reply no longer discards the whole
+                             forecast; challenger "60 percent" no longer becomes 0.99.
+  2026-06-16 07:02  batch 3  cashed-out trades now counted in P&L metrics (were
+                             hidden); approval-rating markets no longer mislabeled.
+  2026-06-16 07:11  batch 4  argparse (no crash / no silent --dry-run swallow);
+                             sameday now enforces observe-only + logs its skips.
+  2026-06-16 07:15  batch 5  added /health /debug /errors /decisions/recent;
+                             /api/state no longer 500s on a DB lock.
+  2026-06-16 07:19  batch 6  event-portfolio can't fabricate a guaranteed win on a
+                             lone leg.
+  2026-06-16 07:25  batch 7  bare sqlite:/// DB path fixed; new dedicated
+                             loss-cause analyzer (`loss_analysis`).
+  2026-06-16 07:34  batch 8  Gate-2 sample floor; env-var leak; dead is_stale branch.
+  2026-06-16 07:37  finalized AUDIT_REPORT.md (Phase 18).
+
+  Test suite grew 41 -> 47 modules, all green, no-network.
+
+  Two things I surfaced honestly:
+    * The live polyswarm.db has a real wallet<->ledger drift (from earlier external
+      row deletion). It was being silently trusted; `db_check` now WARNs about it.
+    * The loss analyzer says the dominant live loss cause is "cashed out early"
+      (32 of 42 losers) -> the scanner may be entering too late. That's the best
+      lead for actually improving results.
+
+
+--------------------------------------------------------------------------------
+PHASE F — Push + transcripts   (2026-06-16 07:54 onward)
+--------------------------------------------------------------------------------
+I was told: "push it through GitHub, including a new transcript of the AI."
+  -> Confirmed the whole audit was pushed. Regenerated the AI transcript and
+     committed a dated snapshot (the working ai_transcript.md is .gitignored as a
+     regenerated artifact).
+  2026-06-16 07:54  Add AI activity transcript snapshot (AI_TRANSCRIPT_2026-06-16.md)
+
+I was told: "also push a .txt of what you (Claude Code) have been told to do —
+like 'at this hour I was told to make this...'."
+  -> This file.
+
+
+--------------------------------------------------------------------------------
+HONEST BOTTOM LINE
+--------------------------------------------------------------------------------
+  - System is PAPER-ONLY and safe to run continuously; no real-money path exists.
+  - Profitability is NOT proven and was never claimed. GATE 1 (model beats market
+    on Brier over >=50 resolved opinion markets) FAILS — there are 0 resolved
+    opinion markets yet. GATE 2 (paper bankroll grew after costs) FAILS. The model
+    is not yet beating a coin flip on its resolved forecasts.
+  - The job was to make the system honest, stable, and debuggable, and to bet
+    BETTER (more selectively), not more — and to surface the truth rather than
+    dress it up. That is what I did. The path to profitability is empirical: fix
+    the entry timing (CLV), accrue >=50 resolved opinion markets, and let the
+    gates actually be read.
+  - One operational step is still pending: the live daemons are running the OLD
+    pre-audit code. Restart shells 3 (sameday) + 5 (ai_pipeline) to deploy all the
+    fixes (including the critical settlement one).
+================================================================================
