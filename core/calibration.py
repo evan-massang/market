@@ -61,6 +61,13 @@ def init_db():
     # Migrate pre-P0.5 databases in place.
     _ensure_column(conn, "forecasts", "market_id", "TEXT")
     _ensure_column(conn, "swarm_forecasts", "market_id", "TEXT")
+    # Plan 2 — degraded-forecast honesty: store WHY a swarm forecast is degraded so a
+    # reduced/partial run never looks like a healthy one in Gate-1 / calibration. All
+    # nullable + backward-compatible (legacy rows stay NULL = "unknown", not "healthy").
+    _ensure_column(conn, "swarm_forecasts", "degraded", "INTEGER")
+    _ensure_column(conn, "swarm_forecasts", "n_agents_succeeded", "INTEGER")
+    _ensure_column(conn, "swarm_forecasts", "n_agents_requested", "INTEGER")
+    _ensure_column(conn, "swarm_forecasts", "degradation_reason", "TEXT")
     # Index market_id for fast keyed resolution / dedupe.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_forecasts_market ON forecasts(market_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_swarm_market ON swarm_forecasts(market_id)")
@@ -80,12 +87,21 @@ def save_forecast(question: str, agent_id: str, probability: float,
 
 
 def save_swarm_forecast(question: str, probability: float, consensus_score: float,
-                        market_odds: float | None = None, market_id: str | None = None):
+                        market_odds: float | None = None, market_id: str | None = None,
+                        degraded: bool | None = None, n_agents_succeeded: int | None = None,
+                        n_agents_requested: int | None = None, degradation_reason: str | None = None):
+    """Persist a swarm forecast. Plan 2: the optional ``degraded`` / ``n_agents_*`` /
+    ``degradation_reason`` fields record WHEN a forecast was produced by a reduced or
+    partial swarm, so a degraded run is stored as degraded (not healthy). Omitting them
+    (legacy callers) stores NULL — backward-compatible."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO swarm_forecasts (question, market_id, final_probability, consensus_score, market_odds) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (question, market_id, probability, consensus_score, market_odds),
+        "INSERT INTO swarm_forecasts (question, market_id, final_probability, consensus_score, "
+        "market_odds, degraded, n_agents_succeeded, n_agents_requested, degradation_reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (question, market_id, probability, consensus_score, market_odds,
+         (None if degraded is None else int(bool(degraded))),
+         n_agents_succeeded, n_agents_requested, degradation_reason),
     )
     conn.commit()
     conn.close()

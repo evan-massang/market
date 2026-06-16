@@ -45,6 +45,10 @@ except Exception:
 # validator. It is a HARD dependency of the bet-decision path: a money gate that
 # cannot be evaluated MUST block the bet, never allow it. (Pure module, no cycle.)
 from harness import safety_gate as _sg
+# ── Plan 2: SWARM-DEGRADATION safety ─────────────────────────────────────────
+# swarm_health holds the minimum-surviving-agent policy. A degraded / aborted /
+# under-strength swarm forecast must never be bet on. (Pure module, no cycle.)
+from core import swarm_health as _swarm_health
 
 # ── P7: EV-after-costs gate + per-theme adaptive min_edge + experiment tagging ──
 # Additive + guarded: a broken/missing P7 module can NEVER break a forecast pass.
@@ -201,6 +205,48 @@ def _p9_exposure_ok(q, event, stake):
         _sg.log_error("predict_today._p9_exposure_ok", e)
         return False, _sg.EXPOSURE_ERROR
     return _sg.coerce(res, gate="exposure", block_reason=_sg.EXPOSURE_INVALID)
+
+
+def _p_swarm_health(meta, prefix="swarm"):
+    """P-Plan2: block a bet on a DEGRADED / ABORTED / under-strength swarm forecast.
+
+    Returns ``(allow, reason)``. The forecast itself is already computed + logged +
+    frozen by the swarm; this only WITHHOLDS the bet (observe-only). A healthy swarm
+    passes untouched and the later quality gates still apply.
+
+    FAIL-CLOSED on missing health metadata: if the swarm did not report its health
+    (no ``allow_bet`` / ``n_agents_succeeded``), we BLOCK — an unknown-strength
+    forecast is never treated as healthy. ``prefix`` namespaces the reason code
+    (predict_today: 'swarm'; sameday: 'sameday_swarm')."""
+    def _r(key):
+        return f"{prefix}_{key}_no_bet"
+    if not isinstance(meta, dict) or "allow_bet" not in meta or "n_agents_succeeded" not in meta:
+        return False, _r("missing_health_metadata")
+    # probability came from the all-agents-failed fallback (a default 0.5, not a signal)
+    if meta.get("method") == _swarm_health.ALL_AGENTS_FAILED_METHOD:
+        return False, _r("fallback_probability")
+    if meta.get("aborted") is True:
+        return False, _r("aborted")
+    n_succ = meta.get("n_agents_succeeded")
+    if not isinstance(n_succ, int):
+        return False, _r("missing_health_metadata")
+    if n_succ < _swarm_health.MIN_SWARM_AGENTS_FOR_BET:
+        return False, _r("insufficient_agents")
+    if meta.get("allow_bet") is not True:
+        return False, _r("degraded")
+    # consensus unusable because too few agents survived (defensive; assess already blocks)
+    if meta.get("consensus") is None and meta.get("consensus_status") == _swarm_health.CONSENSUS_INSUFFICIENT:
+        return False, _r("insufficient_agents")
+    return True, "ok"
+
+
+def _swarm_health_skip_reason(sh_reason, meta):
+    """Enrich a swarm-health block reason with the agent counts for the decision log."""
+    try:
+        return (f"{sh_reason} (agents {meta.get('n_agents_succeeded')}/"
+                f"{meta.get('n_agents_requested')}, {meta.get('degradation_reason')})")
+    except Exception:
+        return sh_reason
 
 
 def _p7_experiment_tag():
@@ -876,6 +922,16 @@ def predict_one(m, cfg):
         _p7_exp_key = _p7_experiment_tag()
         if _p7_exp_key:
             print(f"      experiment: running under '{_p7_exp_key}' parameter set")
+
+        # ── Plan 2: SWARM-HEALTH gate. A degraded / aborted / under-strength swarm
+        #    forecast must never be bet on (and must never look like a healthy
+        #    high-consensus signal). The forecast above is already logged/frozen; this
+        #    only WITHHOLDS the bet. Runs BEFORE sizing AND before BOTH the
+        #    event-portfolio and single-market bet paths, so neither can bet on it. ──
+        sh_ok, sh_reason = _p_swarm_health(meta)
+        if not sh_ok:
+            print("\n[4/4] BET — swarm-health gate (no bet)…", flush=True)
+            return _skip(mid, q, _swarm_health_skip_reason(sh_reason, meta), p=p, price=price)
 
         # ── post-forecast reliability guards B/C/D(b): need swarm p, challenger bp, consensus.
         #    (group re-read here too — a sibling leg may have been bet during the long forecast.) ──

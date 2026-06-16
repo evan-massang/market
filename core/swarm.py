@@ -19,6 +19,7 @@ from core.theme import (
 )
 from core.agent import Agent, AgentEstimate
 from core.aggregator import aggregate, stacking_aggregate
+from core import swarm_health as _sh
 from core.bayesian import bayesian_aggregate, compute_agent_agreement_matrix
 from core.game_theory import (
     detect_herding, compute_information_cascade,
@@ -92,12 +93,16 @@ class Swarm:
                 "probability": 0.5,
                 "probability_pct": "50.0%",
                 "consensus_score": 0.0,
+                "consensus_status": _sh.CONSENSUS_INSUFFICIENT,
                 "std_dev": 0.0,
                 "n_agents": 0,
                 "individual_estimates": [],
                 "regime": None,
-                "aborted": True,
+                "method": "aborted_no_agents",
+                "agent_failures": [],
                 "note": "No agents in swarm; returned neutral 0.5 (no forecast performed).",
+                # Plan 2: explicit health — a no-agent run is aborted + unbettable.
+                **_sh.assess(n_requested=n_agents, n_succeeded=0),
             }
 
         with (obs.forecast_ctx(forecast_id=(obs.current().get('forecast_id') or obs.mint('f')), market_id=market_id, question=question) if obs else contextlib.nullcontext()):
@@ -147,6 +152,7 @@ class Swarm:
 
             round1_estimates: list[AgentEstimate] = []
             all_estimates: list[AgentEstimate] = []
+            all_failures: list[dict] = []   # Plan 2: which agents failed (final round)
 
             # ── Debate Rounds ──
             for round_num in range(1, self.debate_rounds + 1):
@@ -156,6 +162,7 @@ class Swarm:
                 console.print()
 
                 round_estimates = []
+                round_failures = []   # Plan 2: agents that errored THIS round
 
                 for agent in self.agents:
                     persona_short = agent.persona[:22].ljust(22)
@@ -172,6 +179,8 @@ class Swarm:
                         )
                     except Exception as exc:
                         console.print(f" [{COLORS['warning']}]skipped ({type(exc).__name__})[/]")
+                        round_failures.append({"agent_id": agent.agent_id, "persona": agent.persona,
+                                               "error": f"{type(exc).__name__}: {str(exc)[:160]}"})
                         if obs:
                             try:
                                 obs.hooks.on_error(where="swarm.forecast.agent_estimate", exc=exc,
@@ -190,6 +199,7 @@ class Swarm:
                 if round_num == 1:
                     round1_estimates = round_estimates.copy()
                 all_estimates = round_estimates
+                all_failures = round_failures
 
                 if obs:
                     obs.hooks.on_debate_round(
@@ -214,8 +224,13 @@ class Swarm:
                         pass
                 return {
                     "probability": 0.5, "probability_pct": "50.0%", "consensus_score": 0.0,
+                    "consensus_status": _sh.CONSENSUS_INSUFFICIENT,
                     "std_dev": 0.0, "n_agents": 0, "regime": None,
-                    "individual_estimates": [], "method": "degraded_all_agents_failed",
+                    "individual_estimates": [], "method": _sh.ALL_AGENTS_FAILED_METHOD,
+                    "agent_failures": all_failures,
+                    # Plan 2: every agent failed -> aborted, degraded, NOT bettable, and
+                    # the 0.5 here is a FALLBACK probability (never a healthy signal).
+                    **_sh.assess(n_requested=len(self.agents), n_succeeded=0),
                 }
 
             # save to calibration DB
@@ -233,6 +248,17 @@ class Swarm:
             # ── Classical Aggregation ──
             # 1. Standard weighted aggregation
             result = aggregate(all_estimates, calibration_weights)
+
+            # Plan 2 — attach EXPLICIT swarm-health metadata so predict_today / sameday
+            # can block a degraded run BEFORE sizing/betting. ``allow_bet`` is the
+            # swarm-strength signal (strict-majority survival AND >= MIN agents);
+            # downstream quality gates may still block a forecast this allows. A run
+            # with fewer than MIN survivors is degraded + NOT bettable even though a
+            # display probability exists. (consensus_score was already dampened in
+            # aggregate so a lone survivor can't read as consensus 1.0.)
+            result.update(_sh.assess(n_requested=len(self.agents), n_succeeded=len(all_estimates)))
+            result["agent_failures"] = all_failures
+            result["method"] = "swarm"
 
             if obs:
                 obs.hooks.on_blend(
@@ -385,7 +411,11 @@ class Swarm:
             stacking = stacking_aggregate(method_probs)
             result["stacking"] = stacking
 
-            save_swarm_forecast(question, result["probability"], result["consensus_score"], market_odds, market_id=market_id)
+            save_swarm_forecast(question, result["probability"], result["consensus_score"], market_odds,
+                                market_id=market_id, degraded=result.get("degraded"),
+                                n_agents_succeeded=result.get("n_agents_succeeded"),
+                                n_agents_requested=result.get("n_agents_requested"),
+                                degradation_reason=result.get("degradation_reason"))
 
             # Edge vs market — computed BEFORE display (HARNESS PATCH) so the returned
             # result always carries it, even if a cosmetic display error occurs.

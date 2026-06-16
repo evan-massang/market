@@ -142,10 +142,11 @@ def _ai_scout(market, price):
     their forecasts show on the dashboard. Also fires a best-effort MiroFish crowd-sim
     (subprocess) the first time we see a given market.
 
-    Returns ``(swarm_p, challenger_bp, consensus, final_p)`` where ``final_p`` is the P6
-    DECISION probability (skill-weighted blend → gated calibration). The swarm SNAPSHOT
-    forecast input is unchanged (the Swarm still saves its raw probability); final_p only
-    governs sizing. COLD-START: final_p == swarm_p to full float precision today."""
+    Returns ``(swarm_p, challenger_bp, consensus, final_p, health)`` where ``final_p`` is
+    the P6 DECISION probability (skill-weighted blend → gated calibration) and ``health``
+    is the Plan-2 swarm-health dict (aborted/degraded/allow_bet/n_agents_*). The swarm
+    SNAPSHOT forecast input is unchanged (the Swarm still saves its raw probability);
+    final_p only governs sizing. COLD-START: final_p == swarm_p to full float precision."""
     mid = market["market_id"]
     # ONE forecast per market: re-scouting the same market every cycle wastes minutes
     # of CPU and double-counts it toward the gate (and cross-joins the A/B panel).
@@ -154,7 +155,7 @@ def _ai_scout(market, price):
         from core.calibration import get_open_market_ids
         if mid in get_open_market_ids():
             print(f"[sameday] already forecast — skip re-scout: {market['question'][:44]}")
-            return None, None, None, None
+            return None, None, None, None, None
     except Exception as e:
         if obs:
             obs.hooks.on_error(where="sameday._ai_scout.open_ids", exc=e, action="skip")
@@ -194,12 +195,24 @@ def _ai_scout(market, price):
         extra = f" | decision {final_p:.0%}" if final_p != sp else ""
         print(f"[sameday] 🤖 swarm {sp:.0%} | challenger {bp if bp is not None else '-'} | "
               f"market {price:.0%}{extra}")
-        return sp, bp, cons, final_p
+        # Plan 2: surface the swarm-health metadata so place_sameday can block a
+        # degraded / aborted / under-strength swarm BEFORE sizing/betting.
+        health = {
+            "consensus": res.get("consensus_score"),
+            "consensus_status": res.get("consensus_status"),
+            "aborted": res.get("aborted"), "degraded": res.get("degraded"),
+            "allow_bet": res.get("allow_bet"), "method": res.get("method"),
+            "n_agents_requested": res.get("n_agents_requested"),
+            "n_agents_succeeded": res.get("n_agents_succeeded"),
+            "n_agents_failed": res.get("n_agents_failed"),
+            "degradation_reason": res.get("degradation_reason"),
+        }
+        return sp, bp, cons, final_p, health
     except Exception as e:
         if obs:
             obs.hooks.on_error(where="sameday._ai_scout", exc=e, action="skip")
         print("[sameday] AI scout error:", e)
-        return None, None, None, None
+        return None, None, None, None, None
 
 
 def _sd_skip(mid, q, reason, p=None, price=None, layer="guard"):
@@ -277,8 +290,17 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                 # p = RAW swarm probability (used by the reliability guards); final_p = the P6
                 # decision probability (skill-weighted blend → gated calibration) used for sizing.
                 # COLD-START: final_p == p exactly today.
-                p, bp, cons, final_p = _ai_scout(m, price)
+                p, bp, cons, final_p, health = _ai_scout(m, price)
                 if p is None:
+                    continue
+                # ── Plan 2: SWARM-HEALTH gate. Block a degraded / aborted / under-strength
+                #    swarm BEFORE sizing/betting (mirror of predict_today). The forecast is
+                #    already logged/frozen; this only WITHHOLDS the bet. ──
+                from harness.predict_today import (_p_swarm_health as _p_sh,
+                                                   _swarm_health_skip_reason as _sh_reason)
+                _sh_ok, _sh_r = _p_sh(health, prefix="sameday_swarm")
+                if not _sh_ok:
+                    _sd_skip(mid, q, _sh_reason(_sh_r, health or {}), p=p, price=price, layer="swarm_health")
                     continue
                 # P4B OBSERVE-ONLY (audit #4): the forecast above is logged for scoring,
                 # but if this market's label has a real losing track record, WITHHOLD the

@@ -5,6 +5,7 @@ Weights are based on: self-reported confidence + historical calibration score.
 
 from __future__ import annotations
 from core.agent import AgentEstimate
+from core import swarm_health as _sh
 import math
 
 
@@ -16,8 +17,16 @@ def aggregate(
     Produce a final probability from a list of agent estimates.
     Uses confidence-weighted average, optionally adjusted by historical calibration.
     """
+    # Plan 2 — empty estimates must NOT crash; return a safe, explicitly-degraded
+    # result. (The swarm handles the all-agents-failed case upstream and never calls
+    # this with an empty list; this keeps direct callers / tests safe.)
     if not estimates:
-        raise ValueError("No estimates to aggregate")
+        return {
+            "probability": 0.5, "probability_pct": "50.0%",
+            "consensus_score": 0.0, "consensus_status": _sh.CONSENSUS_INSUFFICIENT,
+            "consensus_degraded": True, "raw_consensus_score": 0.0, "std_dev": 0.0,
+            "n_agents": 0, "n_agents_used": 0, "individual_estimates": [],
+        }
 
     weights = []
     probs = []
@@ -39,14 +48,35 @@ def aggregate(
     mean = weighted_prob
     variance = sum(w * (p - mean) ** 2 for p, w in zip(probs, weights)) / total_weight if total_weight > 0 else 0
     std_dev = math.sqrt(variance)
-    consensus_score = max(0.0, 1.0 - (std_dev * 2))  # 0=no consensus, 1=full consensus
+    raw_consensus = max(0.0, 1.0 - (std_dev * 2))  # 0=no consensus, 1=full consensus
+
+    # Plan 2 — FAKE-CONFIDENCE FIX. A single surviving estimate has std_dev 0, which
+    # would otherwise read as consensus 1.0 ("perfect agreement") from one voice.
+    # Below MIN_SWARM_AGENTS_FOR_CONSENSUS there is no agreement signal at all
+    # (consensus 0.0); a sample-size dampener then scales the score up to full
+    # strength only once MIN_SWARM_AGENTS_FOR_BET agents agree, so a 2-agent
+    # "agreement" can never read as max confidence. 3+ agents are UNCHANGED.
+    n = len(estimates)
+    if not _sh.consensus_allowed(n):
+        consensus_score = 0.0
+        consensus_status = _sh.CONSENSUS_INSUFFICIENT
+        consensus_degraded = True
+    else:
+        consensus_score = raw_consensus * _sh.consensus_size_factor(n)
+        consensus_status = (_sh.CONSENSUS_OK if n >= _sh.MIN_SWARM_AGENTS_FOR_BET
+                            else _sh.CONSENSUS_LIMITED)
+        consensus_degraded = n < _sh.MIN_SWARM_AGENTS_FOR_BET
 
     return {
         "probability": round(weighted_prob, 4),
         "probability_pct": f"{weighted_prob:.1%}",
         "consensus_score": round(consensus_score, 3),
+        "consensus_status": consensus_status,
+        "consensus_degraded": consensus_degraded,
+        "raw_consensus_score": round(raw_consensus, 3),
         "std_dev": round(std_dev, 4),
         "n_agents": len(estimates),
+        "n_agents_used": len(estimates),
         "individual_estimates": [
             {
                 "agent_id": e.agent_id,

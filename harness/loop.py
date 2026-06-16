@@ -146,10 +146,19 @@ def _stub_probability(market_id: str, price: float) -> float:
 
 
 def _forecast(market: dict, price: float, cfg: LoopConfig, enrichment: str = "") -> tuple[float, dict]:
-    """Returns (probability, meta). meta carries the swarm's regime/consensus for the
-    dashboard transcript."""
+    """Returns (probability, meta). meta carries the swarm's regime/consensus AND the
+    full Plan-2 swarm-health metadata (aborted/degraded/allow_bet/n_agents_*) so
+    predict_today / sameday can block a degraded forecast before sizing/betting."""
     if cfg.dry_run:
-        return _stub_probability(market["market_id"], price), {"regime": "(dry-run)"}
+        # Deliberate non-LLM smoke stub — present a COMPLETE, healthy swarm-health
+        # block so --dry-run still exercises sizing/fills. ``method`` marks it a stub.
+        n = int(cfg.swarm_size or 5)
+        return _stub_probability(market["market_id"], price), {
+            "regime": "(dry-run)", "consensus": 0.8, "consensus_status": "ok",
+            "aborted": False, "degraded": False, "allow_bet": True,
+            "n_agents_requested": n, "n_agents_succeeded": n, "n_agents_failed": 0,
+            "degradation_reason": None, "method": "dry_run_stub",
+        }
     from core.swarm import Swarm
     from agents.personas import build_swarm
     os.environ["DEBATE_ROUNDS"] = str(cfg.rounds)
@@ -158,7 +167,21 @@ def _forecast(market: dict, price: float, cfg: LoopConfig, enrichment: str = "")
                             market_id=market["market_id"], extra_context=enrichment)
     rg = result.get("regime")
     regime = rg.get("regime") if isinstance(rg, dict) else (str(rg) if rg else "")
-    return float(result["probability"]), {"regime": regime, "consensus": result.get("consensus_score")}
+    # Plan 2: PRESERVE the full swarm-health metadata (was: only regime + consensus,
+    # which silently dropped the degraded/aborted/allow_bet flags downstream).
+    return float(result["probability"]), {
+        "regime": regime,
+        "consensus": result.get("consensus_score"),
+        "consensus_status": result.get("consensus_status"),
+        "aborted": result.get("aborted"),
+        "degraded": result.get("degraded"),
+        "allow_bet": result.get("allow_bet"),
+        "n_agents_requested": result.get("n_agents_requested"),
+        "n_agents_succeeded": result.get("n_agents_succeeded"),
+        "n_agents_failed": result.get("n_agents_failed"),
+        "degradation_reason": result.get("degradation_reason"),
+        "method": result.get("method"),
+    }
 
 
 # ── one pass ──────────────────────────────────────────────────────────────────
