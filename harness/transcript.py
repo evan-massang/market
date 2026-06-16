@@ -56,6 +56,10 @@ def build() -> str:
     swarm = _latest_by_market(q("SELECT * FROM swarm_forecasts ORDER BY id"))
     base = _latest_by_market(q("SELECT * FROM baseline_forecasts ORDER BY id"))
     crowd = _latest_by_market(q("SELECT * FROM mirofish_forecasts ORDER BY id"))
+    try:
+        mf_runs = _latest_by_market(q("SELECT * FROM mirofish_runs ORDER BY id"))
+    except Exception:
+        mf_runs = {}
     decisions = q("SELECT * FROM decisions ORDER BY id DESC")
 
     try:
@@ -107,8 +111,19 @@ def build() -> str:
                      f"market {_pct(sw['market_odds'])} · {res}")
         if bs is not None:
             L.append(f"- **Single-LLM challenger**: {_pct(bs['probability'])} YES")
-        if cr is not None and cr["crowd_probability"] is not None:
-            L.append(f"- **MiroFish crowd**: {_pct(cr['crowd_probability'])} YES ({cr['n_posts'] or 0} posts)")
+        # MiroFish HONEST status (Phase 7): fresh / stale / failed / used — not just a number
+        mr = mf_runs.get(mid)
+        if mr is not None:
+            usable = bool(mr["usable"])
+            label = "FRESH" if usable else (mr["freshness_status"] or "unusable").upper()
+            used = "used in swarm context" if usable else "NOT used"
+            cp = _pct(mr["crowd_probability"]) if mr["crowd_probability"] is not None else "n/a"
+            warn = "" if usable else f" — {(mr['warnings_json'] or '')[:90]}"
+            L.append(f"- **MiroFish: {label}** — {used} · crowd {cp} · {mr['n_posts'] or 0} posts · "
+                     f"age {mr['report_age_seconds']}s · match {mr['question_match_score']}{warn}")
+        elif cr is not None and cr["crowd_probability"] is not None:
+            L.append(f"- **MiroFish crowd** (legacy, pre-validation): {_pct(cr['crowd_probability'])} YES "
+                     f"({cr['n_posts'] or 0} posts)")
         for d in [d for d in decisions if d["market_id"] == mid][:3]:
             act = (f"{d['side']} ${d['stake']:.2f} @ {d['fill_price']:.3f}"
                    if d["status"] == "bet" and d["fill_price"] is not None else d["status"])

@@ -527,6 +527,12 @@ def forecast_market(
             report = _get(client, f"/api/report/{report_id}")
             markdown = report.get("markdown_content") or ""
             result["report_markdown"] = markdown
+            result["report_id"] = report_id
+            # the report's own generation timestamp — the validator compares this to the
+            # request start to reject a STALE/reused report (e.g. an old June-13 report).
+            result["report_generated_at"] = (report.get("completed_at") or report.get("created_at")
+                                             or report.get("updated_at"))
+            result["report_status"] = report.get("status")
             result["stage_reached"] = STAGE_REPORT_DONE
             log(f"  report fetched: {len(markdown)} chars, status={report.get('status')}")
             if not markdown.strip():

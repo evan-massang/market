@@ -293,52 +293,87 @@ def _conviction_sizing(conviction):
     return round(lam, 4), round(cap, 4)
 
 
-def _mirofish_report(question: str, market_id: str, price, max_wait: int = None) -> str:
-    """Run MiroFish (the multi-agent crowd, NOT the swarm LLM) on this market and return a
-    text REPORT block to feed the LLM. Drives the real :5001 backend so the Zep knowledge
-    graph the dashboard renders is built for THIS market; falls back to the local $0 crowd
-    if the backend is down. Never raises — a failed crowd run just returns ''."""
-    from harness import mirofish_signal
+def _mirofish_report(question: str, market_id: str, price, max_wait: int = None, run_id=None):
+    """Run MiroFish FRESH for THIS market, validate it, record the run, and return a
+    validated MiroFishResult. It NEVER returns a stale/weak report as usable — the caller
+    appends it to the swarm only when result.usable is True (else degraded/no-bet)."""
+    from harness import mirofish_signal, mirofish_validate as mfv
     max_wait = max_wait if max_wait is not None else MF_WAIT
-    sid, report_md = None, ""
-    print(f"\n[2.5] REPORT — MiroFish crowd sim builds a knowledge graph + debates (full, slow)…", flush=True)
+    cfg = mfv.config()
+    requested_at = mfv._now()
+    print("\n[2.5] REPORT — MiroFish crowd sim (FRESH per market, validated)…", flush=True)
     t0 = time.time()
+    raw, sid = {}, None
     try:
         from harness import mirofish
-        res = mirofish.forecast_market(question, base=os.getenv("MIROFISH_BASE", "http://localhost:5001"),
-                                       max_wait=max_wait)
-        sid = res.get("simulation_id")
-        report_md = res.get("report_markdown") or res.get("report") or ""
-        print(f"      MiroFish backend: stage={res.get('stage_reached')} sim={sid} "
-              f"graph={res.get('graph_id')} ({time.time()-t0:.0f}s)", flush=True)
+        # Phase 2: a UNIQUE project name per market+run+timestamp so the backend can NOT
+        # reuse an old (e.g. June-13) completed project for this question.
+        pname = mfv.fresh_project_name(market_id, run_id) if cfg["FORCE_FRESH"] else None
+        raw = mirofish.forecast_market(question, base=os.getenv("MIROFISH_BASE", "http://localhost:5001"),
+                                       max_wait=max_wait, project_name=pname)
+        sid = raw.get("simulation_id")
     except Exception as e:
-        print(f"      MiroFish backend unavailable ({str(e)[:70]}); local crowd fallback", flush=True)
-        try:
-            from harness import crowd_local
-            sid = crowd_local.run_local_crowd(question, rounds=int(os.getenv("CROWD_ROUNDS", "1")))
-        except Exception as e2:
-            print(f"      local crowd failed too ({str(e2)[:60]}) — skipping MiroFish", flush=True)
-            return ""
-    # distill the crowd's collective view from the posts it generated
+        raw = {"ok": False, "error": f"backend unavailable: {str(e)[:80]}"}
     sig = {}
     try:
-        sig = mirofish_signal.crowd_signal(sid, question)
-        mirofish_signal.save_signal(market_id, sig, market_odds=price, sim_id=sid)
+        if sid:
+            sig = mirofish_signal.crowd_signal(sid, question)
+            mirofish_signal.save_signal(market_id, sig, market_odds=price, sim_id=sid)
     except Exception as e:
-        print(f"      crowd distill error: {str(e)[:60]}", flush=True)
-    cp, n_posts, posts = sig.get("probability"), sig.get("n_posts", 0), sig.get("posts", [])[:6]
-    if cp is None and not posts and not report_md:
-        print("      MiroFish produced no usable report this market.", flush=True)
-        return ""
+        if obs:
+            try:
+                obs.hooks.on_error(where="predict_today._mirofish_report.signal", exc=e, action="skip")
+            except Exception:
+                pass
+    result = mfv.build_result(raw, market_id, question, requested_at, sig, started_at=requested_at)
+    mfv.validate(result, cfg)
+    mfv.record_run(result, forecast_id=(obs.current().get("forecast_id") if obs else None))
+    print(f"      MiroFish: {mfv.status_label(result)} — sim={result.simulation_id or '-'} "
+          f"posts={result.n_posts} age={result.report_age_seconds}s match={result.question_match_score:.2f} "
+          f"usable={result.usable} ({time.time()-t0:.0f}s)", flush=True)
+    if result.warnings:
+        print(f"        reason: {'; '.join(result.warnings)[:160]}", flush=True)
+    return result
+
+
+def _render_mf_text(result) -> str:
+    """The swarm-context block for a USABLE MiroFish result (never called for stale/weak)."""
     lines = ["[MiroFish multi-agent crowd report — independent simulated agents, NOT an LLM forecast]"]
-    if cp is not None:
-        lines.append(f"Crowd's implied YES probability: {cp:.0%}  (distilled from {n_posts} crowd posts)")
-    if report_md:
-        lines.append("Crowd report excerpt: " + " ".join(report_md.split())[:700])
-    for p in posts:
-        lines.append(f"- crowd voice: {p[:160]}")
-    print(f"      MiroFish report ready: crowd P(YES)={cp}, {n_posts} posts → feeding to the swarm.", flush=True)
+    if result.crowd_probability is not None:
+        lines.append(f"Crowd's implied YES probability: {result.crowd_probability:.0%} "
+                     f"(distilled from {result.n_posts} crowd posts)")
+    if result.report_markdown:
+        lines.append("Crowd report excerpt: " + " ".join(result.report_markdown.split())[:700])
     return "\n".join(lines)
+
+
+# minimum evidence-pack quality to allow a bet in MIROFISH_MODE=degraded when MiroFish is unusable
+MIROFISH_DEGRADED_MIN_EVIDENCE = float(os.getenv("MIROFISH_DEGRADED_MIN_EVIDENCE", "0.40"))
+
+
+def _p_mirofish_gate(m, pack):
+    """Phase 4: enforce MIROFISH_MODE. Returns (ok, reason).
+      off / mirofish disabled / mirofish usable -> ok.
+      required  + unusable -> NO BET.
+      degraded  + unusable -> bet ONLY if the evidence pack is strong enough, else no bet."""
+    try:
+        from harness import mirofish_validate as _mfv
+        mode = _mfv.config()["MODE"]
+    except Exception:
+        return True, "ok"
+    if not USE_MIROFISH or mode == "off":
+        return True, "ok"
+    if m.get("_mf_usable"):
+        return True, "ok"
+    status = m.get("_mf_status") or "unusable"
+    if mode == "required":
+        return False, f"mirofish_required_unusable:{status}"
+    if mode == "degraded":
+        eq = getattr(pack, "evidence_quality", None) if pack is not None else None
+        if eq is not None and eq >= MIROFISH_DEGRADED_MIN_EVIDENCE:
+            return True, f"mirofish_degraded_ok(evidence {eq:.2f})"
+        return False, f"mirofish_degraded_weak_evidence:{status}"
+    return True, "ok"
 
 
 def _hours_left(m):
@@ -744,11 +779,27 @@ def predict_one(m, cfg):
         # freeze the EXACT evidence bundle behind this forecast for replay (best-effort).
         _emit_evidence_pack(mid, pack)
 
-        # 2.5 — REPORT (MiroFish + crowd agents build a report; it is fed to the LLM, not run as one)
-        if USE_MIROFISH and not getattr(cfg, "dry_run", False):   # --dry-run skips the slow MiroFish stage
-            mf = _mirofish_report(q, mid, price)
-            if mf:
+        # 2.5 — REPORT (MiroFish crowd sim — validated; a stale/weak report is NEVER fed to the
+        #       swarm, and MIROFISH_MODE decides whether an unusable report blocks the bet).
+        from harness import mirofish_validate as _mfv
+        _mf_mode = _mfv.config()["MODE"]
+        m["_mf_status"], m["_mf_usable"], m["_mf_reason"] = "skipped", None, "not run"
+        m["_mf_sim_id"], m["_mf_report_hash"], m["_mf_n_posts"], m["_mf_age"] = None, None, 0, None
+        if not USE_MIROFISH or getattr(cfg, "dry_run", False) or _mf_mode == "off":
+            if _mf_mode == "off":
+                m["_mf_status"], m["_mf_reason"] = "disabled", "mirofish_disabled (MIROFISH_MODE=off)"
+                print("\n[2.5] REPORT — MiroFish DISABLED (MIROFISH_MODE=off)", flush=True)
+        else:
+            _mfres = _mirofish_report(q, mid, price, run_id=(obs.current().get("run_id") if obs else None))
+            m["_mf_status"] = _mfv.status_label(_mfres)
+            m["_mf_usable"] = _mfres.usable
+            m["_mf_reason"] = "; ".join(_mfres.warnings) if _mfres.warnings else ("usable" if _mfres.usable else "")
+            m["_mf_sim_id"], m["_mf_report_hash"] = _mfres.simulation_id, _mfres.report_markdown_hash
+            m["_mf_n_posts"], m["_mf_age"] = _mfres.n_posts, _mfres.report_age_seconds
+            if _mfres.usable:                     # ONLY a fresh, market-specific report feeds the swarm
+                mf = _render_mf_text(_mfres)
                 enr = (enr + "\n\n" + mf) if enr else mf
+            # a stale/weak/failed report is NEVER appended (no silent pretend-success).
 
         # 3 — THINK (the swarm LLM processes the gathered data + the crowd report)
         print(f"\n[3/4] THINK — {cfg.swarm_size}-persona swarm forecasting WITH that data (slow on CPU)…", flush=True)
@@ -819,6 +870,14 @@ def predict_one(m, cfg):
         if not ev_ok:
             print("\n[4/4] BET — evidence gate (no bet)…", flush=True)
             return _skip(mid, q, ev_reason, p=p, price=price)
+
+        # ── MiroFish gate (Phase 4): enforce MIROFISH_MODE. required + unusable -> no bet;
+        #    degraded + unusable -> bet only if OTHER evidence is strong, else observe-only.
+        #    The forecast above is already logged/frozen; this only withholds the BET. ──
+        mf_ok, mf_reason = _p_mirofish_gate(m, pack)
+        if not mf_ok:
+            print("\n[4/4] BET — MiroFish gate (no bet)…", flush=True)
+            return _skip(mid, q, mf_reason, p=p, price=price)
 
         # ── P4B: OBSERVE-ONLY label — the forecast above is saved + logged, but this
         #    fine_label historically lost money / didn't beat the market, so NO bet is

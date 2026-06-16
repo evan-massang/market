@@ -196,6 +196,24 @@ def health_alias():
     })
 
 
+@app.get("/api/mirofish/runs")
+def api_mirofish_runs(market_id: str = "", limit: int = 25):
+    """MiroFish run history with HONEST status: fresh/stale/failed, usable, sim_id, report
+    age, post count, question-match, warnings, and whether it was fed to the swarm. So you
+    can see when MiroFish was stale/skipped vs actually contributing."""
+    try:
+        from harness import mirofish_validate as mfv
+        runs = _safe(lambda: mfv.get_runs(market_id or None, limit), [])
+        for r in runs:
+            r["label"] = "FRESH" if r.get("usable") else (r.get("freshness_status") or "?").upper()
+            r["fed_to_swarm"] = bool(r.get("usable"))
+        usable = sum(1 for r in runs if r.get("usable"))
+        return JSONResponse({"runs": runs, "n": len(runs), "usable": usable,
+                             "unusable": len(runs) - usable, "config": mfv.config()})
+    except Exception as e:
+        return JSONResponse({"error": f"mirofish runs unavailable: {e}", "runs": []})
+
+
 @app.get("/api/db/reconciliation")
 def api_db_reconciliation():
     """Wallet↔ledger reconciliation (expected vs actual cash/realized + deltas) so you can
