@@ -196,6 +196,21 @@ def health_alias():
     })
 
 
+@app.get("/api/clv/summary")
+def api_clv_summary():
+    """Closing-line-value: at-resolution CLV + timed 15m/1h/6h snapshots + per-theme.
+    Positive = we found good entries (price drifted toward us). Read-only."""
+    try:
+        from harness import clv
+        return JSONResponse({
+            "at_resolution": _safe(lambda: clv.mean_clv(min_n=1), None),
+            "by_theme": _safe(lambda: clv.clv_by_theme(min_n=1), {}),
+            "timed_snapshots": _safe(lambda: clv.clv_snapshot_summary(min_n=1), {}),
+        })
+    except Exception as e:
+        return JSONResponse({"error": f"clv unavailable: {e}"})
+
+
 @app.get("/api/brain/status")
 def api_brain_status():
     """Which reasoning brain is configured (swarm/mock/disabled/manus) + its health.

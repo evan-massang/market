@@ -385,3 +385,160 @@ def edge_decay_report() -> dict:
             "pct_profitable": a["wins"] / n,
         }
     return out
+
+
+# ── timed CLV snapshots (entry vs 15m / 1h / 6h) ──────────────────────────────--
+# The closing-line CLV above needs a resolution; these intermediate snapshots tell us
+# MUCH sooner whether the scanner is finding good entries (positive drift after we buy)
+# or entering late (price moves against us). Captured per open position as each bucket
+# becomes due, using a caller-supplied current price map (no network in this module).
+_SNAP_TABLE = "clv_snapshots"
+SNAP_BUCKETS = {"15m": 15.0, "1h": 60.0, "6h": 360.0}
+
+
+def init_snapshots(conn: sqlite3.Connection | None = None) -> None:
+    own = conn is None
+    try:
+        if own:
+            conn = sqlite3.connect(_db_path())
+        conn.execute(
+            f"""CREATE TABLE IF NOT EXISTS {_SNAP_TABLE} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT, side TEXT, bucket TEXT,
+                entry_price REAL, snap_price REAL, clv REAL, theme TEXT,
+                opened_at TEXT, recorded_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{_SNAP_TABLE}_mkt ON {_SNAP_TABLE}(market_id)")
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        if own and conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _minutes_since(opened_at, now=None) -> float | None:
+    a = _parse_ts(opened_at)
+    if a is None:
+        return None
+    now = now or datetime.utcnow()
+    try:
+        if a.tzinfo is not None:
+            a = a.replace(tzinfo=None)
+        return (now - a).total_seconds() / 60.0
+    except Exception:
+        return None
+
+
+def record_snapshot(market_id, side, bucket, entry_price, snap_price, theme=None,
+                    opened_at=None) -> bool:
+    """Record one timed CLV snapshot (idempotent per market_id+side+bucket)."""
+    try:
+        clv = _clv_for(side, entry_price, snap_price)
+        if clv is None or bucket not in SNAP_BUCKETS:
+            return False
+        s = side.strip().upper()
+        conn = sqlite3.connect(_db_path())
+        try:
+            init_snapshots(conn)
+            dup = conn.execute(
+                f"SELECT 1 FROM {_SNAP_TABLE} WHERE market_id=? AND side=? AND bucket=? LIMIT 1",
+                (market_id, s, bucket)).fetchone()
+            if dup:
+                return False
+            conn.execute(
+                f"INSERT INTO {_SNAP_TABLE} (market_id, side, bucket, entry_price, snap_price, "
+                f"clv, theme, opened_at, recorded_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (market_id, s, bucket, _f(entry_price), _f(snap_price), clv, theme,
+                 opened_at, datetime.utcnow().isoformat()))
+            conn.commit()
+            return True
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        return False
+
+
+def snapshot_open_positions(price_map: dict, now=None) -> int:
+    """For every OPEN paper position, record any DUE 15m/1h/6h snapshot not yet taken,
+    using price_map[market_id] (current YES price). Returns the count recorded.
+    Best-effort / no network: the caller fetches the prices."""
+    if not price_map:
+        return 0
+    try:
+        conn = sqlite3.connect(_db_path())
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        return 0
+    try:
+        rows = conn.execute(
+            "SELECT market_id, side, fill_price, opened_at, question FROM paper_positions "
+            "WHERE status='open'").fetchall()
+    except Exception:
+        rows = []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    recorded = 0
+    for r in rows:
+        mid = r["market_id"]
+        cur = price_map.get(mid)
+        if cur is None:
+            continue
+        mins = _minutes_since(r["opened_at"], now)
+        if mins is None:
+            continue
+        side = (r["side"] or "YES")
+        # current price on the side we hold (price_map stores the YES price)
+        try:
+            cur_side = float(cur) if side.upper() == "YES" else (1.0 - float(cur))
+        except Exception:
+            continue
+        try:
+            from harness import scoreboard
+            theme = scoreboard.theme_of(r["question"] or "")
+        except Exception:
+            theme = None
+        for bucket, mins_due in SNAP_BUCKETS.items():
+            if mins >= mins_due:
+                if record_snapshot(mid, side, bucket, r["fill_price"], cur_side,
+                                   theme=theme, opened_at=r["opened_at"]):
+                    recorded += 1
+    return recorded
+
+
+def clv_snapshot_summary(min_n: int = 1) -> dict:
+    """Mean CLV per bucket (15m/1h/6h) — positive = price drifted toward us after entry
+    (good entries); negative = we entered late / wrong."""
+    try:
+        conn = sqlite3.connect(_db_path())
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        return {}
+    try:
+        rows = conn.execute(f"SELECT bucket, clv FROM {_SNAP_TABLE} WHERE clv IS NOT NULL").fetchall()
+    except Exception:
+        rows = []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    acc: dict = {}
+    for r in rows:
+        acc.setdefault(r["bucket"], []).append(r["clv"])
+    out = {}
+    for bucket, vals in acc.items():
+        if len(vals) >= min_n:
+            out[bucket] = {"n": len(vals), "mean_clv": round(sum(vals) / len(vals), 6),
+                           "pct_positive": round(sum(1 for v in vals if v > 0) / len(vals), 4)}
+    return out

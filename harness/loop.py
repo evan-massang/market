@@ -395,6 +395,7 @@ def settle_resolved(cfg: LoopConfig | None = None) -> list[dict]:
     # still carries side / fill_price / market_p, which the CLV recorder needs (the
     # post-settle rows are still present but we capture them here for a clean read).
     pos_by_market: dict = {}
+    _price_map: dict = {}   # current YES price per open market, for timed CLV snapshots
     for p in positions:
         seen.setdefault(p["market_id"], p["question"])
         pos_by_market.setdefault(p["market_id"], []).append(p)
@@ -407,6 +408,10 @@ def settle_resolved(cfg: LoopConfig | None = None) -> list[dict]:
                 m = gamma.fetch_market_by_condition_id(mid)
                 if m is None:
                     print(f"  {mid[:18]}… not found on Gamma — skip"); continue
+                try:
+                    _price_map[mid] = gamma.yes_price(m)   # for the timed-CLV snapshotter
+                except Exception:
+                    pass
                 outcome = gamma.resolution_outcome(m)
                 if outcome is None:
                     print(f"  {mid[:18]}… not resolved yet"); continue
@@ -485,6 +490,19 @@ def settle_resolved(cfg: LoopConfig | None = None) -> list[dict]:
         if obs:
             try:
                 obs.hooks.on_error(where="loop.settle_resolved.unbet_sweep", exc=_e, action="skip")
+            except Exception:
+                pass
+    # P7/P12: record any DUE timed CLV snapshots (15m/1h/6h) for open positions from the
+    # prices we just fetched — leading entry-quality signal. Best-effort; pure recording.
+    try:
+        from harness import clv as _clvmod
+        _n = _clvmod.snapshot_open_positions(_price_map)
+        if _n:
+            print(f"[settle] recorded {_n} timed CLV snapshot(s)")
+    except Exception as _e:
+        if obs:
+            try:
+                obs.hooks.on_error(where="loop.settle_resolved.clv_snapshots", exc=_e, action="skip")
             except Exception:
                 pass
     st = wallet.get_state()
