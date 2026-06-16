@@ -83,20 +83,28 @@ def _p7_adaptive_min_edge(question, base_min_edge):
         return base_min_edge
 
 
-def _p7_ev_gate(model_p, market_p, side):
+def _p7_ev_gate(model_p, market_p, side, m=None, confidence=None):
     """P7 (B1): EV-after-costs HARD GATE. Returns ``(ok, reason)``.
 
-    PURE TIGHTENING: ``ok`` is True unless the slippage-worsened wallet fill makes
-    this share non-positive-EV, in which case ``(False, 'neg_ev_after_costs')``. It
-    uses the wallet's OWN cost model (WalletConfig slippage + fee_frac) so the
-    gate's fill is identical to how the fill actually happens. On any error / if the
-    module is unavailable we fall back to pre-P7 behavior (allow) — never LOOSER
-    than pre-P7 (which had no such gate), and never break a healthy +edge bet on an
-    internal fault."""
+    PURE TIGHTENING: ``ok`` is True unless the slippage-worsened wallet fill (and,
+    when a market ``m`` is supplied, the spread/liquidity/uncertainty/exit-risk
+    penalties) makes this share's after-cost EV fall at/below MIN_EV_AFTER_COSTS.
+    Uses the wallet's OWN cost model so the gate's fill matches the real fill. On any
+    error / if the module is unavailable we fall back to pre-P7 behavior (allow)."""
     if _profitability is None:
         return True, "ev_gate_unavailable"
     try:
-        return _profitability.ev_gate(model_p, market_p, side)
+        spread = liquidity = exit_risk = None
+        if m is not None:
+            try:
+                spread = scanner._spread(m)
+                liquidity = scanner._f(m.get("liquidity"), None)
+                exit_risk = scanner.exit_risk(m)
+            except Exception:
+                pass
+        return _profitability.ev_gate(model_p, market_p, side, spread=spread,
+                                      liquidity=liquidity, confidence=confidence,
+                                      exit_risk=exit_risk)
     except Exception as e:
         if obs:
             try:
@@ -838,7 +846,7 @@ def predict_one(m, cfg):
             # P7 (B1): EV-after-costs HARD GATE on the accepted event leg. Side is now
             # known; reject if the slippage-worsened fill is non-positive-EV (pure
             # tightening — a healthy +edge leg is unaffected). Uses the wallet cost model.
-            ev_ok, ev_reason = _p7_ev_gate(final_p, price, side)
+            ev_ok, ev_reason = _p7_ev_gate(final_p, price, side, m=m, confidence=meta.get("consensus"))
             if not ev_ok:
                 return _skip(mid, q, ev_reason, p=p, price=price)
             # P8: unified adaptive risk guards (market-quality + correlation + bad-theme),
@@ -908,7 +916,7 @@ def predict_one(m, cfg):
         # P7 (B1): EV-after-costs HARD GATE. Side + stake are known and the edge cleared
         # min_edge; reject a bet whose slippage-worsened fill is non-positive-EV (pure
         # tightening — a healthy +edge bet passes untouched). Same cost model as the wallet.
-        ev_ok, ev_reason = _p7_ev_gate(final_p, price, sz.side)
+        ev_ok, ev_reason = _p7_ev_gate(final_p, price, sz.side, m=m, confidence=meta.get("consensus"))
         if not ev_ok:
             return _skip(mid, q, ev_reason, p=p, price=price)
         # P8: unified adaptive risk guards (stale/low-liquidity/high-spread + correlation

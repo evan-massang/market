@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import math
 
+import os
+
 from harness.wallet import WalletConfig
 
 # Reason strings for ev_gate. Only the failure reason is contractually fixed.
@@ -49,6 +51,24 @@ REJECT_REASON = "neg_ev_after_costs"
 PASS_REASON = "positive_ev_after_costs"
 
 _SIDES = ("YES", "NO")
+
+
+def _envf(name, default):
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# Cost-aware thresholds + penalty multipliers (per-share price units), env-configurable
+# (Phase 6/7). Defaults keep the gate IDENTICAL to before when no penalty inputs are
+# passed (MIN=0, penalties only apply when the caller supplies spread/liquidity/etc.).
+MIN_EV_AFTER_COSTS = _envf("MIN_EV_AFTER_COSTS", 0.0)
+SPREAD_PENALTY_MULT = _envf("SPREAD_PENALTY_MULTIPLIER", 0.5)
+LIQUIDITY_PENALTY_MULT = _envf("LIQUIDITY_PENALTY_MULTIPLIER", 0.02)
+UNCERTAINTY_PENALTY_MULT = _envf("UNCERTAINTY_PENALTY_MULTIPLIER", 0.02)
+EXIT_RISK_PENALTY_MULT = _envf("EXIT_RISK_PENALTY_MULTIPLIER", 0.03)
+_LIQ_REF = 20_000.0   # liquidity saturation reference for the depth penalty
 
 
 def _finite(x) -> bool:
@@ -61,7 +81,10 @@ def _finite(x) -> bool:
 
 def ev_after_costs(model_p: float, market_p: float, side: str,
                    bankroll: float | None = None, stake: float | None = None,
-                   slippage: float | None = None, fee_frac: float | None = None) -> dict:
+                   slippage: float | None = None, fee_frac: float | None = None,
+                   spread: float | None = None, liquidity: float | None = None,
+                   confidence: float | None = None, exit_risk: float | None = None,
+                   min_ev: float | None = None) -> dict:
     """Expected value of one share AFTER the wallet's slippage + fee, for ``side``.
 
     Parameters mirror the bet-decision call sites. ``bankroll`` and ``stake`` do
@@ -120,7 +143,26 @@ def ev_after_costs(model_p: float, market_p: float, side: str,
     # identical to ev_per_share > 0 (no behavior change today).
     net_ev_per_share = ev_per_share - fee * fill_price
 
-    positive = bool(inputs_ok and net_ev_per_share > 0.0)
+    # ── cost/risk penalties (per share). Each only applies when its signal is given,
+    #    so a bare call is byte-identical to before. All penalties are >= 0 (they can
+    #    only REDUCE EV — a tightening), making the gate cost-aware, not raw-edge-only.
+    pen = {}
+    if spread is not None and _finite(spread) and spread > 0:
+        pen["spread"] = SPREAD_PENALTY_MULT * float(spread)
+    if liquidity is not None and _finite(liquidity):
+        liq = max(0.0, float(liquidity))
+        liq_quality = liq / (liq + _LIQ_REF)                 # 0 (dry) … →1 (deep)
+        pen["liquidity"] = LIQUIDITY_PENALTY_MULT * (1.0 - liq_quality)
+    if confidence is not None and _finite(confidence):
+        c = min(max(float(confidence), 0.0), 1.0)
+        pen["uncertainty"] = UNCERTAINTY_PENALTY_MULT * (1.0 - c)
+    if exit_risk is not None and _finite(exit_risk):
+        pen["exit_risk"] = EXIT_RISK_PENALTY_MULT * min(max(float(exit_risk), 0.0), 1.0)
+    total_penalty = sum(pen.values())
+    net_ev_after_penalties = net_ev_per_share - total_penalty
+
+    threshold = MIN_EV_AFTER_COSTS if min_ev is None else float(min_ev)
+    positive = bool(inputs_ok and net_ev_after_penalties > threshold)
 
     return {
         "side": side_u if side_u in _SIDES else None,
@@ -128,6 +170,10 @@ def ev_after_costs(model_p: float, market_p: float, side: str,
         "ev_per_share": ev_per_share,
         "net_ev_per_share": net_ev_per_share,
         "ev_per_dollar": ev_per_dollar,
+        "penalties": pen,
+        "total_penalty": round(total_penalty, 6),
+        "net_ev_after_penalties": net_ev_after_penalties,
+        "min_ev": threshold,
         "breakeven_p": breakeven_p if side_u in _SIDES else None,
         "positive": positive,
     }
@@ -135,15 +181,21 @@ def ev_after_costs(model_p: float, market_p: float, side: str,
 
 def ev_gate(model_p: float, market_p: float, side: str,
             bankroll: float | None = None, stake: float | None = None,
-            slippage: float | None = None, fee_frac: float | None = None) -> tuple[bool, str]:
-    """PURE TIGHTENING gate. ``ok`` iff the after-costs EV per share is positive.
+            slippage: float | None = None, fee_frac: float | None = None,
+            spread: float | None = None, liquidity: float | None = None,
+            confidence: float | None = None, exit_risk: float | None = None,
+            min_ev: float | None = None) -> tuple[bool, str]:
+    """PURE TIGHTENING gate. ``ok`` iff the after-costs (and after spread/liquidity/
+    uncertainty/exit-risk penalties) EV per share clears ``min_ev``.
 
-    Returns ``(ok, reason)``. On failure ``reason == "neg_ev_after_costs"``. This
-    gate can only REJECT a bet the slippage-worsened fill makes non-positive-EV;
-    it never approves anything that the upstream edge/sizing gates rejected.
+    Returns ``(ok, reason)``. On failure ``reason == "neg_ev_after_costs"``. The
+    penalty signals are optional — a bare call (no spread/liquidity/etc.) with
+    min_ev=0 behaves exactly as before. It can only REJECT, never approve.
     """
     ev = ev_after_costs(model_p, market_p, side,
                         bankroll=bankroll, stake=stake,
-                        slippage=slippage, fee_frac=fee_frac)
+                        slippage=slippage, fee_frac=fee_frac,
+                        spread=spread, liquidity=liquidity,
+                        confidence=confidence, exit_risk=exit_risk, min_ev=min_ev)
     ok = bool(ev["positive"])
     return ok, (PASS_REASON if ok else REJECT_REASON)

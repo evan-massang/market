@@ -116,6 +116,43 @@ def test_fee_aware_positive_flag_flips_marginal_bet():
     assert healthy["positive"] is True, healthy
 
 
+def test_penalties_reduce_ev_and_can_flip_to_reject():
+    # cost-aware: a healthy raw edge survives with no penalties, but a wide-spread /
+    # thin-liquidity / low-confidence / high-exit-risk market is rejected (Phase 6/7).
+    base = ev_after_costs(0.60, 0.50, "YES")
+    assert base["positive"] is True and not base["penalties"]
+    pen = ev_after_costs(0.60, 0.50, "YES", spread=0.06, liquidity=800,
+                         confidence=0.2, exit_risk=0.85)
+    assert pen["positive"] is False, pen
+    assert pen["net_ev_after_penalties"] < base["net_ev_per_share"]
+    for k in ("spread", "liquidity", "uncertainty", "exit_risk"):
+        assert pen["penalties"][k] > 0
+
+
+def test_each_penalty_is_monotonic():
+    a = ev_after_costs(0.65, 0.50, "YES", liquidity=50_000)   # deep
+    b = ev_after_costs(0.65, 0.50, "YES", liquidity=1_000)    # thin
+    assert b["penalties"]["liquidity"] > a["penalties"]["liquidity"]
+    lo = ev_after_costs(0.65, 0.50, "YES", confidence=0.9)
+    hi = ev_after_costs(0.65, 0.50, "YES", confidence=0.1)
+    assert hi["penalties"]["uncertainty"] > lo["penalties"]["uncertainty"]
+
+
+def test_no_penalty_args_is_unchanged():
+    # backward-compat: without penalty inputs and min_ev=0, net_after == net_per_share
+    r = ev_after_costs(0.65, 0.50, "YES")
+    assert r["total_penalty"] == 0 and r["net_ev_after_penalties"] == r["net_ev_per_share"]
+    assert r["positive"] is (r["net_ev_per_share"] > 0)
+
+
+def test_min_ev_threshold_enforced():
+    # a small positive net EV is rejected when min_ev is raised above it
+    r0 = ev_after_costs(0.52, 0.50, "YES", min_ev=0.0)
+    r1 = ev_after_costs(0.52, 0.50, "YES", min_ev=0.05)
+    assert r0["net_ev_after_penalties"] > 0
+    assert r0["positive"] is True and r1["positive"] is False
+
+
 def test_fill_price_matches_wallet_formula():
     # The gate's fill MUST equal the wallet's fill for every leg/price (cost-model
     # consistency). Sweep a range including clamp edges.
@@ -178,6 +215,10 @@ TESTS = [
     ("matches_hand_computed_ev", test_matches_hand_computed_ev),
     ("fee_frac_flows_into_per_dollar_consistently", test_fee_frac_flows_into_per_dollar_consistently),
     ("fee_aware_positive_flag_flips_marginal_bet", test_fee_aware_positive_flag_flips_marginal_bet),
+    ("penalties_reduce_ev_and_can_flip_to_reject", test_penalties_reduce_ev_and_can_flip_to_reject),
+    ("each_penalty_is_monotonic", test_each_penalty_is_monotonic),
+    ("no_penalty_args_is_unchanged", test_no_penalty_args_is_unchanged),
+    ("min_ev_threshold_enforced", test_min_ev_threshold_enforced),
     ("fill_price_matches_wallet_formula", test_fill_price_matches_wallet_formula),
     ("uses_wallet_defaults_when_none", test_uses_wallet_defaults_when_none),
     ("degenerate_prices_guarded", test_degenerate_prices_guarded),
