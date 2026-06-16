@@ -65,23 +65,21 @@ def single_llm_forecast(question: str, market_odds: float | None = None,
         raw = _hosted_raw(system, user) if _hosted_configured() else _local_raw(system, user, model)
     if not raw:
         return None
-    try:
-        from core.agent import _coerce_prob   # robust % / prose / null coercion
-        m = re.search(r'\{.*\}', raw, re.DOTALL)
-        if m:
+    # Plan 7: STRICT parser — a year/date/count/money amount, a bare out-of-range number,
+    # malformed JSON, or prose without probability wording returns None (a SKIPPED vote,
+    # never a fabricated/clamped 0.5). The ensemble excludes None, so a parse failure can
+    # never inflate the challenger mean.
+    from core.probability_parser import parse_probability_response
+    pres = parse_probability_response(raw, source="challenger")
+    if not pres["ok"]:
+        if obs:
             try:
-                p = _coerce_prob(json.loads(m.group(0)).get("probability"))
+                obs.hooks.on_error(where="challenger.single_llm_forecast.parse",
+                                   exc=RuntimeError(f"{pres['reason']} ({pres['method']})"), action="skip")
             except Exception:
-                p = None
-        else:
-            # prose fallback: "60 percent"/"75%" -> 0.6/0.75 (NOT a forced 0.99);
-            # an unparseable reply returns None (reject) rather than a fake max-confidence.
-            p = _coerce_prob(raw)
-        if p is None:
-            return None
-        return min(max(p, 0.01), 0.99)
-    except Exception:
+                pass
         return None
+    return pres["probability"]   # already strictly within [0.01, 0.99] — no clamp needed
 
 
 def _hosted_configured() -> bool:
