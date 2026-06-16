@@ -196,6 +196,17 @@ def health_alias():
     })
 
 
+@app.get("/api/brain/status")
+def api_brain_status():
+    """Which reasoning brain is configured (swarm/mock/disabled/manus) + its health.
+    The LLM is a replaceable provider; the system runs observe-only if it's unavailable."""
+    try:
+        from harness import brain
+        return JSONResponse(brain.status())
+    except Exception as e:
+        return JSONResponse({"error": f"brain status unavailable: {e}"})
+
+
 @app.get("/api/system/status")
 def api_system_status():
     """Phase 15 — the supervisor/system status (same data as `supervisor status`):
