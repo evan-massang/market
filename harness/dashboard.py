@@ -174,19 +174,25 @@ def api_health():
 
 @app.get("/health")
 def health_alias():
-    """Structured health for the supervisor's HTTP check (always 200 if the app is up)."""
-    snap = _safe(lambda: health.snapshot(), {})
-    db_ok = _safe(lambda: __import__("harness.db_check", fromlist=["run"]).run().get("fail", 1) == 0, False)
-    last_hb = None
+    """FAST liveness probe (the supervisor's startup gate hits this). Must answer in
+    well under a second — so NO external HTTP probes / DB reconciliation here (that
+    detail lives in /api/health and /api/system/status). Just confirm the app is up
+    and the DB opens."""
+    db_ok = False
     try:
-        last_hb = (snap.get("daemon") or {}).get("age_sec")
+        import sqlite3
+        from harness import wallet
+        c = sqlite3.connect(wallet.DB_PATH, timeout=1.0)
+        c.execute("SELECT 1")
+        c.close()
+        db_ok = True
     except Exception:
         pass
+    import datetime as _dt
     return JSONResponse({
-        "ok": True, "service": "dashboard", "time": _safe(lambda: __import__("datetime").datetime
-                       .now(__import__("datetime").timezone.utc).isoformat(timespec="seconds"), None),
-        "db_ok": bool(db_ok), "last_heartbeat": last_hb, "version": "polyswarm-harness",
-        "snapshot": snap,
+        "ok": True, "service": "dashboard",
+        "time": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+        "db_ok": db_ok, "version": "polyswarm-harness",
     })
 
 

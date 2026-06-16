@@ -185,16 +185,20 @@ def registry(cfg: dict | None = None) -> list[Service]:
             note="optional MiroFish web UI (Vite :3000)"),
         Service(
             name="dashboard",
-            cmd=[POLY_PY, "-m", "harness.dashboard"], cwd=PKG_ROOT,
+            cmd=[POLY_PY, "-u", "-m", "harness.dashboard"], cwd=PKG_ROOT,
             enabled=cfg["RUN_DASHBOARD"], required=False, manage=True, order=3,
             port=dash_port, http_url=f"http://localhost:{dash_port}/health",
-            start_timeout=30.0, env={**common_env, "DASH_STREAM_LOG": "ai_night.log"},
+            # heavy uvicorn + harness imports take a while on a busy CPU box, esp. once the
+            # daemons + MiroFish are also running; give it room. `-u` flushes its log.
+            start_timeout=75.0, env={**common_env, "DASH_STREAM_LOG": "ai_night.log"},
             note="live monitor (http://localhost:8800)"),
         Service(
             name="sameday_daemon",
             cmd=[POLY_PY, "-u", "-m", "harness.sameday", "daemon"], cwd=PKG_ROOT,
             enabled=cfg["RUN_SAMEDAY_DAEMON"], required=True, manage=True, order=4,
-            heartbeat_path=os.path.join(PKG_ROOT, "sameday_live.log"), heartbeat_max_age=600.0,
+            # under the supervisor, sameday's stdout goes to its .runtime log (not the
+            # old launcher's sameday_live.log) — that log's mtime is the liveness signal.
+            heartbeat_path=os.path.join(LOGS, "sameday_daemon.log"), heartbeat_max_age=600.0,
             start_timeout=20.0, env=common_env,
             note="same-day favorite-longshot + AI scout daemon"),
         Service(
