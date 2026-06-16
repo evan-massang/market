@@ -93,6 +93,28 @@ def test_paper_metrics_hand_computed():
     assert _approx(pm["realized_pnl"], -6.0), pm
 
 
+def _closed(pnl, stake, market_id, settled_at):
+    conn = sqlite3.connect(os.environ["DATABASE_URL"])
+    conn.execute(
+        "INSERT INTO paper_positions (market_id, question, side, model_p, market_p, edge, stake, "
+        "fill_price, shares, fee, status, realized_pnl, settled_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?, 'closed', ?, ?)",
+        (market_id, f"Q-{market_id}", "YES", 0.6, 0.5, 0.1, stake, 0.51, stake / 0.51, 0.0, pnl, settled_at),
+    )
+    conn.commit(); conn.close()
+
+
+def test_paper_metrics_includes_cashed_out_closed():
+    # audit #8/#19: cashed-out ('closed') trades must count in P&L metrics so they
+    # reconcile with the wallet realized_pnl that Gate 2 reads.
+    _reset()
+    _settled(-10.0, 10.0, "S1", "2026-06-10T00:00:00")
+    _closed(-8.0, 10.0, "C1", "2026-06-11T00:00:00")
+    pm = M.paper_metrics()
+    assert pm["n"] == 2, pm                       # both counted
+    assert _approx(pm["realized_pnl"], -18.0), pm  # -10 settled + -8 closed
+
+
 def test_paper_metrics_empty_book():
     _reset()
     pm = M.paper_metrics()
@@ -140,6 +162,7 @@ TESTS = [
     ("log_loss_none_below_min_n", test_log_loss_none_below_min_n),
     ("log_loss_confident_miss_is_finite", test_log_loss_confident_miss_is_finite),
     ("paper_metrics_hand_computed", test_paper_metrics_hand_computed),
+    ("paper_metrics_includes_cashed_out_closed", test_paper_metrics_includes_cashed_out_closed),
     ("paper_metrics_empty_book", test_paper_metrics_empty_book),
     ("profit_factor_none_when_no_losses", test_profit_factor_none_when_no_losses),
     ("gate_report_shape_and_not_faked", test_gate_report_shape_and_not_faked),

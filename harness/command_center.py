@@ -97,8 +97,9 @@ def losing_trades(limit: int = 25) -> list[dict]:
     try:
         rows = conn.execute(
             "SELECT market_id, question, side, model_p, market_p, edge, stake, "
-            "realized_pnl, outcome, settled_at FROM paper_positions "
-            "WHERE status='settled' AND realized_pnl < 0 "
+            "realized_pnl, outcome, status, settled_at FROM paper_positions "
+            # include cashed-out ('closed') losers so they are not hidden (audit #8/#19)
+            "WHERE status IN ('settled','closed') AND realized_pnl < 0 "
             "ORDER BY settled_at DESC, id DESC LIMIT ?",
             (limit,),
         ).fetchall()

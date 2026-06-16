@@ -105,7 +105,9 @@ def _settled_rows() -> list[dict]:
     try:
         rows = conn.execute(
             "SELECT stake, realized_pnl, settled_at FROM paper_positions "
-            "WHERE status='settled' ORDER BY settled_at, id"
+            # include cashed-out ('closed') trades so ROI/hit/profit-factor/drawdown
+            # reconcile with the wallet realized_pnl that Gate 2 reads (audit #8/#19).
+            "WHERE status IN ('settled','closed') ORDER BY settled_at, id"
         ).fetchall()
     except Exception as e:
         _err("metrics._settled_rows.select", e)

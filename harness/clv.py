@@ -338,7 +338,8 @@ def edge_decay_report() -> dict:
         try:
             rows = conn.execute(
                 "SELECT model_p, market_p, edge, stake, realized_pnl, opened_at, end_date "
-                "FROM paper_positions WHERE status='settled' AND realized_pnl IS NOT NULL"
+                # include cashed-out trades for the realized-return analytic (audit #8/#19)
+                "FROM paper_positions WHERE status IN ('settled','closed') AND realized_pnl IS NOT NULL"
             ).fetchall()
         except Exception:
             return {}

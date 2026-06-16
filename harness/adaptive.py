@@ -18,7 +18,7 @@ Design contract
 * Best-effort + import-safe: a missing table / DB / malformed row degrades to a
   safe default (``{}`` for theme_pnl, the floor for adaptive_min_edge). Nothing
   here may raise into the bettor (predict_today / sameday) or settlement (loop).
-* Only ``status='settled'`` positions count — a market that resolved on-chain.
+* ``status IN ('settled','closed')`` count — on-chain-resolved AND cashed-out
   Each such row's realized_pnl already nets wallet costs (slippage + fee), so a
   losing theme is losing AFTER costs by construction.
 """
@@ -112,7 +112,9 @@ def theme_pnl(opinion_only: bool = False) -> dict:
     try:
         rows = conn.execute(
             "SELECT question, stake, realized_pnl FROM paper_positions "
-            "WHERE status='settled'"
+            # settled (on-chain resolved) AND closed (cashed-out) so per-theme P&L
+            # reconciles with the wallet realized_pnl Gate 2 reads (audit #8/#19).
+            "WHERE status IN ('settled','closed')"
         ).fetchall()
     except Exception as e:
         # missing table / older schema -> no track record yet

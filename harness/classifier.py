@@ -129,10 +129,23 @@ _RAW_SIGNALS: list[tuple[str, int, str, str]] = [
      r"become (?:president|prime minister|chancellor|nominee))\b", 4, "opinion", "elections_kw"),
     (r"\b(?:democrats?|republicans?|gop|labour|tory|maga)\b.{0,30}\b(?:win|control|"
      r"majority|flip|sweep)\b", 2, "opinion", "party_control"),
-    (r"\bcandidate\b", 1, "opinion", "candidate_kw"),
+    # 'candidate' only counts as a POLITICAL opinion signal in political context —
+    # otherwise a 'vaccine candidate' / 'candidate gene' market would be mislabeled
+    # opinion. Real election markets independently fire elections_kw above. (audit #25)
+    (r"\bcandidate\b.{0,40}\b(?:elect|primary|nomin|party|senate|house|governor|"
+     r"president|congress|republican|democrat|gop|ballot|caucus|runoff)\b|"
+     r"\b(?:elect|primary|nomin|party|republican|democrat|gop|ballot|caucus)\b.{0,40}\bcandidate\b",
+     1, "opinion", "candidate_kw"),
     # approval / polling / sentiment — weight 4 (opinion subject dominates a threshold)
     (r"\b(?:approval rating|disapproval|favorability|poll(?:s|ing)?|popular vote|"
      r"net approval|approval of)\b", 4, "opinion", "approval_poll"),
+    # approval-RATING markets phrased as a bare 'approval' + a threshold/percentage
+    # ("X's approval be above 50%", "approval exceed 45%", "more than 60% approve of X").
+    # Threshold-scoped so a MECHANICAL 'FDA approval'/'drug approval' (no %) is NOT
+    # caught here. Weight 4 so it dominates the +3 numeric-threshold signal. (audit #2)
+    (r"\bapproval\b.{0,25}(?:\d+\s*%|above|below|exceed|over\b|under\b|higher|lower|reach|hit|stay)",
+     4, "opinion", "approval_poll"),
+    (r"\bapprove of\b|\d+\s*%\s+(?:approve|approval)", 4, "opinion", "approval_poll"),
     # cultural awards / attention / virality — opinion but NO pollable base rate
     (r"\b(?:oscars?|grammys?|emmys?|golden globe|nobel|person of the year|"
      r"best (?:picture|actor|actress|director)|man of the (?:match|year)|"

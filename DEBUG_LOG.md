@@ -110,4 +110,29 @@ Test: `test_parser_robust` 5/5 (numeric clamp, %/prose, unparseable→default, a
 estimate never raises a dirty error, challenger prose ≠ 0.99). `test_swarm_sizes`
 still 5/5. Suite 44 modules.
 
+### BATCH 3 — P&L-metric consistency + classifier accuracy — FIXED
+
+- **C1 🟠 cashed-out ('closed') trades excluded from every P&L analytic but counted
+  in Gate 2 → two conflicting realized numbers, hidden losers.** `metrics._settled_rows`,
+  `adaptive.theme_pnl`, `clv.edge_decay_report`, `command_center.losing_trades` all
+  filtered `status='settled'`, but `close_at_price` writes `'closed'` and the wallet
+  realized_pnl (Gate 2) includes those. **FIX:** P&L analytics now use
+  `status IN ('settled','closed')`. Live: `paper_metrics` realized went −31.94 →
+  **−39.43** (now equals the positions-ledger sum), losing-trades view 10 → 25
+  (cashed-out losers visible); the residual gap to the wallet's −42.25 is exactly the
+  drift `db_check` flags. Outcome/Brier metrics keep `settled` only (a cash-out has no
+  on-chain outcome). FIXED.
+- **C2 🟠 approval-rating opinion markets mislabeled 'mechanical' (skipped).** "X's
+  approval be above 50%" fired the +3 numeric-threshold (mechanical) but the
+  approval-poll signal only matched the exact substring "approval rating". **FIX:** added
+  threshold-scoped `approval` + `approve of` opinion signals (weight 4) so approval-rating
+  markets classify opinion — while a MECHANICAL "FDA/SEC approval" (no %) is deliberately
+  NOT caught. `harness/classifier.py`. FIXED.
+- **C3 🟡 bare 'candidate' (weight 1) labeled non-political markets opinion** (e.g.
+  "vaccine candidate succeed in Phase 3"). **FIX:** `candidate_kw` now requires political
+  context; real election markets already fire `elections_kw`. FIXED.
+
+Tests: +`test_metrics::paper_metrics_includes_cashed_out_closed`; classifier 15/15,
+adaptive/clv/command_center green. Suite 44 modules.
+
 _(remaining batches appended below as each is closed)_
