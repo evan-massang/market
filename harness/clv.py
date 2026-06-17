@@ -85,6 +85,73 @@ def _clv_for(side, entry, closing):
     return None
 
 
+def _to_epoch(t):
+    """Coerce a mark timestamp (epoch float/int or ISO string) -> epoch seconds, or None."""
+    if t is None:
+        return None
+    if isinstance(t, (int, float)):
+        return float(t)
+    try:
+        s = str(t).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        from datetime import timezone as _tz
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def compute_clv(position, mark_price, *, mark_time=None, max_age_seconds=900) -> dict:
+    """Honest, side- AND timestamp-aware CLV for ONE position. Read-only, never raises.
+
+    ``position`` is a dict with at least ``side`` and ``fill_price`` (or ``entry_price``);
+    ``status`` ('settled'/'closed') or an ``is_final`` flag marks a settled market. CLV uses the
+    correct side (YES: mark-entry, NO: entry-mark). For an OPEN market the mark must be FRESH
+    (a ``mark_time`` within ``max_age_seconds``); a missing/stale/unverifiable mark yields a
+    reason and ``ok=False`` — never a fake number. For a SETTLED market the supplied price is
+    the FINAL close/settlement price (``is_final=true``) and is not staleness-checked.
+
+    Returns {ok, clv, clv_bps, side, entry_price, mark_price, mark_time, is_final, reason}.
+    Reasons: clv_ok / clv_mark_missing / clv_mark_stale / clv_invalid_entry_price /
+    clv_invalid_side / clv_invalid_mark_price / clv_unknown."""
+    pos = position if isinstance(position, dict) else {}
+    side = (pos.get("side") or "").strip().upper()
+    entry = _f(pos.get("fill_price"))
+    if entry is None:
+        entry = _f(pos.get("entry_price"))
+    status = (pos.get("status") or "").strip().lower()
+    if pos.get("is_final") is not None:
+        is_final = bool(pos.get("is_final"))
+    else:
+        is_final = status in ("settled", "closed")
+    mp = _f(mark_price)
+    base = {"ok": False, "clv": None, "clv_bps": None, "side": side, "entry_price": entry,
+            "mark_price": mp, "mark_time": mark_time, "is_final": is_final, "reason": "clv_unknown"}
+
+    if entry is None or not (0.0 < entry < 1.0):
+        return {**base, "reason": "clv_invalid_entry_price"}
+    if side not in ("YES", "NO"):
+        return {**base, "reason": "clv_invalid_side"}
+    if mp is None:
+        return {**base, "reason": "clv_mark_missing"}
+    if not (0.0 <= mp <= 1.0):
+        return {**base, "reason": "clv_invalid_mark_price"}
+    if not is_final:
+        mt = _to_epoch(mark_time)
+        if mt is None:
+            return {**base, "reason": "clv_mark_stale"}          # open mark with no verifiable time
+        import time as _time
+        if (_time.time() - mt) > max_age_seconds:
+            return {**base, "reason": "clv_mark_stale"}
+    clv = _clv_for(side, entry, mp)
+    if clv is None:
+        return {**base, "reason": "clv_unknown"}
+    return {"ok": True, "clv": round(clv, 6), "clv_bps": round(clv * 10000.0, 2),
+            "side": side, "entry_price": entry, "mark_price": mp, "mark_time": mark_time,
+            "is_final": is_final, "reason": "clv_ok"}
+
+
 # ── schema ──────────────────────────────────────────────────────────────────--
 def init_db(conn: sqlite3.Connection | None = None) -> None:
     """Create clv_records (+ indices) idempotently. Never raises."""

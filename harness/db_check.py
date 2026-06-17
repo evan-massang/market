@@ -155,6 +155,26 @@ def run() -> dict:
     except Exception as e:
         _add("open_position_integrity", "WARN", f"open-position integrity error: {e}")
 
+    # 4c) Plan 9 — canonical read-only accounting audit summary + unsettled-expired.
+    #     This is the SAME truth model Gate 2 / the scoreboard / the dashboard consume, so the
+    #     integrity check can never say "OK" while the audited accounting is degraded/drifted.
+    try:
+        from harness import accounting_audit as _acct
+        a = _acct.audit_accounting()
+        _amap = {"ok": "OK", "degraded": "WARN", "drift": "FAIL", "unknown": "UNKNOWN", "error": "UNKNOWN"}
+        _eq = a["equity"] if a["equity"] is not None else "unverified"
+        _un = a["unrealized_pnl"] if a["unrealized_pnl"] is not None else "unverified"
+        _add("accounting_audit", _amap.get(a["status"], "WARN"),
+             f"status={a['status']} equity={_eq} realized={a['realized_pnl']} unrealized={_un} "
+             f"drift=${a['drift']:.2f} marks_stale={a['mark_stale_count']} "
+             f"reasons={','.join(a['reasons'])}")
+        exp = a["details"].get("unsettled_expired", 0)
+        _add("unsettled_expired", "WARN" if exp else "OK",
+             f"{exp} open position(s) past end_date but still unsettled" if exp
+             else "no expired-but-unsettled open positions")
+    except Exception as e:
+        _add("accounting_audit", "UNKNOWN", f"accounting audit unavailable: {e}")
+
     # 5) settled-vs-closed P&L split (so a hidden cash-out loss bucket is visible)
     try:
         sp = conn.execute("SELECT COALESCE(SUM(realized_pnl),0), COUNT(*) FROM paper_positions WHERE status='settled'").fetchone()
@@ -183,8 +203,10 @@ def run() -> dict:
 def _summary(path: str) -> dict:
     n_fail = sum(1 for _, s, _ in CHECKS if s == "FAIL")
     n_warn = sum(1 for _, s, _ in CHECKS if s == "WARN")
+    n_unknown = sum(1 for _, s, _ in CHECKS if s == "UNKNOWN")
     n_ok = sum(1 for _, s, _ in CHECKS if s == "OK")
-    return {"db": path, "checks": list(CHECKS), "ok": n_ok, "warn": n_warn, "fail": n_fail}
+    return {"db": path, "checks": list(CHECKS), "ok": n_ok, "warn": n_warn,
+            "unknown": n_unknown, "fail": n_fail}
 
 
 def ledger_reconciliation_report() -> dict:
@@ -269,7 +291,10 @@ def render(res: dict) -> None:
     for name, status, detail in res["checks"]:
         print(f"[{status:<4}] {name:<20} {detail}")
     print("-" * 60)
-    print(f"OK: {res['ok']} pass, {res['warn']} warn, {res['fail']} fail  (of {len(res['checks'])} checks)")
+    print(f"{res['ok']} pass, {res['warn']} warn, {res.get('unknown', 0)} unknown, "
+          f"{res['fail']} fail  (of {len(res['checks'])} checks)")
+    if res['fail'] or res['warn'] or res.get('unknown', 0):
+        print("  NOT all-clear — accounting/integrity is degraded; fix before trusting the gates.")
 
 
 def main(argv=None) -> int:

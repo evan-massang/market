@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from harness.classifier import tag_market
 from harness import wallet as paper
@@ -137,19 +138,13 @@ def compute(include_test=False, include_demo=False, environment=None) -> dict:
     # GATE 1 — calibration
     gate1_pass = bool(n >= GATE1_MIN_N and model_b is not None and market_b is not None and model_b < market_b)
 
-    # GATE 2 — profitability (paper bankroll grew after costs)
-    try:
-        st = paper.get_state()
-    except Exception:
-        st = {"starting_bankroll": 0.0, "equity": 0.0, "realized_pnl": 0.0, "cash": 0.0, "open_exposure": 0.0}
-    # require a real sample so one lucky +$0.01 settled trade can't flash Gate 2 PASS
-    try:
-        _c = sqlite3.connect(DB_PATH)
-        n_settled = _c.execute("SELECT COUNT(*) FROM paper_positions WHERE status IN ('settled','closed')").fetchone()[0]
-        _c.close()
-    except Exception:
-        n_settled = 0
-    gate2_pass = bool(n_settled >= GATE2_MIN_N and st["realized_pnl"] > 0 and st["equity"] >= st["starting_bankroll"])
+    # GATE 2 — profitability READINESS (Plan 9: FAIL-CLOSED via the read-only accounting audit;
+    # passes ONLY on verified equity with a real sample, baseline, valid CLV, segmentation, and
+    # within-limit drawdown — never on realized-only / at-cost / stale numbers).
+    from harness import accounting_audit as _acct
+    acct = _acct.audit_accounting()
+    g2 = _acct.gate2_status()
+    gate2_pass = g2["pass"]
 
     return {
         "n": n, "n_required": GATE1_MIN_N,
@@ -157,11 +152,28 @@ def compute(include_test=False, include_demo=False, environment=None) -> dict:
         "baseline_brier": baseline_b, "baseline_n": len(base),
         "themes": {k: {"n": v.n, "model_brier": v.model_brier, "market_brier": v.market_brier}
                    for k, v in sorted(themes.items())},
+        # Plan 9 honesty surface
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "paper_only": True,
+        "accounting": {
+            "status": acct["status"], "reasons": acct["reasons"],
+            "cash": acct["cash"], "realized_pnl": acct["realized_pnl"],
+            "unrealized_pnl": acct["unrealized_pnl"], "equity": acct["equity"],
+            "total_pnl": acct["total_pnl"], "drift": acct["drift"],
+            "mark_stale_count": acct["mark_stale_count"],
+            "open_count": acct["open_position_count"], "settled_count": acct["closed_position_count"],
+            "last_mark_time": None,
+        },
         "gate1": {"pass": gate1_pass, "model_brier": model_b, "market_brier": market_b,
                   "n": n, "n_required": GATE1_MIN_N},
-        "gate2": {"pass": gate2_pass, "starting_bankroll": st["starting_bankroll"],
-                  "equity": st["equity"], "realized_pnl": st["realized_pnl"],
-                  "n": n_settled, "n_required": GATE2_MIN_N},
+        "gate2": {"pass": gate2_pass, "status": g2["status"], "reasons": g2["reasons"],
+                  "starting_bankroll": g2["starting_bankroll"] or 0.0,
+                  "equity": g2["equity"], "realized_pnl": g2["realized_pnl"],
+                  "total_pnl": g2["total_pnl"], "n": g2["n_settled"], "n_required": GATE2_MIN_N,
+                  "accounting_status": g2["accounting_status"], "paper_only": True,
+                  "baseline_n": g2["baseline_n"], "mean_clv": g2["mean_clv"],
+                  "max_drawdown": g2["max_drawdown"], "span_days": g2["span_days"],
+                  "uncertainty": g2["uncertainty"]},
         "both_pass": gate1_pass and gate2_pass,
     }
 
@@ -295,13 +307,28 @@ def render(include_test=False, include_demo=False, environment=None) -> None:
         print(f" A/B challenger — single-LLM Brier: {_fmt(bb)}  (n={s['baseline_n']})  -> "
               f"swarm {_fmt(s['model_brier'])} vs single-LLM {_fmt(bb)}: {vs_model}")
         print()
+    # Plan 9: accounting honesty line (never a green gate while the book is unverified)
+    acct = s.get("accounting") or {}
+    _money = lambda x: (f"${x:.2f}" if isinstance(x, (int, float)) else "unverified")
+    _signed = lambda x: (f"${x:+.2f}" if isinstance(x, (int, float)) else "unverified")
+    print(f" ACCOUNTING [{acct.get('status', '?').upper()}]  paper-only · "
+          f"realized {_signed(acct.get('realized_pnl'))} · unrealized {_signed(acct.get('unrealized_pnl'))} · "
+          f"total {_signed(acct.get('total_pnl'))} · equity {_money(acct.get('equity'))}"
+          + (f"   (! {', '.join(acct.get('reasons') or [])})" if acct.get('status') != 'ok' else ""))
+    if acct.get("mark_stale_count"):
+        print(f"   (! {acct['mark_stale_count']} open position(s) without a fresh mark -> equity UNVERIFIED)")
+    print(f" as of {s.get('generated_at', '?')}  ·  paper_only={s.get('paper_only', True)}")
+    print()
     g1, g2 = s["gate1"], s["gate2"]
     print(f" GATE 1  (model Brier < market Brier, n>={s['n_required']}):  "
           f"{'PASS' if g1['pass'] else 'FAIL'}"
           + (f"   (lower is better: {_fmt(g1['model_brier'])} vs {_fmt(g1['market_brier'])})" if s['n'] else "   (no resolved markets yet)"))
-    print(f" GATE 2  (paper bankroll grew after costs):                 "
-          f"{'PASS' if g2['pass'] else 'FAIL'}"
-          f"   (start ${g2['starting_bankroll']:.2f} -> equity ${g2['equity']:.2f}, realized ${g2['realized_pnl']:+.2f})")
+    print(f" GATE 2  (verified profitable, fail-closed):                "
+          f"{'PASS' if g2['pass'] else g2.get('status', 'FAIL').upper()}"
+          f"   (start {_money(g2['starting_bankroll'])} -> equity {_money(g2['equity'])}, "
+          f"realized {_signed(g2['realized_pnl'])}, n={g2['n']}/{g2['n_required']})")
+    if not g2["pass"]:
+        print(f"          reasons: {', '.join(g2.get('reasons') or [])}")
     # P7 read-only analytics panel (informational; changes NO gate). Best-effort.
     try:
         render_profitability()

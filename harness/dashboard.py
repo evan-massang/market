@@ -109,8 +109,15 @@ def api_state():
             "model_brier": sb["model_brier"], "market_brier": sb["market_brier"],
             "baseline_brier": sb.get("baseline_brier"), "baseline_n": sb.get("baseline_n", 0),
             "gate1": sb["gate1"]["pass"], "gate2": sb["gate2"]["pass"],
+            "gate2_status": sb["gate2"].get("status"), "gate2_reasons": sb["gate2"].get("reasons"),
             "themes": sb["themes"],
         },
+        # Plan 9: accounting honesty — the card shows VERIFIED status + realized/unrealized/total
+        # split + equity, or "unverified" instead of a fake number. paper_only is always explicit.
+        "accounting": sb.get("accounting"),
+        "paper_only": True,
+        "equity_verified": (sb.get("accounting") or {}).get("equity") is not None,
+        "generated_at": sb.get("generated_at"),
         "pnl_series": [{"ts": s["ts"], "equity": s["equity"], "realized_pnl": s["realized_pnl"],
                         "cash": s["cash"], "n_open": s["n_open"]} for s in snaps],
         # guarded like every other read here — a transient 'database is locked' (a
@@ -122,6 +129,23 @@ def api_state():
         "mirofish": mirofish_signal.get_signals(8),
     }
     return JSONResponse(data)
+
+
+@app.get("/api/accounting")
+def api_accounting():
+    """Plan 9: the HONEST accounting card — read-only audit (cash / realized / unrealized /
+    total / equity, drift, stale marks, status+reasons), the fail-closed Gate-2 readiness
+    verdict, and journal consistency. Shows 'unverified'/'unknown' instead of fake numbers."""
+    try:
+        from harness import accounting_audit as _acct
+        return JSONResponse({
+            "audit": _safe(lambda: _acct.audit_accounting(), {"status": "error"}),
+            "gate2": _safe(lambda: _acct.gate2_status(), {"status": "unknown"}),
+            "journal": _safe(lambda: _acct.journal_consistency(), {"status": "unknown"}),
+            "paper_only": True,
+        })
+    except Exception as e:
+        return JSONResponse({"error": f"accounting unavailable: {e}", "paper_only": True})
 
 
 @app.get("/api/command_center")

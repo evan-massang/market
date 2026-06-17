@@ -265,10 +265,16 @@ def evaluate(db_path=None, write_log=True):
     gate1_pass = bool(
         n >= GATE1_MIN_N and model_b is not None and market_b is not None and model_b < market_b
     )
-    # GATE 2 — profitability (identical predicate to scoreboard.compute)
-    gate2_pass = bool(
-        wallet["realized_pnl"] > 0 and wallet["equity"] >= wallet["starting_bankroll"]
-    )
+    # GATE 2 — profitability READINESS (Plan 9: unified, FAIL-CLOSED). Read-only; same DB path.
+    # The old predicate (realized>0 AND at-cost equity>=start) could pass on stale/at-cost
+    # numbers with too few trades and no baseline/CLV — now it is the accounting-audited gate.
+    try:
+        from harness import accounting_audit as _acct
+        _g2 = _acct.gate2_status(db_path=path)
+        gate2_pass = bool(_g2["pass"])
+        gate2_status_s, gate2_reasons = _g2["status"], _g2["reasons"]
+    except Exception as _e:
+        gate2_pass, gate2_status_s, gate2_reasons = False, "unknown", ["gate2_accounting_unverified"]
     overall_pass = bool(gate1_pass and gate2_pass)
 
     verdict = {
@@ -279,6 +285,8 @@ def evaluate(db_path=None, write_log=True):
         "paper_pnl": wallet["realized_pnl"],
         "gate1_pass": gate1_pass,
         "gate2_pass": gate2_pass,
+        "gate2_status": gate2_status_s,
+        "gate2_reasons": gate2_reasons,
         "overall_pass": overall_pass,
         # context (not part of the criterion-5 field set, but useful + harmless)
         "baseline_brier_mean": baseline_b,

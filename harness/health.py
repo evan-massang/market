@@ -56,7 +56,7 @@ def snapshot():
     # Table names confirmed against `sqlite3 polyswarm.db '.tables'`; timestamp COLUMNS corrected
     # to the real schema (paper_positions has no created_at -> opened_at; decisions -> ts). The
     # swarm's market-level forecasts live in swarm_forecasts (one row per swarm forecast).
-    return {
+    snap = {
         "ts": time.time(),
         "ollama": ollama_health(),
         "mirofish_backend": mirofish_health(),
@@ -68,7 +68,21 @@ def snapshot():
             "paper_position": _age(_last_row_ts("paper_positions", "opened_at")),
             "decision":       _age(_last_row_ts("decisions", "ts")),
         },
+        "paper_only": True,
     }
+    # Plan 9: ACCOUNTING TRUTH. Service-liveness alone must not paint the badge green — the
+    # health card distinguishes "service alive" + "data fresh" from "accounting VERIFIED".
+    # Read-only, best-effort (an audit fault is reported as unverified, never as healthy).
+    try:
+        from harness import accounting_audit as _acct
+        a = _acct.audit_accounting()
+        snap["accounting"] = {"status": a["status"], "verified": bool(a["ok"]),
+                              "drift": a["drift"], "mark_stale_count": a["mark_stale_count"],
+                              "reasons": a["reasons"]}
+    except Exception as e:
+        snap["accounting"] = {"status": "unknown", "verified": False, "reasons": ["accounting_unavailable"],
+                              "error": str(e)}
+    return snap
 
 if __name__ == "__main__":
     import json; print(json.dumps(snapshot(), indent=2, default=str))

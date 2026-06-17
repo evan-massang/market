@@ -34,6 +34,16 @@ def _insert(question, market_id, p, outcome, market_odds):
     conn.close()
 
 
+def _baseline(question, market_id, brier):
+    conn = sqlite3.connect(os.environ["DATABASE_URL"])
+    conn.execute("CREATE TABLE IF NOT EXISTS baseline_forecasts ("
+                 "id INTEGER PRIMARY KEY AUTOINCREMENT, question TEXT, market_id TEXT, brier_score REAL)")
+    conn.execute("INSERT INTO baseline_forecasts (question, market_id, brier_score) VALUES (?,?,?)",
+                 (question, market_id, brier))
+    conn.commit()
+    conn.close()
+
+
 def _set_wallet(cash, realized):
     conn = sqlite3.connect(os.environ["DATABASE_URL"])
     conn.execute("UPDATE paper_wallet SET cash=?, realized_pnl=? WHERE id=1", (cash, realized))
@@ -44,7 +54,7 @@ def _set_wallet(cash, realized):
 def _rebuild():
     conn = sqlite3.connect(os.environ["DATABASE_URL"])
     for t in ("swarm_forecasts", "forecasts", "baseline_forecasts",
-              "paper_wallet", "paper_positions"):
+              "paper_wallet", "paper_positions", "clv_records"):
         conn.execute(f"DROP TABLE IF EXISTS {t}")
     conn.commit()
     conn.close()
@@ -57,16 +67,28 @@ def _rebuild():
     # 2 MECHANICAL rows that MUST be excluded from the opinion gate:
     _insert("Will Bitcoin close above $100k?", "MECH-1", 0.30, 0.0, 0.40)
     _insert("Will the Fed cut interest rates?", "MECH-2", 0.20, 0.0, 0.35)
-    # >= GATE2_MIN_N settled paper positions so Gate 2 has a real sample (audit floor):
+    # Plan 9: a genuinely GATE-2-READY paper book —
+    #   * >= GATE2_MIN_N settled positions, ledger-consistent (payout set so cash reconciles),
+    #   * spanning > GATE2_MIN_DAYS calendar days,
+    #   * a baseline (single-LLM) comparison present, and
+    #   * >= 5 fresh CLV records — so the FAIL-CLOSED Gate 2 can legitimately PASS.
     conn2 = sqlite3.connect(os.environ["DATABASE_URL"])
-    for i in range(SB.GATE2_MIN_N + 2):
+    for i in range(SB.GATE2_MIN_N + 2):       # stake 10, win -> payout 12.5, realized +2.5
         conn2.execute(
             "INSERT INTO paper_positions (market_id, question, side, model_p, market_p, edge, stake, "
-            "fill_price, shares, fee, status, outcome, realized_pnl, settled_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?, 'settled', ?, ?, ?)",
-            (f"P-{i}", "Q", "YES", 0.7, 0.5, 0.2, 10.0, 0.51, 19.6, 0.0, 1.0, 2.5, "2026-06-10T00:00:00"))
+            "fill_price, shares, fee, status, outcome, payout, realized_pnl, settled_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?, 'settled', ?, ?, ?, ?)",
+            (f"P-{i}", "Q", "YES", 0.7, 0.5, 0.2, 10.0, 0.51, 19.6, 0.0, 1.0, 12.5, 2.5,
+             f"2026-05-{(i % 28) + 1:02d}T00:00:00"))
     conn2.commit(); conn2.close()
-    _set_wallet(1080.0, 80.0)   # bankroll grew (Gate 2 pass)
+    # baseline (single-LLM) resolved opinion Briers -> baseline comparison exists
+    for i in range(3):
+        _baseline(f"Will candidate {i} win the 2028 election?", f"BL-{i}", 0.12)
+    # fresh CLV records (YES bought at 0.50, closed 0.55 -> +0.05) -> CLV verified
+    from harness import clv as _clv
+    for i in range(8):
+        _clv.record_clv(f"CL-{i}", "YES", 0.50, 0.55, theme="elections")
+    _set_wallet(1080.0, 80.0)   # bankroll grew; ledger-consistent (1000 - 320 + 400 = 1080)
 
 
 def test_theme_and_brier_properties_pure():
