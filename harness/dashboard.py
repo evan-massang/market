@@ -203,13 +203,31 @@ def api_mirofish_runs(market_id: str = "", limit: int = 25):
     can see when MiroFish was stale/skipped vs actually contributing."""
     try:
         from harness import mirofish_validate as mfv
+        from harness import mirofish_status as mfs
         runs = _safe(lambda: mfv.get_runs(market_id or None, limit), [])
         for r in runs:
-            r["label"] = "FRESH" if r.get("usable") else (r.get("freshness_status") or "?").upper()
-            r["fed_to_swarm"] = bool(r.get("usable"))
+            # Plan 8: two DISTINCT, honest signals.
+            #  * mirofish_used = the IMMUTABLE historical fact — was this run fresh, market-
+            #    matched, verifiable, terminal-stage, and actually fed to the swarm? Derived
+            #    from the same state machine the decision used; never flips after the fact.
+            #  * stale_now = is the report STILL fresh right now (re-aged vs current MAX_AGE)?
+            #    A separate display signal so a once-used report that has since aged is shown
+            #    honestly ("used, now stale") without rewriting the historical contribution.
+            r["state"] = mfs.state_from_row(r)
+            r["mirofish_used"] = (r["state"] == mfs.FRESH_USED)
+            r["fed_to_swarm"] = r["mirofish_used"]
+            r["stale_now"] = mfs.is_stale_now(r)
+            r["label"] = ("FRESH" if (r["mirofish_used"] and not r["stale_now"])
+                          else (r.get("freshness_status") or "?").upper())
+        used = sum(1 for r in runs if r["mirofish_used"])
         usable = sum(1 for r in runs if r.get("usable"))
-        return JSONResponse({"runs": runs, "n": len(runs), "usable": usable,
-                             "unusable": len(runs) - usable, "config": mfv.config()})
+        return JSONResponse({"runs": runs, "n": len(runs), "used": used, "usable": usable,
+                             "unusable": len(runs) - usable, "config": mfv.config(),
+                             "note": "mirofish_used = was this run actually fed to the swarm "
+                                     "(fresh, market-matched, verifiable, completed). It is a "
+                                     "historical fact and never flips. stale_now = whether the "
+                                     "report is still fresh right now. Backend liveness is NOT a "
+                                     "contribution."})
     except Exception as e:
         return JSONResponse({"error": f"mirofish runs unavailable: {e}", "runs": []})
 

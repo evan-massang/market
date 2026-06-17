@@ -25,6 +25,7 @@ except Exception:
 
 from harness import gamma, classifier, sizing, wallet, journal, challenger, scanner, event_portfolio
 from harness import event_safety as _esafe   # Plan 6: event-basket EXECUTION safety policy
+from harness import mirofish_status as _mfstatus   # Plan 8: canonical MiroFish contribution states
 # P6 — skill-weighted forecaster blend + gated calibration + versioned forecast record.
 # All three are HARD cold-start passthroughs (see the blend/calibrate site in predict_one).
 from harness import calibration_apply, forecast_versions
@@ -439,14 +440,37 @@ def _p_mirofish_gate(m, pack):
         from harness import mirofish_validate as _mfv
         mode = _mfv.config()["MODE"]
     except Exception:
-        return True, "ok"
+        # FAIL CLOSED (Plan 1 money-gate contract): if the MiroFish config tooling is broken
+        # and a fresh used result is REQUIRED to bet, its absence must BLOCK — never silently
+        # allow. Determine the requirement with a BULLETPROOF inline env read (no nested call
+        # that could re-raise and fall through to a fail-OPEN); ANY uncertainty -> assume
+        # required -> block.
+        try:
+            req = ((os.getenv("MIROFISH_REQUIRED_FOR_BET", "").strip().lower() in ("1", "true", "yes", "on"))
+                   or (os.getenv("MIROFISH_MODE", "").strip().lower() == "required"))
+        except Exception:
+            req = True   # cannot even read the requirement -> fail closed
+        return (False, "mirofish_config_unavailable_no_bet") if req else (True, "ok")
+    # Plan 8: REQUIRED MiroFish that is not used -> a SPECIFIC canonical no-bet reason
+    # (mirofish_required_stale/pending/failed/market_mismatch/..._no_bet). Bridges both the
+    # legacy MIROFISH_MODE=required and the new MIROFISH_REQUIRED_FOR_BET flag.
+    required = (mode == "required") or _mfstatus.required_for_bet()
+    # CRITICAL ordering: the required-mode check MUST come BEFORE the off/disabled early-out.
+    # Otherwise MIROFISH_REQUIRED_FOR_BET=true + USE_MIROFISH=false (MiroFish off) would let a
+    # bet through with NO MiroFish at all — required absence must FAIL CLOSED, not be ignored.
     if not USE_MIROFISH or mode == "off":
+        if required:
+            st = m.get("_mirofish")
+            reason = (_mfstatus.required_no_bet_reason(st) if isinstance(st, dict) else None)
+            return False, (reason or "mirofish_required_unavailable_no_bet")
         return True, "ok"
     if m.get("_mf_usable"):
         return True, "ok"
     status = m.get("_mf_status") or "unusable"
-    if mode == "required":
-        return False, f"mirofish_required_unusable:{status}"
+    if required:
+        st = m.get("_mirofish")
+        reason = (_mfstatus.required_no_bet_reason(st) if isinstance(st, dict) else None)
+        return False, (reason or f"mirofish_required_unavailable_no_bet:{status}")
     if mode == "degraded":
         eq = getattr(pack, "evidence_quality", None) if pack is not None else None
         if eq is not None and eq >= MIROFISH_DEGRADED_MIN_EVIDENCE:
@@ -895,23 +919,40 @@ def predict_one(m, cfg):
         #       swarm, and MIROFISH_MODE decides whether an unusable report blocks the bet).
         from harness import mirofish_validate as _mfv
         _mf_mode = _mfv.config()["MODE"]
+        _mf_required = _mfstatus.required_for_bet()
         m["_mf_status"], m["_mf_usable"], m["_mf_reason"] = "skipped", None, "not run"
         m["_mf_sim_id"], m["_mf_report_hash"], m["_mf_n_posts"], m["_mf_age"] = None, None, 0, None
         if not USE_MIROFISH or getattr(cfg, "dry_run", False) or _mf_mode == "off":
-            if _mf_mode == "off":
-                m["_mf_status"], m["_mf_reason"] = "disabled", "mirofish_disabled (MIROFISH_MODE=off)"
-                print("\n[2.5] REPORT — MiroFish DISABLED (MIROFISH_MODE=off)", flush=True)
+            # Plan 8: explicit DISABLED canonical state (never silently "healthy").
+            _mf_st = _mfstatus.disabled(required=_mf_required)
+            if _mf_mode == "off" or not USE_MIROFISH:
+                m["_mf_status"], m["_mf_reason"] = "disabled", "mirofish_disabled"
+                print("\n[2.5] REPORT — MiroFish DISABLED", flush=True)
         else:
             _mfres = _mirofish_report(q, mid, price, run_id=(obs.current().get("run_id") if obs else None))
+            # Plan 8: the canonical contribution decision is allow_decision_use (fresh +
+            # VERIFIABLE + market-matched + complete). The report is appended to the swarm
+            # ⟺ allow_decision_use ⟺ mirofish_used — one consistent criterion. A stale /
+            # weak / pending / wrong-market / failed / unverifiable report is NEVER appended.
+            _mf_st = _mfstatus.from_result(_mfres, required=_mf_required, consumed=False)
+            if _mf_st["allow_decision_use"]:      # ONLY a fresh, verifiable, market-specific report feeds the swarm
+                mf = _render_mf_text(_mfres)
+                enr = (enr + "\n\n" + mf) if enr else mf
+                _mf_st = _mfstatus.mark_used(_mf_st, contribution="context_only")
             m["_mf_status"] = _mfv.status_label(_mfres)
-            m["_mf_usable"] = _mfres.usable
+            m["_mf_usable"] = _mf_st["allow_decision_use"]   # canonical (not the raw validator usable)
             m["_mf_reason"] = "; ".join(_mfres.warnings) if _mfres.warnings else ("usable" if _mfres.usable else "")
             m["_mf_sim_id"], m["_mf_report_hash"] = _mfres.simulation_id, _mfres.report_markdown_hash
             m["_mf_n_posts"], m["_mf_age"] = _mfres.n_posts, _mfres.report_age_seconds
-            if _mfres.usable:                     # ONLY a fresh, market-specific report feeds the swarm
-                mf = _render_mf_text(_mfres)
-                enr = (enr + "\n\n" + mf) if enr else mf
-            # a stale/weak/failed report is NEVER appended (no silent pretend-success).
+        # Plan 8: the canonical, honest MiroFish contribution metadata for the decision/journal/obs.
+        m["_mirofish"] = _mf_st
+        m["_mirofish_used"] = _mf_st["mirofish_used"]
+        m["_mirofish_state"] = _mf_st["state"]
+        m["_mirofish_reason"] = _mf_st["reason"]
+        m["_mirofish_contribution"] = _mf_st["contribution"]
+        m["_mirofish_required"] = _mf_st["required"]
+        print(f"      MiroFish contribution: state={_mf_st['state']} used={_mf_st['mirofish_used']} "
+              f"contribution={_mf_st['contribution']} required={_mf_st['required']}", flush=True)
 
         # 3 — THINK (the swarm LLM processes the gathered data + the crowd report)
         print(f"\n[3/4] THINK — {cfg.swarm_size}-persona swarm forecasting WITH that data (slow on CPU)…", flush=True)

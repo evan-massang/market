@@ -48,6 +48,13 @@ KNOWN = {
     "MIROFISH_REQUIRE_PROBABILITY": (False, True, "require a probability"),
     "MIROFISH_MATCH_THRESHOLD": (False, True, "question-match threshold"),
     "MIROFISH_DEGRADED_MIN_EVIDENCE": (False, True, "evidence floor for degraded betting"),
+    # Plan 8 — MiroFish freshness + contribution honesty
+    "MIROFISH_REQUIRED_FOR_BET": (False, True, "require a fresh used MiroFish result to bet (default false)"),
+    "MIROFISH_MAX_AGE_SECONDS": (False, True, "max MiroFish result age (default 900)"),
+    "MIROFISH_WAIT_TIMEOUT_SECONDS": (False, True, "wait for a MiroFish result (default 0 = fire-and-forget)"),
+    "MIROFISH_MIN_SIMS": (False, True, "min crowd posts/sims for a usable result"),
+    "MIROFISH_ALLOW_STALE_FOR_DISPLAY": (False, True, "show stale MiroFish as historical (default true)"),
+    "MIROFISH_ALLOW_STALE_FOR_BET": (False, True, "never bet on stale MiroFish (default false)"),
     "MF_WAIT": (False, True, "mirofish max wait seconds"),
     "CROWD_ROUNDS": (False, True, "local crowd fallback rounds"),
     # supervisor

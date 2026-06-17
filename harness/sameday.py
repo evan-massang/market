@@ -25,6 +25,7 @@ except Exception:
     pass
 
 from harness import gamma, classifier, wallet, journal, sizing, challenger, scanner
+from harness import mirofish_status as _mfstatus   # Plan 8: canonical MiroFish contribution states
 # P6 — same skill-weighted blend + gated calibration + versioned record as predict_today.
 # All three are HARD cold-start passthroughs (see _ai_scout): final_p == swarm p today.
 from harness import calibration_apply, forecast_versions
@@ -220,9 +221,11 @@ def _ai_scout(market, price, evidence_text: str = ""):
             "n_agents_succeeded": res.get("n_agents_succeeded"),
             "n_agents_failed": res.get("n_agents_failed"),
             "degradation_reason": res.get("degradation_reason"),
-            # Plan 5 honesty: the forecast saw the evidence pack; MiroFish was launch-only.
+            # Plan 5/8 honesty: the forecast saw the evidence pack; MiroFish is launch-only
+            # (fire-and-forget) — its result is NEVER read into this decision.
             "evidence_used": bool(evidence_text),
             "mirofish_used": False,
+            "mirofish_state": "launch_only_not_used",
         }
         return sp, bp, cons, final_p, health
     except Exception as e:
@@ -351,6 +354,15 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                 if not _sh_ok:
                     _sd_skip(mid, q, _sh_reason(_sh_r, health or {}), p=p, price=price, layer="swarm_health")
                     continue
+                # ── Plan 8: if MiroFish is REQUIRED to bet, same-day cannot satisfy it — its
+                #    MiroFish is launch-only (fire-and-forget; never read back into a decision),
+                #    so block honestly. Optional MiroFish (default) does not gate same-day. ──
+                if _mfstatus.required_for_bet():
+                    _mf_st = _mfstatus.launch_only(market_id=mid, question=q, required=True)
+                    _mf_r = _mfstatus.required_no_bet_reason(_mf_st, prefix="sameday_")
+                    if _mf_r:
+                        _sd_skip(mid, q, _mf_r, p=p, price=price, layer="mirofish")
+                        continue
                 # P4B OBSERVE-ONLY (audit #4): the forecast above is logged for scoring,
                 # but if this market's label has a real losing track record, WITHHOLD the
                 # bet — mirror predict_today so both daemons freeze a losing label.

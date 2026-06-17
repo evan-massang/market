@@ -111,10 +111,10 @@ def _gate(mode, usable, eq=None, use_mf=True):
         return PT._p_mirofish_gate(m, pack)
 
 
-# 9. required mode blocks the bet when MiroFish is unusable
+# 9. required mode blocks the bet when MiroFish is unusable (Plan 8 canonical reason)
 def test_required_mode_blocks_unusable():
     ok, reason = _gate("required", usable=False)
-    assert ok is False and "mirofish_required_unusable" in reason
+    assert ok is False and "mirofish_required" in reason and "no_bet" in reason
 
 
 # 10. degraded mode: blocks on weak evidence, continues on strong evidence
@@ -125,11 +125,13 @@ def test_degraded_mode_evidence_gated():
     assert ok_strong is True
 
 
-# 11. off mode never blocks; usable always passes
+# 11. off mode never blocks; usable always passes; required + MiroFish OFF fails CLOSED
 def test_off_and_usable_pass():
     assert _gate("off", usable=False)[0] is True
     assert _gate("required", usable=True)[0] is True
-    assert _gate("required", usable=False, use_mf=False)[0] is True   # mirofish not on
+    assert _gate("off", usable=False, use_mf=False)[0] is True          # off + mirofish off -> allow
+    # Plan 8 (adversarial fix): REQUIRED + MiroFish off must BLOCK, never silently allow.
+    assert _gate("required", usable=False, use_mf=False)[0] is False
 
 
 TESTS = [

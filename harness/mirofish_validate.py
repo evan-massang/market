@@ -28,6 +28,14 @@ def _f(name, default):
         return float(default)
 
 
+def _valid_threshold() -> float:
+    # the question-match gate may only be made STRICTER than the vetted default 0.30, never
+    # weaker: out-of-range OR tiny-positive values (which would silently disable the gate)
+    # fall back to / are floored at the default. Effective threshold is always in [0.30, 1.0].
+    v = _f("MIROFISH_MATCH_THRESHOLD", 0.30)
+    return max(v, 0.30) if 0.0 < v <= 1.0 else 0.30
+
+
 def config() -> dict:
     return {
         "FORCE_FRESH": _flag("MIROFISH_FORCE_FRESH", True),
@@ -38,7 +46,7 @@ def config() -> dict:
         "REQUIRE_QUESTION_MATCH": _flag("MIROFISH_REQUIRE_QUESTION_MATCH", True),
         "REQUIRE_PROBABILITY": _flag("MIROFISH_REQUIRE_PROBABILITY", False),
         "MODE": (os.getenv("MIROFISH_MODE", "degraded") or "degraded").strip().lower(),
-        "MATCH_THRESHOLD": _f("MIROFISH_MATCH_THRESHOLD", 0.30),
+        "MATCH_THRESHOLD": _valid_threshold(),
     }
 
 
@@ -175,7 +183,12 @@ def validate(result: MiroFishResult, cfg: dict | None = None, now_iso: str | Non
             result.report_age_seconds = round((now - gen).total_seconds(), 1)
         except Exception:
             result.report_age_seconds = None
-        if req is not None and gen < req:
+        if result.report_age_seconds is not None and result.report_age_seconds < -120.0:
+            # generated well in the FUTURE (beyond benign clock skew / sub-second truncation)
+            # -> spoofed/invalid timestamp, unverifiable, reject
+            result.freshness_status = "stale"
+            w.append("report timestamp is in the future (invalid/unverifiable)")
+        elif req is not None and gen < req:
             result.freshness_status = "stale"
             w.append("report generated BEFORE this request started (reused/stale)")
         elif result.report_age_seconds is not None and result.report_age_seconds > cfg["MAX_AGE"]:
@@ -202,8 +215,19 @@ def validate(result: MiroFishResult, cfg: dict | None = None, now_iso: str | Non
     if cfg["REQUIRE_PROBABILITY"] and result.crowd_probability is None:
         w.append("probability required but extraction failed")
 
+    # an incomplete simulation is NOT a completed result, regardless of any filler text it
+    # carries — a not-yet-finished sim can never be usable (defends the recorded `usable`
+    # column and the dashboard, which both key off it). WHITELIST the terminal stages only
+    # (mirofish.py ends at report_done / probability_extracted): any other stage — including
+    # sim_running, sim_done, or an empty/unknown stage — is incomplete.
+    _stage = (result.stage_reached or "").strip().lower()
+    _incomplete = _stage not in ("report_done", "probability_extracted")
+    if _incomplete:
+        w.append(f"incomplete simulation (stage={_stage or 'unknown'}) — not a completed result")
+
     usable = (
-        result.freshness_status == "fresh"
+        not _incomplete
+        and result.freshness_status == "fresh"
         and bool(result.simulation_id)
         and (has_report or has_posts)
         and not (cfg["REQUIRE_QUESTION_MATCH"] and result.question_match_score < cfg["MATCH_THRESHOLD"])
@@ -249,10 +273,21 @@ def init_runs_db(conn: sqlite3.Connection | None = None) -> None:
                 report_age_seconds REAL, project_id TEXT, simulation_id TEXT, report_id TEXT,
                 report_hash TEXT, crowd_probability REAL, n_posts INTEGER, report_chars INTEGER,
                 ok INTEGER, usable INTEGER, degraded INTEGER, freshness_status TEXT,
+                stage_reached TEXT, min_sims_used REAL, match_threshold_used REAL,
                 question_match_score REAL, error TEXT, warnings_json TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mfruns_mkt ON mirofish_runs(market_id)")
+        # forward-migrations (additive + idempotent): older DBs lack stage_reached (so the
+        # dashboard can tell a pending sim from a completed one) and the FROZEN decision-time
+        # thresholds (so a historical run's used-flag never flips when config later changes).
+        for _col, _type in (("stage_reached", "TEXT"),
+                            ("min_sims_used", "REAL"),
+                            ("match_threshold_used", "REAL")):
+            try:
+                conn.execute(f"ALTER TABLE mirofish_runs ADD COLUMN {_col} {_type}")
+            except Exception:
+                pass   # already present
         conn.commit()
     except Exception:
         pass
@@ -266,6 +301,21 @@ def init_runs_db(conn: sqlite3.Connection | None = None) -> None:
 
 def record_run(result: MiroFishResult, forecast_id: str | None = None) -> bool:
     import json
+    # FREEZE the decision-time contribution thresholds the canonical state machine uses, so a
+    # later config change can never flip this run's historical mirofish_used on the dashboard.
+    try:
+        from harness import mirofish_status as _mfs
+        _min_sims, _match_thr = float(_mfs.min_sims()), float(_mfs._match_threshold())
+    except Exception:
+        # NEVER leave the frozen thresholds null on a new row — that would make state_from_row
+        # fall back to live config and let the historical used-flag flip. Replicate the
+        # canonical defaults directly from env so a new row is always self-describing.
+        try:
+            _ms = os.getenv("MIROFISH_MIN_SIMS") or os.getenv("MIROFISH_MIN_POSTS") or "3"
+            _min_sims = float(int(float(_ms)))
+        except Exception:
+            _min_sims = 3.0
+        _match_thr = _valid_threshold()
     try:
         conn = sqlite3.connect(_db_path())
         init_runs_db(conn)
@@ -273,15 +323,17 @@ def record_run(result: MiroFishResult, forecast_id: str | None = None) -> bool:
             """INSERT INTO mirofish_runs (market_id, forecast_id, question, question_hash,
                requested_at, completed_at, report_generated_at, report_age_seconds, project_id,
                simulation_id, report_id, report_hash, crowd_probability, n_posts, report_chars,
-               ok, usable, degraded, freshness_status, question_match_score, error, warnings_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               ok, usable, degraded, freshness_status, stage_reached, min_sims_used,
+               match_threshold_used, question_match_score, error, warnings_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (result.market_id, forecast_id, result.question, result.question_hash,
              result.requested_at, result.completed_at, result.report_generated_at,
              result.report_age_seconds, result.project_id, result.simulation_id, result.report_id,
              result.report_markdown_hash, result.crowd_probability, result.n_posts,
              len(result.report_markdown or ""), int(result.ok), int(result.usable),
-             int(result.degraded), result.freshness_status, result.question_match_score,
-             result.error, json.dumps(result.warnings)))
+             int(result.degraded), result.freshness_status, result.stage_reached,
+             _min_sims, _match_thr,
+             result.question_match_score, result.error, json.dumps(result.warnings)))
         conn.commit(); conn.close()
         return True
     except Exception:
