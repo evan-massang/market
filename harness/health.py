@@ -58,6 +58,7 @@ def snapshot():
     # swarm's market-level forecasts live in swarm_forecasts (one row per swarm forecast).
     snap = {
         "ts": time.time(),
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "ollama": ollama_health(),
         "mirofish_backend": mirofish_health(),
         "daemon": heartbeat_health(),
@@ -82,6 +83,24 @@ def snapshot():
     except Exception as e:
         snap["accounting"] = {"status": "unknown", "verified": False, "reasons": ["accounting_unavailable"],
                               "error": str(e)}
+    # Plan 10: per-daemon HONEST heartbeat — the OLD `daemon` field uses MAX(mtime) which masks
+    # one stale daemon when the other is fresh. The structured per-daemon read can never mask a
+    # dead/stale daemon (a heartbeat whose PID is gone -> crashed, not fresh).
+    try:
+        from harness import heartbeat as _hb
+        snap["daemons"] = {
+            "ai_pipeline": _hb.read(path=HEARTBEAT, max_age_seconds=900.0),
+            "sameday_daemon": _hb.read(path=os.getenv("SAMEDAY_HEARTBEAT", ".heartbeat.sameday.json"),
+                                       max_age_seconds=600.0),
+        }
+    except Exception:
+        snap["daemons"] = {}
+    # Plan 10: code version / branch / commit (None when git is unavailable; never raises).
+    try:
+        from harness import status_model as _sm
+        snap["version"] = _sm.version_info()
+    except Exception:
+        snap["version"] = {}
     return snap
 
 if __name__ == "__main__":

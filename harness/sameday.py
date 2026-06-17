@@ -569,18 +569,37 @@ def run_once(use_ai=True):
             obs.hooks.on_run_end({"bets": n, "open": st["n_open"]})
 
 
+def _sameday_hb(stage, *, last_error=None, loop_count=None):
+    """Plan 10: structured, honest heartbeat for the sameday daemon. Best-effort."""
+    try:
+        import os as _os
+        from harness import heartbeat as _hb
+        _hb.write("sameday_daemon",
+                  path=_os.getenv("SAMEDAY_HEARTBEAT", ".heartbeat.sameday.json"),
+                  stage=stage, last_error=last_error, loop_count=loop_count, paper_only=True,
+                  config_flags={"use_ai": True, "paper_only": True})
+    except Exception:
+        pass
+
+
 def daemon(interval=INTERVAL, use_ai=True):
     print(f"[sameday] DAEMON — same-day only, SWARM-DRIVEN bets (opinion-only, 1/event), "
           f"every {interval/60:.0f} min. No stopping.\n")
+    _loop = 0
+    _sameday_hb("starting", loop_count=0)
     while True:
+        _loop += 1
+        _err = None
         try:
             run_once(use_ai=use_ai)
         except KeyboardInterrupt:
             print("[sameday] stopped."); return
         except Exception as e:
+            _err = f"{type(e).__name__}: {e}"
             if obs:
                 obs.hooks.on_error(where="sameday.daemon", exc=e, action="retry")
             print("[sameday] cycle error:", e)
+        _sameday_hb("error" if _err else "cycle", last_error=_err, loop_count=_loop)
         time.sleep(interval)
 
 

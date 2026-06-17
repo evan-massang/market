@@ -121,7 +121,8 @@ class Service:
     depends_on: list = field(default_factory=list)
     http_url: str | None = None      # startup waits for HTTP 2xx; live status uses it
     port: int | None = None          # else startup waits for TCP; live status uses it
-    heartbeat_path: str | None = None
+    heartbeat_path: str | None = None       # liveness signal (file mtime) for the supervisor
+    hb_json: str | None = None               # Plan 10: STRUCTURED heartbeat JSON (stage/last_error/…)
     heartbeat_max_age: float = 600.0
     start_timeout: float = 30.0      # seconds to become healthy after spawn
     restart: bool = True             # eligible for watcher auto-restart
@@ -199,6 +200,7 @@ def registry(cfg: dict | None = None) -> list[Service]:
             # under the supervisor, sameday's stdout goes to its .runtime log (not the
             # old launcher's sameday_live.log) — that log's mtime is the liveness signal.
             heartbeat_path=os.path.join(LOGS, "sameday_daemon.log"), heartbeat_max_age=600.0,
+            hb_json=os.path.join(PKG_ROOT, ".heartbeat.sameday.json"),   # Plan 10 structured heartbeat
             start_timeout=20.0, env=common_env,
             note="same-day favorite-longshot + AI scout daemon"),
         Service(
@@ -208,6 +210,7 @@ def registry(cfg: dict | None = None) -> list[Service]:
             cwd=PKG_ROOT, enabled=cfg["RUN_AI_PIPELINE"], required=True, manage=True, order=5,
             depends_on=["mirofish_backend"] if cfg["RUN_MIROFISH"] else [],
             heartbeat_path=os.path.join(PKG_ROOT, ".heartbeat.json"), heartbeat_max_age=900.0,
+            hb_json=os.path.join(PKG_ROOT, ".heartbeat.json"),          # Plan 10: same file, structured now
             start_timeout=20.0, env={**common_env, "DASH_STREAM_LOG": "ai_night.log"},
             note="precise FIND->GATHER->MiroFish->LLM->BET pipeline"),
     ]

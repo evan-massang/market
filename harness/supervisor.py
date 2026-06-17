@@ -24,6 +24,7 @@ import time
 from datetime import datetime, timezone
 
 from harness import procman, services
+from harness import status_model as _sm
 from harness.services import (RUNTIME, PIDS, LOGS, HEARTBEATS, STATUS_JSON, STOP_FLAG)
 
 DISABLED_DIR = os.path.join(RUNTIME, "disabled")
@@ -126,6 +127,51 @@ def _write_status(svcs, supervisor_pid=None):
     return data
 
 
+def _service_hb_canon(svc, alive):
+    """Plan 10: a canonical heartbeat read for a managed, alive service. Prefers the STRUCTURED
+    hb_json (stage/last_error/pid) and falls back to the supervisor's liveness file mtime.
+    Returns (heartbeat_dict_or_None, age_seconds_or_None)."""
+    if not (svc.manage and alive):
+        return None, None
+    # 1) structured heartbeat the SERVICE writes itself (richest signal)
+    if getattr(svc, "hb_json", None):
+        try:
+            from harness import heartbeat as _hbmod
+            # check_pid=True: a heartbeat whose recorded process is gone is CRASHED immediately
+            # (don't wait out the staleness window — narrows the PID-reuse/stale-file gap).
+            hbr = _hbmod.read(path=svc.hb_json, max_age_seconds=svc.heartbeat_max_age, check_pid=True)
+            return hbr, hbr.get("age_seconds")
+        except Exception:
+            # a service that DECLARES a structured heartbeat but whose heartbeat we cannot read
+            # must NOT silently fall back to an mtime-only "healthy" — that would trust a file
+            # timestamp without verifying fresh work. Unverifiable -> unknown.
+            return {"state": _sm.UNKNOWN, "reason": "heartbeat_read_error", "stale": True}, None
+    # 2) plain liveness file (mtime only) -> fresh/stale (ONLY for services with no hb_json)
+    if svc.heartbeat_path:
+        try:
+            fresh, _d = services.heartbeat_fresh(svc.heartbeat_path, svc.heartbeat_max_age)
+            age = None
+            if os.path.exists(svc.heartbeat_path):
+                age = time.time() - os.path.getmtime(svc.heartbeat_path)
+            return ({"state": _sm.HEALTHY if fresh else _sm.STALE,
+                     "reason": "heartbeat_ok" if fresh else "heartbeat_stale",
+                     "stale": (not fresh)}, age)
+        except Exception:
+            pass
+    return None, None
+
+
+def _canonical(svc, row):
+    """Map a status row to the canonical (state, reason, age_seconds, stale). ADDITIVE — never
+    changes the existing OK/WARN/FAIL `status` or `alive` fields."""
+    hb_canon, age = _service_hb_canon(svc, bool(row.get("alive")))
+    state, reason = _sm.classify_service(
+        managed=bool(row.get("managed")), enabled=bool(row.get("enabled")), exists=svc.exists,
+        alive=row.get("alive"), supervisor_status=row.get("status"), heartbeat=hb_canon)
+    stale = bool(hb_canon.get("stale")) if (hb_canon and "stale" in hb_canon) else (state == _sm.STALE)
+    return state, reason, age, stale
+
+
 def _collect_status(svcs):
     out = []
     for svc in svcs:
@@ -150,7 +196,34 @@ def _collect_status(svcs):
                           "status": st, "detail": detail, "required": svc.required,
                           "restart_count": int(hb.get("restart_count", 0) or 0),
                           "started_at": hb.get("started_at"), "last_error": hb.get("last_error")}))
+    # Plan 10: ADD the canonical truth layer (state/reason/age/stale/paper_only) to every row,
+    # without touching the existing status/alive fields that callers/tests depend on.
+    for svc, row in out:
+        state, reason, age, stale = _canonical(svc, row)
+        row["state"] = state
+        row["reason"] = reason
+        row["age_seconds"] = (round(age, 1) if isinstance(age, (int, float)) else None)
+        row["stale"] = stale
+        row["paper_only"] = True
     return out
+
+
+def system_status(svcs=None) -> dict:
+    """Plan 10: ONE canonical system status from the supervisor's view. Supervisor-being-alive is
+    NOT counted as bot-healthy — a stale/crashed REQUIRED service drags the system off green."""
+    all_svcs = svcs if svcs is not None else services.registry()
+    rows = _collect_status(all_svcs)
+    components = [{"name": svc.name, "kind": "service", "state": row["state"],
+                  "critical": bool(svc.required and svc.manage)} for svc, row in rows]
+    sys_st = _sm.system_status(components)
+    sys_st["details"]["services"] = {svc.name: {"state": row["state"], "reason": row["reason"],
+                                                 "alive": row.get("alive"), "stale": row.get("stale"),
+                                                 "age_seconds": row.get("age_seconds"),
+                                                 "required": row.get("required")}
+                                     for svc, row in rows}
+    spid = procman.read_pid(_pid_path("supervisor"))
+    sys_st["details"]["supervisor_alive"] = bool(spid and procman.is_alive(spid))
+    return sys_st
 
 
 # ── spawn / startup ───────────────────────────────────────────────────────────--
@@ -363,18 +436,30 @@ def status(svcs=None, as_dict=False):
     all_svcs = svcs if svcs is not None else services.registry()
     rows = _collect_status(all_svcs)
     if as_dict:
-        return {"updated_at": _now(), "services": {s.name: r for s, r in rows}}
+        sysv = _sm.system_status([{"name": s.name, "kind": "service", "state": r["state"],
+                                   "critical": bool(s.required and s.manage)} for s, r in rows])
+        spid = procman.read_pid(_pid_path("supervisor"))
+        return {"updated_at": _now(), "paper_only": True,
+                "system_state": sysv["state"], "system_ok": sysv["ok"],
+                "supervisor_alive": bool(spid and procman.is_alive(spid)),
+                "services": {s.name: r for s, r in rows}}
     print("\nSYSTEM STATUS")
-    print("-" * 72)
+    print(f"{'STATE':<11}{'SERVICE':<20}{'PID':<10}EXPECTED  AGE      DETAIL / REASON")
+    print("-" * 92)
     for svc, r in rows:
-        st = r["status"]
-        pid = f"pid {r['pid']}" if r.get("pid") else ""
+        pid = f"pid {r['pid']}" if r.get("pid") else "-"
+        expected = ("required" if svc.required else "optional") if svc.manage else "external"
+        age = (f"{r['age_seconds']:.0f}s" if r.get("age_seconds") is not None else "-")
         rc = f" · restarts {r['restart_count']}" if r.get("restart_count") else ""
-        print(f"{st:<5} {svc.name:<20} {pid:<10} {r['detail']}{rc}")
+        err = f"  !{r['last_error']}" if r.get("last_error") else ""
+        print(f"{r['state']:<11}{svc.name:<20}{pid:<10}{expected:<10}{age:<9}{r['detail']}{rc}{err}")
     spid = procman.read_pid(_pid_path("supervisor"))
     watch = f"watcher pid {spid} (auto-restart on)" if (spid and procman.is_alive(spid)) else "watcher not running"
-    print("-" * 72)
-    print(f"supervisor: {watch}   ·   PAPER-ONLY")
+    sysv = _sm.system_status([{"name": s.name, "kind": "service", "state": r["state"],
+                               "critical": bool(s.required and s.manage)} for s, r in rows])
+    print("-" * 92)
+    print(f"supervisor: {watch}  ·  SYSTEM = {sysv['state'].upper()} "
+          f"(supervisor-alive != bot-healthy)  ·  PAPER-ONLY")
     return None
 
 

@@ -91,8 +91,13 @@ def api_state():
         st = paper.get_state()
     except Exception:
         st = {"starting_bankroll": 0, "cash": 0, "equity": 0, "realized_pnl": 0, "open_exposure": 0, "n_open": 0}
-    sb = scoreboard.compute()
-    snaps = journal.get_snapshots(500)
+    # Plan 10: a transient DB lock inside scoreboard.compute() must NOT 500 /api/state (which
+    # would leave the HTML showing the LAST, stale cards — e.g. a stale gate2=green). Guard it,
+    # and read every field with a safe default so a partial scoreboard never crashes the endpoint.
+    sb = _safe(lambda: scoreboard.compute(), {}) or {}
+    _g1 = sb.get("gate1") or {}
+    _g2 = sb.get("gate2") or {}
+    snaps = _safe(lambda: journal.get_snapshots(500), [])
     try:
         challenger_model = challenger.challenger_model_label()
         challenger_hosted = challenger._hosted_configured()
@@ -105,12 +110,12 @@ def api_state():
         "challenger_model": challenger_model,
         "challenger_hosted": challenger_hosted,
         "scoreboard": {
-            "n": sb["n"], "n_required": sb["n_required"],
-            "model_brier": sb["model_brier"], "market_brier": sb["market_brier"],
+            "n": sb.get("n", 0), "n_required": sb.get("n_required"),
+            "model_brier": sb.get("model_brier"), "market_brier": sb.get("market_brier"),
             "baseline_brier": sb.get("baseline_brier"), "baseline_n": sb.get("baseline_n", 0),
-            "gate1": sb["gate1"]["pass"], "gate2": sb["gate2"]["pass"],
-            "gate2_status": sb["gate2"].get("status"), "gate2_reasons": sb["gate2"].get("reasons"),
-            "themes": sb["themes"],
+            "gate1": _g1.get("pass"), "gate2": _g2.get("pass"),
+            "gate2_status": _g2.get("status"), "gate2_reasons": _g2.get("reasons"),
+            "themes": sb.get("themes") or {},
         },
         # Plan 9: accounting honesty — the card shows VERIFIED status + realized/unrealized/total
         # split + equity, or "unverified" instead of a fake number. paper_only is always explicit.
@@ -185,6 +190,177 @@ def _safe(fn, default):
         return default
 
 
+def _db_usable() -> bool:
+    """Plan 10: the DB is 'ok' only if it actually OPENS and answers a query — a present-but-
+    LOCKED/corrupt file is NOT ok (read-only handle, never creates the DB)."""
+    if not os.path.exists(DB_PATH):
+        return False
+    try:
+        c = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=1.0)
+        # read the schema (not a constant SELECT 1) so a corrupt/locked file actually fails.
+        c.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        c.close()
+        return True
+    except Exception:
+        return False
+
+
+def _envelope(*, state, reason="", source="", stale=False, paper_only=True, **data):
+    """Plan 10: the canonical truth envelope every dashboard card endpoint returns. ``ok`` is
+    green ONLY for ok/healthy; unknown/stale/degraded/drift are never green."""
+    from harness import status_model as _sm
+    out = {"generated_at": _sm.now_iso(), "stale": bool(stale), "paper_only": bool(paper_only),
+           "source": source, "state": state, "reason": reason or state,
+           "ok": state in ("ok", "healthy")}
+    out.update(data)
+    return out
+
+
+@app.get("/api/services")
+def api_services():
+    """Plan 10: per-service canonical truth (state/age/stale) + the SYSTEM state. A live process
+    is not 'healthy'; supervisor-alive is not 'bot-healthy'. Never 500s."""
+    try:
+        from harness import supervisor as _sup
+        d = _safe(lambda: _sup.status(as_dict=True),
+                  {"services": {}, "system_state": "unknown", "supervisor_alive": None})
+        return JSONResponse(_envelope(
+            state=d.get("system_state", "unknown"), reason="supervisor_status",
+            source="supervisor.status", stale=False, system_state=d.get("system_state"),
+            supervisor_alive=d.get("supervisor_alive"), services=d.get("services", {})))
+    except Exception as e:
+        return JSONResponse(_envelope(state="unknown", reason=f"supervisor_unavailable:{e}",
+                                      source="supervisor", services={}))
+
+
+@app.get("/api/scoreboard")
+def api_scoreboard():
+    """Plan 10: scoreboard card — realized/unrealized/total/equity (Plan 9 accounting), gates,
+    Brier, with accounting STATUS driving the card colour. Never 500s."""
+    sb = _safe(lambda: scoreboard.compute(), {})
+    acc = (sb.get("accounting") or {}) if isinstance(sb, dict) else {}
+    return JSONResponse(_envelope(
+        state=(acc.get("status") or "unknown"), reason="scoreboard", source="scoreboard.compute",
+        stale=(acc.get("status") not in ("ok",)),
+        data_generated_at=sb.get("generated_at"), n=sb.get("n"),
+        model_brier=sb.get("model_brier"), market_brier=sb.get("market_brier"),
+        gate1=sb.get("gate1"), gate2=sb.get("gate2"), accounting=acc, themes=sb.get("themes")))
+
+
+@app.get("/api/mirofish")
+def api_mirofish():
+    """Plan 10: MiroFish CONTRIBUTION card (Plan 8 canonical). Backend alive is NOT a contribution
+    — mirofish_used=true ONLY for a fresh, market-matched run actually fed to the swarm."""
+    try:
+        from harness import mirofish_validate as _mfv, mirofish_status as _mfs, health as _h
+        runs = _safe(lambda: _mfv.get_runs(None, 25), [])
+        for r in runs:
+            r["state"] = _safe(lambda r=r: _mfs.state_from_row(r), "unknown")
+            r["mirofish_used"] = (r["state"] == _mfs.FRESH_USED)
+            r["stale_now"] = _safe(lambda r=r: _mfs.is_stale_now(r), True)
+        used = sum(1 for r in runs if r.get("mirofish_used"))                       # historical fact
+        fresh_used = sum(1 for r in runs if r.get("mirofish_used") and not r.get("stale_now"))
+        backend = _safe(lambda: _h.mirofish_health(), {"up": False})
+        # GREEN only when MiroFish is CURRENTLY contributing: a fresh (not stale_now) used run AND
+        # the backend alive. A stale-but-historically-used run, or a dead backend, is not green.
+        if fresh_used > 0 and backend.get("up"):
+            state, reason = "ok", "mirofish_contributing"
+        elif backend.get("up"):
+            state, reason = "degraded", "backend_alive_not_fresh_contributing"
+        else:
+            state, reason = "unknown", "mirofish_unavailable"
+        return JSONResponse(_envelope(
+            state=state, reason=reason, source="mirofish_status",
+            backend_alive=bool(backend.get("up")), used=used, fresh_used=fresh_used,
+            n=len(runs), runs=runs,
+            note="backend liveness is NOT a contribution; green needs a FRESH used run + live backend."))
+    except Exception as e:
+        return JSONResponse(_envelope(state="unknown", reason=f"mirofish_unavailable:{e}",
+                                      source="mirofish", backend_alive=False, used=0, runs=[]))
+
+
+@app.get("/api/decisions")
+def api_decisions(limit: int = 60):
+    """Plan 10: recent decisions — bets and no-bets counted SEPARATELY (no-bet is not a trade)."""
+    rows = _safe(lambda: journal.get_decisions(limit), [])
+    bets = sum(1 for r in rows if isinstance(r, dict) and r.get("status") == "bet")
+    no_bets = sum(1 for r in rows if isinstance(r, dict) and r.get("status") == "no_bet")
+    last = rows[0] if rows else None
+    # no decisions yet is NOT "ok/green" — it's unknown (nothing to show).
+    return JSONResponse(_envelope(
+        state=("ok" if rows else "unknown"), reason=("decisions" if rows else "no_decisions"),
+        source="journal.get_decisions", decisions=rows, n=len(rows), bets=bets, no_bets=no_bets,
+        last_decision_at=(last.get("ts") if isinstance(last, dict) else None)))
+
+
+@app.get("/api/gates")
+def api_gates():
+    """Plan 10: Gate 1 (calibration) + Gate 2 (Plan 9 FAIL-CLOSED readiness). Gate 2 shows PASS
+    ONLY when gate2_status().pass is true; otherwise its status+reasons are surfaced."""
+    try:
+        from harness import accounting_audit as _acct
+        sb = _safe(lambda: scoreboard.compute(), {})
+        g1 = (sb.get("gate1") or {}) if isinstance(sb, dict) else {}
+        g2 = _safe(lambda: _acct.gate2_status(), {"status": "unknown", "pass": False})
+        both = bool(g1.get("pass") and g2.get("pass"))
+        state = "ok" if both else (g2.get("status") or "unknown")
+        return JSONResponse(_envelope(
+            state=state, reason="gates", source="accounting_audit.gate2_status",
+            gate1=g1, gate2=g2, both_pass=both))
+    except Exception as e:
+        return JSONResponse(_envelope(state="unknown", reason=f"gates_unavailable:{e}", source="gates"))
+
+
+@app.get("/api/version")
+def api_version():
+    """Plan 10: code version / git branch+commit / dirty tree. None (not crash) when git is absent."""
+    from harness import status_model as _sm
+    v = _safe(lambda: _sm.version_info(use_cache=False), {})
+    return JSONResponse(_envelope(
+        state=("ok" if v.get("git_commit") else "unknown"), reason="version",
+        source="obs.codeversion", git_branch=v.get("git_branch"), git_commit=v.get("git_commit"),
+        git_dirty=v.get("git_dirty"), code_version=v.get("code_version")))
+
+
+@app.get("/api/truth")
+def api_truth():
+    """Plan 10: the UNIFIED 'is the system trustworthy?' signal the health badge consumes —
+    accounting audit + Gate 2 + service states + DB. NEVER green unless every part is verified."""
+    from harness import status_model as _sm
+    comps, extra = [], {}
+    try:
+        from harness import accounting_audit as _acct
+        acc = _safe(lambda: _acct.audit_accounting(), {"status": "unknown"})
+        comps.append({"name": "accounting", "kind": "accounting", "state": acc.get("status", "unknown")})
+        # Gate 2 is go-live READINESS, not operational health (it rarely passes for a paper bot),
+        # so it is NOT a system-health component — it is reported as its own EXPLICIT, visible
+        # field. The System badge reflects liveness + accounting; Gate 2 is surfaced separately.
+        g2 = _safe(lambda: _acct.gate2_status(), {"status": "unknown", "pass": False})
+        extra["accounting_status"] = acc.get("status")
+        extra["gate2_pass"] = bool(g2.get("pass"))
+        extra["gate2_status"] = g2.get("status")
+        extra["gate2_reasons"] = g2.get("reasons")
+    except Exception:
+        comps.append({"name": "accounting", "kind": "accounting", "state": "unknown"})
+    try:
+        from harness import supervisor as _sup
+        svc = _safe(lambda: _sup.status(as_dict=True), {"system_state": "unknown"})
+        comps.append({"name": "services", "kind": "service", "state": svc.get("system_state", "unknown"),
+                      "critical": True})
+        extra["services_state"] = svc.get("system_state")
+    except Exception:
+        comps.append({"name": "services", "kind": "service", "state": "unknown", "critical": True})
+    db_ok = bool(_safe(lambda: _db_usable(), False))
+    db_present = bool(_safe(lambda: os.path.exists(DB_PATH), False))
+    comps.append({"name": "db", "kind": "db",
+                  "state": ("ok" if db_ok else ("error" if db_present else "missing"))})
+    extra["db_ok"] = db_ok
+    sysv = _sm.system_status(comps)
+    sysv["source"] = "accounting+gate2+services+db"
+    sysv.update(extra)
+    return JSONResponse(sysv)
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(HTML, headers={"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"})
@@ -213,10 +389,13 @@ def health_alias():
     except Exception:
         pass
     import datetime as _dt
+    # Plan 10: ok reflects the DB check this probe actually performs (its docstring promises the
+    # DB opens) — never hardcoded green. HTTP stays 200 so the supervisor's liveness gate (which
+    # only checks the status code) still sees the web server is up.
     return JSONResponse({
-        "ok": True, "service": "dashboard",
+        "ok": bool(db_ok), "service": "dashboard",
         "time": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
-        "db_ok": db_ok, "version": "polyswarm-harness",
+        "db_ok": db_ok, "version": "polyswarm-harness", "paper_only": True,
     })
 
 
@@ -342,6 +521,8 @@ def debug_state():
     out["guards"] = _safe(lambda: __import__("harness.provenance", fromlist=["config_snapshot"]).config_snapshot(), {})
     out["health"] = _safe(lambda: health.snapshot(), {})
     out["db_check"] = _safe(lambda: __import__("harness.db_check", fromlist=["run"]).run(), {})
+    out["version"] = _safe(lambda: __import__("harness.status_model", fromlist=["version_info"]).version_info(), {})
+    out["paper_only"] = True
     return JSONResponse(out)
 
 
@@ -846,11 +1027,19 @@ async function tick(){
   $('#ablegend').textContent = (d.challenger_hosted?'🟢 ':'')+(d.challenger_model||'single-LLM')+(d.challenger_hosted?' (live)':' (local)');
   $('#cards').innerHTML=[
     card('Cash', money(w.cash), 'available to bet','var(--cyan)'),
-    card('Equity', money(w.equity), 'cash + open (at cost)','var(--purple)'),
+    // Plan 10: equity shows VERIFIED mark-to-market or 'unverified' — never a fake at-cost number painted as truth.
+    card('Equity', d.equity_verified ? money((d.accounting||{}).equity) : 'unverified',
+         d.equity_verified ? 'mark-to-market verified' : 'marks stale/missing · at-cost '+money(w.equity),
+         d.equity_verified ? 'var(--purple)' : 'var(--amber)'),
     card('Realized P&amp;L', money(w.realized_pnl), `start ${money(w.starting_bankroll)}`, pnlCol),
     card('Open positions', w.n_open, money(w.open_exposure)+' exposure','var(--amber)'),
     card('Forecasts', c.forecasts, `${c.resolved} resolved`,'var(--blue)'),
-    card('Gates', (sb.gate1?'1✓':'1✗')+' '+(sb.gate2?'2✓':'2✗'), `n=${sb.n}/${sb.n_required}`, (sb.gate1&&sb.gate2)?'var(--green)':'var(--pink)'),
+    // Plan 10: Gate 2 shows its Plan-9 fail-closed status/reason, not just a ✓/✗.
+    card('Gates', (sb.gate1?'1✓':'1✗')+' '+(sb.gate2?'2✓':'2✗'),
+         'G2 '+(sb.gate2_status||(sb.gate2?'pass':'fail'))
+           +((!sb.gate2 && sb.gate2_reasons && sb.gate2_reasons.length)?(' · '+sb.gate2_reasons[0]):'')
+           +` · n=${sb.n}/${sb.n_required}`,
+         (sb.gate1&&sb.gate2)?'var(--green)':'var(--pink)'),
   ].join('');
 
   $('#gauges').innerHTML =
@@ -939,13 +1128,29 @@ function freshColor(sec){ if(sec==null) return 'var(--red)'; if(sec<900) return 
 function ago(sec){ if(sec==null) return 'never'; if(sec<60) return Math.round(sec)+'s ago'; if(sec<3600) return Math.round(sec/60)+'m ago'; if(sec<86400) return Math.round(sec/3600)+'h ago'; return Math.round(sec/86400)+'d ago'; }
 function hbadge(label,color,sub){ return `<span class=hbadge><span class=hdot style="background:${color};box-shadow:0 0 6px ${color}"></span>${label}<span class=hsub>${sub}</span></span>`; }
 async function healthTick(){
-  let h; try{ h=await(await fetch('/api/health')).json(); }catch(e){ return; }
+  let h={}, t={};
+  try{ h=await(await fetch('/api/health')).json(); }catch(e){}
+  try{ t=await(await fetch('/api/truth')).json(); }catch(e){}
   const o=h.ollama||{}, mf=h.mirofish_backend||{}, d=h.daemon||{}, f=h.freshness_sec||{};
+  const stc={healthy:'var(--green)',degraded:'var(--amber)',stale:'var(--amber)',unsafe:'var(--red)',unknown:'var(--dim)'};
+  const dc={healthy:'var(--green)',stale:'var(--amber)',degraded:'var(--amber)',crashed:'var(--red)',not_started:'var(--dim)',starting:'var(--amber)',unknown:'var(--dim)'};
   const out=[];
+  // Plan 10: SYSTEM TRUTH badge FIRST — accounting + Gate 2 + services + DB. The dashboard can
+  // never read "all green" while accounting drifts / equity is unverified / a daemon is stale.
+  out.push(hbadge('System', stc[t.state]||'var(--red)',
+     (t.state||'unknown')+((t.accounting_status&&t.accounting_status!=='ok')?(' · acct '+t.accounting_status):'')));
+  const acc=h.accounting||{};
+  out.push(hbadge('Accounting', acc.verified?'var(--green)':(acc.status==='drift'?'var(--red)':'var(--amber)'), acc.status||'unknown'));
   out.push(hbadge('Ollama', (o.up&&o.model_present)?'var(--green)':'var(--red)',
      o.up ? (o.model_present ? (o.model||'model')+' ✓' : 'model missing') : 'down'));
   out.push(hbadge('MiroFish', mf.up?'var(--green)':'var(--amber)', mf.up?'external :5001':(mf.mode||'local fallback')));
-  out.push(hbadge('Daemon', freshColor(d.age_sec), d.age_sec==null?'no heartbeat':ago(d.age_sec)));
+  // Plan 10: per-daemon HONEST state (structured heartbeat) — not masked by MAX(mtime).
+  const dm=h.daemons||{};
+  Object.entries(dm).forEach(([n,hb])=> out.push(hbadge(n.replace('_daemon',''), dc[(hb||{}).state]||'var(--red)',
+     ((hb||{}).state||'?')+((hb&&hb.age_seconds!=null)?(' · '+ago(hb.age_seconds)):''))));
+  // Plan 10: when no STRUCTURED per-daemon heartbeat is available, do NOT colour by the legacy
+  // MAX(mtime) — a file timestamp is not verified fresh work. Show dim 'unverified', never green.
+  if(!Object.keys(dm).length) out.push(hbadge('Daemon', 'var(--dim)', d.age_sec==null?'no structured heartbeat':('mtime '+ago(d.age_sec)+' · unverified')));
   [['swarm',f.swarm_forecast],['1-LLM',f.challenger],['crowd',f.mirofish],['bet',f.paper_position],['decision',f.decision]]
     .forEach(([lab,sec])=> out.push(hbadge(lab, freshColor(sec), ago(sec))));
   const el=document.getElementById('health'); if(el) el.innerHTML=out.join('');

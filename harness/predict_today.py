@@ -1185,12 +1185,30 @@ def _settle():
         return []
 
 
-def _heartbeat(st):
-    import json as _json
+def _heartbeat(st, *, stage="cycle", market_id=None, market_question=None,
+               last_error=None, loop_count=None):
+    """Plan 10: write a STRUCTURED, honest heartbeat (pid/last_tick/stage/last_error/branch/
+    commit/loop_count) so the supervisor + dashboard can tell 'process alive' from 'doing fresh
+    work'. Keeps the legacy ts/cycle fields for back-compat. Best-effort; never raises."""
     try:
-        with open(os.getenv("HARNESS_HEARTBEAT", ".heartbeat.json"), "w") as hb:
-            _json.dump({"ts": time.time(), "cycle": {"phase": "predict_today", "open": st["n_open"],
-                       "equity": round(st["equity"], 2), "realized_pnl": round(st["realized_pnl"], 2)}}, hb)
+        from harness import heartbeat as _hb
+        last_dec = None
+        try:
+            from harness import journal as _j
+            decs = _j.get_decisions(1)
+            last_dec = decs[0] if decs else None
+        except Exception:
+            last_dec = None
+        _hb.write(
+            "ai_pipeline", path=os.getenv("HARNESS_HEARTBEAT", ".heartbeat.json"),
+            stage=stage, market_id=market_id, market_question=market_question,
+            last_decision_id=(last_dec.get("id") if isinstance(last_dec, dict) else None),
+            last_decision_at=(last_dec.get("ts") if isinstance(last_dec, dict) else None),
+            last_error=last_error, loop_count=loop_count, paper_only=True,
+            config_flags={"window": os.getenv("SCANNER_WINDOW"), "paper_only": True},
+            extra={"ts": time.time(), "cycle": {"phase": "predict_today", "open": st.get("n_open"),
+                   "equity": round(st.get("equity") or 0.0, 2),
+                   "realized_pnl": round(st.get("realized_pnl") or 0.0, 2)}})
     except Exception:
         pass
 
@@ -1237,10 +1255,14 @@ def daemon(cfg, max_hours=24.0, interval=60, include_mech=False, window=None):
     done: set[str] = set()
     last_key = None
     idle_interval = max(interval, IDLE_INTERVAL)
+    _loop = 0
     print(f"\n  PRECISE AI DAEMON — find->gather->think->bet, {win} window, no price rule. No stopping.\n", flush=True)
     while True:
         cands = []
         worked = False
+        _loop += 1
+        _cycle_err = None
+        _hb_market = None
         try:
             with contextlib.ExitStack() as _es:
                 if obs:
@@ -1256,6 +1278,7 @@ def daemon(cfg, max_hours=24.0, interval=60, include_mech=False, window=None):
                 else:
                     m = cands[0]                      # one deep forecast per cycle (slow)
                     done.add(m["market_id"])
+                    _hb_market = m
                     print("=" * 78)
                     # crash-safety: one bad market must never kill the cycle, so the
                     # snapshot/heartbeat/run_end below still run for this cycle.
@@ -1265,6 +1288,7 @@ def daemon(cfg, max_hours=24.0, interval=60, include_mech=False, window=None):
                         if obs:
                             obs.hooks.on_error(where="predict_today.daemon.market", exc=e, action="skip")
                         print(f"[predict] market error ({type(e).__name__}): {e}", flush=True)
+                        _cycle_err = f"{type(e).__name__}: {e}"
                     worked = True
                 st = wallet.get_state()
                 # Only snapshot/log when something actually changed — stops the idle spin from
@@ -1275,7 +1299,10 @@ def daemon(cfg, max_hours=24.0, interval=60, include_mech=False, window=None):
                     print(f"[predict] cycle done · open={st['n_open']} equity=${st['equity']:.0f} "
                           f"realized=${st['realized_pnl']:+.2f}\n", flush=True)
                     last_key = key
-                _heartbeat(st)
+                _heartbeat(st, stage=("forecasting" if cands else "idle"),
+                           market_id=(_hb_market.get("market_id") if _hb_market else None),
+                           market_question=(_hb_market.get("question") if _hb_market else None),
+                           last_error=_cycle_err, loop_count=_loop)
                 if obs:
                     obs.hooks.on_run_end({"bets": (1 if worked else 0), "open": st["n_open"]})
         except KeyboardInterrupt:
@@ -1284,6 +1311,12 @@ def daemon(cfg, max_hours=24.0, interval=60, include_mech=False, window=None):
             if obs:
                 obs.hooks.on_error(where="predict_today.daemon", exc=e, action="retry")
             print("[predict] cycle error:", e, flush=True)
+            # record the cycle error in the heartbeat so the dashboard shows degraded, not green
+            try:
+                _heartbeat(wallet.get_state(), stage="error", last_error=f"{type(e).__name__}: {e}",
+                           loop_count=_loop)
+            except Exception:
+                pass
         time.sleep(interval if cands else idle_interval)   # don't spin when idle
 
 
