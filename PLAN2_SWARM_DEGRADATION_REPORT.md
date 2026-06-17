@@ -6,7 +6,7 @@
 > Paper-only. No real-money execution. Branch: `fix/swarm-degradation-safety`.
 > Plan 1 (fail-closed money gates, commit 8ea3920) is the committed base.
 
-Status: **IN PROGRESS**.
+Status: **COMPLETE** — committed as 353b0cc.
 
 ## Swarm chain map (Phase 1)
 
@@ -24,7 +24,7 @@ Status: **IN PROGRESS**.
 ---
 
 Status: **COMPLETE** — 56/56 test modules pass (incl. the new 20-case Plan-2 module).
-Branch `fix/swarm-degradation-safety` (not committed — awaiting review).
+Branch `fix/swarm-degradation-safety` (committed as 353b0cc).
 
 ## Summary
 

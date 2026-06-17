@@ -7,7 +7,7 @@
 > Built on Plans 1-6 (8ea3920 … f0563d5).
 
 Status: **COMPLETE** — 61/61 test modules pass (incl. the new 28-case Plan-7 module).
-Not committed (awaiting review). A 3-skeptic adversarial workflow executed the parser on
+Committed as d6003da. A 3-skeptic adversarial workflow executed the parser on
 ~55 adversarial inputs: **0 holes found**, 1 low-severity quirk (fullwidth digits) hardened.
 
 ## Summary

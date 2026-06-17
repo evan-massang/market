@@ -7,7 +7,7 @@
 > Paper-only. No real-money execution. Branch: `fix/gate-shortcut-betting-paths`.
 > Built on Plan 1 (fail-closed gates, 8ea3920) + Plan 2 (swarm degradation, 353b0cc).
 
-Status: **IN PROGRESS**.
+Status: **COMPLETE** — committed as 3310b9a.
 
 ## Entrypoint Map (Phase 1)
 
@@ -28,7 +28,7 @@ dashboard, and mirofish backend — no shortcut betting.
 ---
 
 Status: **COMPLETE** — 57/57 test modules pass (incl. the new 14-case Plan-3 module).
-Branch `fix/gate-shortcut-betting-paths` (not committed — awaiting review).
+Branch `fix/gate-shortcut-betting-paths` (committed as 3310b9a).
 
 ## Summary
 

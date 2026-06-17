@@ -6,7 +6,7 @@ run inline (Plan 1 + Plan 2), in the same order, reusing the exact same gate
 wrappers — so a "shortcut" path (strategy_bet, legacy loop, manual place_bet) can
 no longer bypass EV / risk / bankroll / exposure / swarm-health.
 
-    swarm-health (AI sources)  →  EV  →  risk  →  bankroll  →  exposure  →  open once
+    swarm-health (AI sources)  →  MiroFish (if required)  →  EV  →  risk  →  bankroll  →  exposure  →  open once
 
 If ANY gate blocks: no `wallet.open_position` is called, a no-bet decision is
 recorded (print + obs.on_trade_skip + journal.record_decision), and a structured
@@ -96,10 +96,10 @@ def open_position_if_safe(*, source: str, market: dict, side: str, probability: 
     never opens when any gate blocks. ``source`` labels the caller (e.g.
     'strategy_bet', 'loop', 'place_bet')."""
     from harness import wallet
-    # Reuse the EXACT Plan 1 + Plan 2 gate wrappers so every path is byte-consistent
+    # Reuse the EXACT Plan 1 + Plan 2 + Plan 8 gate wrappers so every path is byte-consistent
     # with predict_today / sameday. (Lazy import keeps safe_bet import-light + cycle-free.)
     from harness.predict_today import (_p7_ev_gate, _p8_risk_guards, _p9_can_trade,
-                                       _p9_exposure_ok, _p_swarm_health)
+                                       _p9_exposure_ok, _p_swarm_health, _p_mirofish_gate)
     market = market or {}
     mid, q = market.get("market_id"), market.get("question")
     ctx = dict(reason_context or {})
@@ -110,6 +110,16 @@ def open_position_if_safe(*, source: str, market: dict, side: str, probability: 
         sh_ok, sh_reason = _p_swarm_health(forecast_meta if isinstance(forecast_meta, dict) else {})
         if not sh_ok:
             return record_no_bet(source, market, sh_reason, probability=probability, price=price, context=ctx)
+
+    # 1b. MiroFish gate (Plan 8): a REQUIRED fresh, market-matched crowd report must be present —
+    #     exactly as predict_today / sameday enforce. A shortcut/manual path that did NOT gather a
+    #     fresh MiroFish report blocks when MiroFish is required (fail-closed); it is a NO-OP when
+    #     MiroFish is off / not required (the default), so default behaviour is unchanged. This
+    #     closes the integration gap where a manual/shortcut bet could skip the Plan-8 gate the
+    #     daemons enforce. `evidence_meta` (if a pack-like object) feeds the degraded-mode check.
+    mf_ok, mf_reason = _p_mirofish_gate(market, evidence_meta)
+    if not mf_ok:
+        return record_no_bet(source, market, mf_reason, probability=probability, price=price, context=ctx)
 
     # 2. EV gate (after-costs, with spread/liquidity/exit-risk penalties from the market)
     ev_ok, ev_reason = _p7_ev_gate(probability, price, side, m=market, confidence=confidence)

@@ -3,7 +3,7 @@
 **Branch:** `fix/profit-intelligence-paper-only` · **Mode:** PAPER-ONLY (no real trades, no live
 daemons, no live `polyswarm.db` mutation, no Plan 1–10 gate bypass/loosening).
 
-> Status: in progress. Phase 1 inspection table below; implementation + tests + verification follow.
+> Status: **COMPLETE** — committed as 71ee7eb.
 
 ## Phase 1 — Inspection table
 

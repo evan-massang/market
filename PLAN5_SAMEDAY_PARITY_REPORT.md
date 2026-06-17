@@ -8,7 +8,7 @@
 > Built on Plans 1-4 (8ea3920, 353b0cc, 3310b9a, f5e767a).
 
 Status: **COMPLETE** — 59/59 test modules pass (incl. the new 21-case Plan-5 module).
-Not committed (awaiting review).
+Committed as 29b90e3.
 
 ## Summary
 

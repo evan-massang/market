@@ -3,7 +3,7 @@
 **Branch:** `fix/scoreboard-accounting-honesty` · **Mode:** PAPER-ONLY (no trades, no live daemons,
 no DB repair, no live `polyswarm.db` mutation).
 
-> Status: in progress. Phase 1 inspection table below; implementation + tests + verification follow.
+> Status: **COMPLETE** — committed as e96fa92.
 
 ## Phase 1 — Inspection table
 

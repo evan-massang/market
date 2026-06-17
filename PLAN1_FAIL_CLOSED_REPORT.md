@@ -7,7 +7,7 @@
 > Paper-only. No real-money execution. No live-service or live-DB changes.
 > Branch: `fix/fail-closed-money-gates`.
 
-Status: **IN PROGRESS** — Phase 1 (mapping) underway.
+Status: **COMPLETE** — committed as 8ea3920.
 
 ## Gate map (Phase 1)
 
@@ -168,7 +168,7 @@ never call `wallet.open_position` and return False after recording the no-bet
 
 ## Final verification (Plan-1 close-out)
 
-Branch: `fix/fail-closed-money-gates` (no commit yet — awaiting review).
+Branch: `fix/fail-closed-money-gates` (committed as 8ea3920).
 
 ### Exact files changed
 

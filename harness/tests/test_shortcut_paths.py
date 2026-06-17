@@ -145,6 +145,25 @@ def test_safebet_ai_source_missing_health_blocks():
     assert out["opened"] is False and "missing_health_metadata" in out["reason"], out
 
 
+def test_safebet_required_mirofish_blocks_shortcut_path():
+    # FINAL-AUDIT FIX (Plan 3↔Plan 8 gap): when MiroFish is REQUIRED, a shortcut/manual bet with
+    # NO fresh, market-matched report must block in safe_bet EXACTLY as predict_today/sameday do.
+    # (No-op when not required — the default — is proven by test_safebet_all_gates_pass_opens_once.)
+    _reset_wallet()
+
+    def _no_open(*a, **k):
+        raise AssertionError("opened despite REQUIRED MiroFish missing on a shortcut path!")
+
+    with _env(MIROFISH_MODE="required"), \
+         patched(PT, "_p_swarm_health", lambda meta, prefix="swarm": (True, "ok")), \
+         patched(W, "open_position", _no_open):
+        out = SAFE.open_position_if_safe(source="place_bet", market=_MKT, side="YES",
+                                         probability=0.65, price=0.50, stake=10.0,
+                                         forecast_meta=_HEALTHY_META)
+    assert out["opened"] is False and "mirofish" in out["reason"].lower(), out
+    assert _decisions("mirofish"), "required-MiroFish no_bet not recorded for the shortcut path"
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # strategy_bet — disabled by default; routed + gated when enabled
 # ════════════════════════════════════════════════════════════════════════════
@@ -304,6 +323,7 @@ TESTS = [
     ("safebet_all_gates_pass_opens_once", test_safebet_all_gates_pass_opens_once),
     ("safebet_each_gate_blocks_no_open", test_safebet_each_gate_blocks_no_open),
     ("safebet_ai_source_missing_health_blocks", test_safebet_ai_source_missing_health_blocks),
+    ("safebet_required_mirofish_blocks_shortcut_path", test_safebet_required_mirofish_blocks_shortcut_path),
     ("strategy_bet_disabled_by_default_no_open_no_fetch", test_strategy_bet_disabled_by_default_no_open_no_fetch),
     ("strategy_bet_missing_probability_no_bet", test_strategy_bet_missing_probability_no_bet),
     ("strategy_bet_enabled_ev_blocks_longshot", test_strategy_bet_enabled_ev_blocks_longshot),

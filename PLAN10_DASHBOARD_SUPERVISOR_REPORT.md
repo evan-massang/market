@@ -3,7 +3,7 @@
 **Branch:** `fix/dashboard-supervisor-truth` · **Mode:** PAPER-ONLY (no trades, no live daemons,
 no supervisor start/stop, no live `polyswarm.db` mutation).
 
-> Status: in progress. Phase 1 surface map below; implementation + tests + verification follow.
+> Status: **COMPLETE** — committed as e6bc4a0.
 
 ## Dashboard / Supervisor Surface Map (Phase 1)
 
@@ -303,10 +303,10 @@ service started, no live DB touched.
 | 8 | Expected dashboard endpoints do not silently 404 | ✅ `expected_cards_not_404` |
 | 9 | Unknown metrics show unknown, not zero/green | ✅ `unknown_is_not_green`, mirofish/decisions unknown |
 | 10 | Paper-only mode is visible | ✅ every endpoint + heartbeat + status |
-| 11 | Tests prove the above | ✅ 42/42 |
+| 11 | Tests prove the above | ✅ 55/55 |
 | 12 | Existing tests still pass | ✅ 64/64 modules |
 | 13 | Report written | ✅ this file |
 
-**Verdict:** ✅ all acceptance criteria met; 42/42 truth tests + 64/64 suite green; round-1
-adversarial fake-green vectors found and closed. Final sign-off pending round-2 (0 new
-exploitable).
+**Verdict:** ✅ all acceptance criteria met; 55/55 truth tests + 64/64 suite green; across 6
+adversarial rounds all fake-green vectors were found and closed. PLAN 10 COMPLETE (committed as
+e6bc4a0).

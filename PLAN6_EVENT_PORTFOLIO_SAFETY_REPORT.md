@@ -8,7 +8,7 @@
 > Built on Plans 1-5 (8ea3920 … 29b90e3).
 
 Status: **COMPLETE** — 60/60 test modules pass (incl. the new 24-case Plan-6 module).
-Not committed (awaiting review). Two analysis workflows were run: an understanding sweep
+Committed as f0563d5. Two analysis workflows were run: an understanding sweep
 (4 analysts) that confirmed the danger map, and an adversarial verification (3 skeptics)
 that found **0 holes** and surfaced 2 low-severity caveats — both now hardened.
 
