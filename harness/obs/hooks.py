@@ -7,6 +7,7 @@ a logging hook. All hooks also short-circuit to None when OBS is disabled.
 """
 
 import functools
+import inspect
 import traceback
 from datetime import datetime, timezone
 
@@ -23,11 +24,119 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+# ── Live-telemetry bridge (dashboard cockpit) ─────────────────────────────────────
+# Each hook here is the SINGLE observability dispatch already wired across the codebase, so it is
+# the lowest-touch place to feed the dashboard's live event stream. The bridge runs BEFORE the
+# obs-enabled gate (so live telemetry works even with OBS_ENABLED=0) and is fully guarded — a
+# telemetry failure can NEVER affect the forecast / gate / wallet / decision path. No fake events:
+# every event below is a real observability callback firing at a real point in the run.
+_LIVE_MAP = {
+    "on_forecast_start": ("swarm.started", "swarm"),
+    "on_llm_call": ("agent.started", "agent"),
+    "on_agent_estimate": ("agent.finished", "agent"),
+    "on_forecast_final": ("forecast.final", "swarm"),
+    "on_trade_open": ("decision.bet", "wallet"),
+    "on_trade_skip": ("decision.no_bet", "predict_today"),
+    "on_trade_settle": ("position.settled", "wallet"),
+    "on_gate": ("gate.result", "gate"),
+    "on_event_portfolio": ("gate.result", "gate"),
+    "on_evidence_pack": ("evidence.pack", "predict_today"),
+    "on_error": ("error", "system"),
+}
+
+
+def _bridge_live(name, sig, args, kwargs):
+    """Best-effort: mirror a mapped obs hook into the live_events ring buffer. Never raises."""
+    spec = _LIVE_MAP.get(name)
+    if not spec:
+        return
+    try:
+        from harness import live_events as _le
+    except Exception:
+        return
+    etype, source = spec
+    try:
+        if sig is not None:
+            ba = sig.bind_partial(*args, **kwargs)
+            ba.apply_defaults()
+            a = dict(ba.arguments)
+        else:
+            a = dict(kwargs)
+    except Exception:
+        a = dict(kwargs)
+    try:
+        mid = a.get("market_id")
+        q = a.get("question")
+        status, message, data = "running", None, {}
+        if name == "on_forecast_start":
+            status, message, data = "started", "swarm forecast started", {"market_price": a.get("market_price")}
+        elif name == "on_llm_call":
+            status = "failed" if a.get("error") else "finished"
+            message = f"LLM {a.get('model')} · {a.get('tokens_out')}tok · {a.get('latency_ms')}ms"
+            data = {"provider": a.get("provider"), "model": a.get("model"), "role": a.get("role"),
+                    "tokens_out": a.get("tokens_out"), "latency_ms": a.get("latency_ms"),
+                    "error": a.get("error")}
+        elif name == "on_agent_estimate":
+            status, message = "finished", f"{a.get('persona')} → p={a.get('probability')}"
+            data = {"persona": a.get("persona"), "probability": a.get("probability"),
+                    "confidence": a.get("confidence"), "round": a.get("round")}
+        elif name == "on_forecast_final":
+            status = "finished"
+            message = f"swarm {a.get('model_probability')} vs market {a.get('market_probability')}"
+            data = {"model_probability": a.get("model_probability"),
+                    "market_probability": a.get("market_probability"),
+                    "edge": a.get("edge"), "consensus": a.get("consensus")}
+        elif name == "on_trade_open":
+            status = "finished"
+            message = f"BET {a.get('side')} ${a.get('stake')} @ {a.get('fill_price')}"
+            data = {"side": a.get("side"), "stake": a.get("stake"),
+                    "fill_price": a.get("fill_price"), "trade_id": a.get("trade_id")}
+        elif name == "on_trade_skip":
+            inp = a.get("inputs") or {}
+            mid = mid or inp.get("market_id")
+            q = q or inp.get("question")
+            status, message = "blocked", f"NO BET — {a.get('reason')}"
+            data = {"reason": a.get("reason"), "layer": inp.get("layer")}
+        elif name == "on_trade_settle":
+            status = "finished"
+            message = f"settled · payout ${a.get('payout')} · pnl ${a.get('realized_pnl')}"
+            data = {"outcome": a.get("outcome"), "payout": a.get("payout"),
+                    "realized_pnl": a.get("realized_pnl"), "trade_id": a.get("trade_id")}
+        elif name == "on_gate":
+            passed = bool(a.get("overall_pass"))
+            status = "passed" if passed else "blocked"
+            message = f"Gate1={a.get('gate1_pass')} Gate2={a.get('gate2_pass')} (n={a.get('n_resolved')})"
+            data = {"gate1_pass": a.get("gate1_pass"), "gate2_pass": a.get("gate2_pass"),
+                    "overall_pass": a.get("overall_pass"), "n_resolved": a.get("n_resolved")}
+        elif name == "on_event_portfolio":
+            passed = bool(a.get("accept"))
+            status = "passed" if passed else "blocked"
+            message = f"event portfolio {'ACCEPT' if passed else 'REJECT'} {a.get('reject_reason') or ''}".strip()
+            data = {"accept": a.get("accept"), "reject_reason": a.get("reject_reason"),
+                    "portfolio_ev": a.get("portfolio_ev")}
+        elif name == "on_evidence_pack":
+            status, message = "finished", "evidence pack built"
+            data = {k: a.get(k) for k in ("n_sources", "total_items", "evidence_quality") if k in a}
+        elif name == "on_error":
+            status = "failed"
+            message = f"{a.get('where')}: {a.get('error') or a.get('exc')}"
+            data = {"where": a.get("where"), "action": a.get("action")}
+        _le.emit(etype, source, market_id=mid, question=q, status=status, message=message, data=data)
+    except Exception:
+        pass
+
+
 def _hook(fn):
-    """Decorator: no-op when disabled; swallow every exception -> return None."""
+    """Decorator: bridge to live telemetry (always, best-effort), then no-op when obs disabled;
+    swallow every exception -> return None."""
+    try:
+        _sig = inspect.signature(fn)
+    except Exception:
+        _sig = None
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        _bridge_live(fn.__name__, _sig, args, kwargs)   # live telemetry BEFORE the obs gate
         if not config.enabled():
             return None
         try:

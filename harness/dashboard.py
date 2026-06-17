@@ -27,7 +27,7 @@ try:
 except Exception:
     pass
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from harness import wallet as paper
@@ -388,6 +388,284 @@ def api_truth():
     sysv["source"] = "accounting+gate2+services+db"
     sysv.update(extra)
     return JSONResponse(sysv)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Live telemetry cockpit (UI upgrade) — SSE stream + paper-wallet/bets/pnl/ai-now.
+# All read-only + best-effort; missing data shows honest unknown/stale/link_unavailable/etc.
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/events/live")
+async def events_live(request: Request):
+    """SSE stream of REAL live_events (cross-process ring buffer fed by the obs hooks). If no
+    daemon is emitting, the client simply sees pings + a stale state — never faked activity."""
+    from harness import live_events as _le
+
+    async def gen():
+        _le.register_client()
+        last_id = 0
+        try:
+            backlog = list(reversed(_safe(lambda: _le.recent_events(60), [])))
+            for e in backlog:
+                try:
+                    last_id = max(last_id, int(e["id"]))
+                except Exception:
+                    pass
+                yield f"data: {json.dumps(e)}\n\n"
+            tick = 0
+            while tick < 7200:                          # ~2h cap; EventSource auto-reconnects
+                try:
+                    if await request.is_disconnected():
+                        break
+                except Exception:
+                    pass
+                for e in _safe(lambda: _le.recent_events(200, since_id=last_id), []):
+                    try:
+                        last_id = max(last_id, int(e["id"]))
+                    except Exception:
+                        pass
+                    yield f"data: {json.dumps(e)}\n\n"
+                if tick % 5 == 0:
+                    st = _safe(lambda: _le.event_status(), {"state": "unknown"})
+                    yield f": ping {st.get('state')} {st.get('last_event_age_seconds')}\n\n"
+                tick += 1
+                await asyncio.sleep(1.0)
+        finally:
+            _le.unregister_client()
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no",
+                                      "Connection": "keep-alive"})
+
+
+@app.get("/api/live/recent")
+def api_live_recent(limit: int = 200, type: str = ""):
+    from harness import live_events as _le
+    evs = _safe(lambda: _le.recent_events(limit, type=(type or None)), [])
+    return JSONResponse({"paper_only": True, "generated_at": _now_iso_(),
+                         "count": len(evs), "events": evs})
+
+
+@app.get("/api/live/status")
+def api_live_status():
+    from harness import live_events as _le
+    return JSONResponse(_safe(lambda: _le.event_status(),
+                              {"paper_only": True, "state": "unknown", "transport": "sse",
+                               "generated_at": _now_iso_()}))
+
+
+@app.get("/api/paper-wallet")
+def api_paper_wallet():
+    """Plan 9 accounting truth → the cockpit wallet card. verified_equity is None (unverified)
+    unless accounting says marks are fresh; never a fabricated number."""
+    from harness import accounting_audit as _acct
+    audit = _safe(lambda: _acct.audit_accounting(), {"status": "unknown", "reasons": []})
+    st = _safe(lambda: paper.get_state(), {})
+    open_n = _safe(lambda: len(paper.get_open_positions()), None)
+    settled_n = _safe(lambda: _settled_count(), None)
+    g2 = _safe(lambda: _acct.gate2_status(), {})
+    equity_verified = audit.get("equity") is not None
+    starting = audit.get("starting_bankroll")
+    if starting is None:
+        starting = st.get("starting_bankroll")
+    cash = audit.get("cash")
+    if cash is None:
+        cash = st.get("cash")
+    open_exposure = _safe(lambda: st.get("open_exposure"), None)
+    avail = None
+    if cash is not None:
+        avail = round(float(cash), 6)
+    return JSONResponse({
+        "paper_only": True, "generated_at": _now_iso_(),
+        "starting_bankroll": starting, "cash": cash,
+        "verified_equity": (audit.get("equity") if equity_verified else None),
+        "equity_verified": equity_verified,
+        "realized_pnl": audit.get("realized_pnl"), "unrealized_pnl": audit.get("unrealized_pnl"),
+        "total_pnl": audit.get("total_pnl"), "open_exposure": open_exposure,
+        "available_balance": avail, "open_positions_count": open_n,
+        "settled_positions_count": settled_n,
+        "max_drawdown": (g2.get("max_drawdown") if isinstance(g2, dict) else None),
+        "accounting_status": audit.get("status"), "accounting_reasons": audit.get("reasons", []),
+        "gate2_status": (g2.get("status") if isinstance(g2, dict) else None),
+        "gate2_pass": bool(g2.get("pass")) if isinstance(g2, dict) else False,
+        "stale": (audit.get("status") not in ("ok",)),
+    })
+
+
+@app.get("/api/paper-bets/open")
+def api_paper_bets_open():
+    from harness import paper_bets as _pb
+    return JSONResponse(_safe(lambda: _pb.open_positions(),
+                              {"paper_only": True, "generated_at": _now_iso_(), "positions": []}))
+
+
+@app.get("/api/paper-bets/settled")
+def api_paper_bets_settled(limit: int = 100):
+    from harness import paper_bets as _pb
+    return JSONResponse(_safe(lambda: _pb.settled_positions(limit=limit),
+                              {"paper_only": True, "generated_at": _now_iso_(), "positions": []}))
+
+
+@app.get("/api/paper-bets/proof")
+def api_paper_bets_proof(position_id: str = ""):
+    from harness import paper_bets as _pb
+    if not position_id:
+        return JSONResponse({"paper_only": True, "position_id": None, "proof_status": "unknown",
+                             "timeline": [], "warnings": ["missing_position_id"]})
+    return JSONResponse(_safe(lambda: _pb.proof_timeline(position_id),
+                              {"paper_only": True, "position_id": position_id,
+                               "proof_status": "unknown", "timeline": [], "warnings": ["error"]}))
+
+
+def _pnl_curve(db_path=None):
+    """Equity/cash/realized/unrealized/total curve from the equity_snapshots history (Plan 9
+    accounting truth). Marks the overall verification state; never fakes points."""
+    from harness import accounting_audit as _acct
+    snaps = _safe(lambda: journal.get_snapshots(1000), [])
+    audit = _safe(lambda: _acct.audit_accounting(), {"status": "unknown"})
+    verified = audit.get("status") == "ok"
+    if not snaps:
+        return {"paper_only": True, "generated_at": _now_iso_(), "state": "not_enough_data",
+                "points": [], "warnings": ["not_enough_paper_wallet_history"]}
+    peak = None
+    points = []
+    for s in snaps:
+        eq = s.get("equity")
+        rp = s.get("realized_pnl")
+        cash = s.get("cash")
+        if eq is not None:
+            peak = eq if peak is None else max(peak, eq)
+        dd = (round(peak - eq, 6) if (peak is not None and eq is not None) else None)
+        points.append({"ts": s.get("ts"), "cash": cash, "equity": eq, "realized_pnl": rp,
+                       "unrealized_pnl": (round(eq - cash - (rp or 0), 6) if (eq is not None and cash is not None) else None),
+                       "total_pnl": (round((eq - (s.get("starting_bankroll") or 0)), 6) if eq is not None else None),
+                       "drawdown": dd, "verified": verified,
+                       "reason": ("accounting_ok" if verified else f"accounting_{audit.get('status')}")})
+    state = "ok" if verified else "unverified"
+    if len(points) < 2:
+        state = "partial"
+    return {"paper_only": True, "generated_at": _now_iso_(), "state": state, "points": points,
+            "warnings": ([] if verified else [f"accounting_{audit.get('status')}"])}
+
+
+@app.get("/api/pnl-curve")
+def api_pnl_curve():
+    return JSONResponse(_safe(lambda: _pnl_curve(), {"paper_only": True, "state": "error",
+                                                     "points": [], "warnings": ["error"]}))
+
+
+@app.get("/api/equity-curve")
+def api_equity_curve():
+    return JSONResponse(_safe(lambda: _pnl_curve(), {"paper_only": True, "state": "error",
+                                                     "points": [], "warnings": ["error"]}))
+
+
+@app.get("/api/pnl")
+def api_pnl():
+    from harness import accounting_audit as _acct
+    audit = _safe(lambda: _acct.audit_accounting(), {"status": "unknown"})
+    return JSONResponse({"paper_only": True, "generated_at": _now_iso_(),
+                         "realized_pnl": audit.get("realized_pnl"),
+                         "unrealized_pnl": audit.get("unrealized_pnl"),
+                         "total_pnl": audit.get("total_pnl"), "equity": audit.get("equity"),
+                         "accounting_status": audit.get("status")})
+
+
+@app.get("/api/ai-now")
+def api_ai_now():
+    """What is the AI doing right now? From live events first; falls back to heartbeat/journal.
+    Never fakes activity — idle/stale/unknown shown honestly."""
+    from harness import live_events as _le
+    evs = _safe(lambda: _le.recent_events(80), [])
+    status = _safe(lambda: _le.event_status(), {"state": "unknown", "last_event_id": None})
+    last = evs[0] if evs else None
+
+    def _last_of(types):
+        for e in evs:
+            if e.get("type") in types:
+                return e
+        return None
+
+    bet = _last_of({"decision.bet", "position.opened"})
+    nobet = _last_of({"decision.no_bet"})
+    settled = _last_of({"position.settled"})
+    mf = _last_of({"mirofish.state", "mirofish.stage"})
+    gate = _last_of({"gate.result"})
+    agent = _last_of({"agent.started", "agent.finished"})
+    swarm = _last_of({"swarm.started", "forecast.final"})
+    cur = swarm or agent or last
+    age = status.get("last_event_age_seconds")
+    if not evs:
+        state = "unknown"
+    elif age is not None and age <= 20:
+        state = "thinking" if (agent or swarm) else "evaluating"
+    elif age is not None and age <= 300:
+        state = "waiting"
+    else:
+        state = "stale"
+    if nobet and last and last.get("type") == "decision.no_bet":
+        state = "blocked"
+    # heartbeat fallback
+    hb_stage = None
+    try:
+        hsnap = health.snapshot()
+        daemons = hsnap.get("daemons") or {}
+        ai = daemons.get("ai_pipeline") or {}
+        hb_stage = (ai.get("details") or {}).get("stage") if isinstance(ai.get("details"), dict) else None
+    except Exception:
+        hb_stage = None
+    return JSONResponse({
+        "paper_only": True, "state": state,
+        "current_market_id": (cur or {}).get("market_id"),
+        "current_question": (cur or {}).get("question"),
+        "current_agent": ((agent or {}).get("data") or {}).get("persona"),
+        "mirofish_state": ((mf or {}).get("data") or {}).get("state") or (mf or {}).get("status"),
+        "last_gate_result": (gate or {}).get("message"),
+        "last_no_bet_reason": ((nobet or {}).get("data") or {}).get("reason") or (nobet or {}).get("message"),
+        "last_bet_position_id": ((bet or {}).get("data") or {}).get("trade_id"),
+        "last_settled_position_id": ((settled or {}).get("data") or {}).get("trade_id"),
+        "last_event_id": status.get("last_event_id"),
+        "last_event_age_seconds": age,
+        "last_heartbeat_stage": hb_stage,
+        "generated_at": _now_iso_(),
+    })
+
+
+@app.get("/api/candidates/recent")
+def api_candidates_recent(limit: int = 12):
+    """Recent markets the AI evaluated, with the bet/no-bet reason. Reuses the journal + Plan 11
+    profit-intel reason buckets. No-bets are shown as useful signals, not failures."""
+    from harness import profit_intel as _pi
+    rows = _safe(lambda: journal.get_decisions(limit), [])
+    out = []
+    for r in rows:
+        status = r.get("status")
+        out.append({
+            "market_id": r.get("market_id"), "question": r.get("question"),
+            "market_price": r.get("market_p"), "forecast_probability": r.get("model_p"),
+            "raw_edge": r.get("edge"), "side": r.get("side"), "regime": r.get("regime"),
+            "action": status, "reason": r.get("why"),
+            "reason_bucket": (_safe(lambda r=r: _pi.classify_no_bet_reason(r.get("why")), "unknown")
+                              if status == "no_bet" else "bet"),
+        })
+    return JSONResponse({"paper_only": True, "generated_at": _now_iso_(), "candidates": out})
+
+
+def _settled_count(db_path=None):
+    import sqlite3 as _sq
+    try:
+        conn = _sq.connect(DB_PATH)
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM paper_positions WHERE status IN ('settled','closed')").fetchone()[0]
+        finally:
+            conn.close()
+        return int(n)
+    except Exception:
+        return None
+
+
+def _now_iso_():
+    from harness import status_model as _sm
+    return _sm.now_iso()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -811,620 +1089,404 @@ def main():
 
 HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>Polymarket Harness — Live Monitor</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<title>POLYMARKET AI · COMMAND CENTER</title>
 <style>
-:root{--bg:#070b16;--panel:#0d1322;--panel2:#0a0f1c;--bd:#1b2540;--tx:#e6ebf5;--dim:#7c89a8;
---purple:#8b5cf6;--cyan:#22d3ee;--green:#34d399;--amber:#f59e0b;--pink:#f472b6;--red:#f4475e;--blue:#3b82f6}
+:root{--bg:#06060c;--bg2:#0b0b16;--panel:rgba(14,14,26,.72);--ink:#e8e8ff;--dim:#6a6a85;
+--mag:#ff2bd1;--grn:#00ffa3;--amb:#ffd23f;--red:#ff4d5e;--cyan:#39e1ff;--line:rgba(255,43,209,.18)}
 *{box-sizing:border-box}
-body{margin:0;background:radial-gradient(1200px 600px at 20% -10%,#10183020,transparent),var(--bg);
-color:var(--tx);font:14px/1.45 'Segoe UI',Inter,system-ui,sans-serif;padding:18px 22px 40px}
-h1{font-size:19px;font-weight:700;letter-spacing:.3px;margin:0 0 2px}
-.sub{color:var(--dim);font-size:12px;margin-bottom:16px}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);margin-right:6px;
-box-shadow:0 0 8px var(--green);animation:pulse 1.6s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-.grid{display:grid;gap:14px}
-.cards{grid-template-columns:repeat(6,1fr)}
-.main{grid-template-columns:2.2fr 1fr;margin-top:14px}
-.row2{grid-template-columns:1.3fr 1fr;margin-top:14px}
-.panel{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--bd);
-border-radius:10px;padding:14px 16px}
-.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--bd);
-border-radius:10px;padding:12px 14px;position:relative;overflow:hidden}
-.card .lab{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px}
-.card .big{font-size:26px;font-weight:700;margin-top:6px;font-variant-numeric:tabular-nums}
-.card .delta{font-size:12px;margin-top:3px;color:var(--dim)}
-.card .accent{position:absolute;left:0;top:0;height:3px;width:100%}
-.ttl{font-size:12px;color:#aab6d6;text-transform:uppercase;letter-spacing:.7px;margin-bottom:10px;font-weight:600}
-table{width:100%;border-collapse:collapse;font-size:12.5px}
-th{color:var(--dim);text-align:left;font-weight:600;padding:6px 8px;border-bottom:1px solid var(--bd);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
-td{padding:7px 8px;border-bottom:1px solid #131a2e;font-variant-numeric:tabular-nums}
-tr:hover td{background:#0f1830}
-.q{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.pill{padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600}
-.yes{background:#0d2e22;color:var(--green)}.no{background:#2e1418;color:var(--red)}
-.pos{color:var(--green)}.neg{color:var(--red)}
-.gauge{margin-bottom:14px}
-.gauge .gl{display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px}
-.gbar{height:12px;border-radius:7px;background:#121a30;position:relative;overflow:hidden}
-.gfill{height:100%;border-radius:7px}
-.gmark{position:absolute;top:-3px;width:2px;height:18px;background:#fff;box-shadow:0 0 6px #fff}
-.txn{max-height:340px;overflow:auto}
-.tx{border-left:3px solid var(--bd);padding:8px 12px;margin-bottom:8px;background:#0b1120;border-radius:0 8px 8px 0}
-.tx.bet{border-color:var(--cyan)}.tx.nobet{border-color:#33405e;opacity:.8}.tx.rejected{border-color:var(--amber)}
-.tx .h{display:flex;justify-content:space-between;gap:10px;font-size:12.5px}
-.tx .why{color:#c6cfe6;font-size:12px;margin-top:4px}
-.tx .meta{color:var(--dim);font-size:11px;margin-top:3px}
-.mono{font-variant-numeric:tabular-nums}
-.bartrack{display:inline-block;width:90px;height:8px;border-radius:5px;background:#121a30;vertical-align:middle;position:relative;margin:0 6px}
-.barf{position:absolute;left:0;top:0;height:100%;border-radius:5px}
-.legend{font-size:11px;color:var(--dim);margin-left:6px}
-a{color:var(--cyan)}
-.stream{height:320px;overflow:auto;background:#04070e;border:1px solid var(--bd);border-radius:8px;
-padding:10px 12px;margin-top:4px;font:12px/1.5 'Cascadia Code',Consolas,ui-monospace,monospace;white-space:pre}
-.stream .ln{display:block;color:#9fb0d8}
-.stream .ln.head{color:#e6ebf5;font-weight:700}
-.stream .ln.swarm{color:#c4b5fd}
-.stream .ln.data{color:#fbbf24}
-.stream .ln.fish{color:#67e8f9}
-.stream .ln.bet{color:#34d399;font-weight:600}
-.stream .ln.dim{color:#566184}
-.livedot{float:right;font-size:11px;color:var(--dim);font-weight:600}
-.health{display:flex;flex-wrap:wrap;gap:8px;margin:2px 0 14px}
-.hbadge{display:inline-flex;align-items:center;gap:6px;background:linear-gradient(180deg,var(--panel),var(--panel2));
-border:1px solid var(--bd);border-radius:20px;padding:5px 11px;font-size:11.5px;color:var(--tx);font-weight:600}
-.hbadge .hdot{width:8px;height:8px;border-radius:50%}
-.hbadge .hsub{color:var(--dim);font-size:10.5px;font-weight:500;margin-left:1px}
-.netwrap{position:relative;overflow:hidden}
-#net{width:100%;height:340px;display:block;border-radius:8px;border:1px solid var(--bd);
-background:radial-gradient(700px 280px at 50% 42%,#0a1330,transparent),#05080f}
-.llm{height:340px;overflow:auto;background:#05080f;border:1px solid var(--bd);border-radius:8px;
-padding:10px 12px;font:12.5px/1.55 'Cascadia Code',Consolas,ui-monospace,monospace}
-.llm .llmq{color:var(--cyan);font-weight:700;margin-bottom:8px;border-bottom:1px solid var(--bd);
-padding-bottom:6px;white-space:normal;word-break:break-word}
-.llm .llmbody{color:#cdd6ee;white-space:pre-wrap;word-break:break-word}
-.cursor{display:inline-block;width:7px;height:14px;background:var(--green);margin-left:1px;
-vertical-align:-2px;box-shadow:0 0 8px var(--green);animation:blink 1s steps(1) infinite}
-@keyframes blink{50%{opacity:0}}
-.mfgwrap{position:relative;height:380px;border:1px solid var(--bd);border-radius:8px;overflow:hidden;
-background:radial-gradient(700px 320px at 40% 35%,#0a1330,transparent),#05080f}
-#mfgraph{width:100%;height:100%;display:block;cursor:grab}
-.mfgbtn{float:right;background:var(--panel);color:var(--cyan);border:1px solid var(--bd);border-radius:6px;
-font-size:11px;padding:3px 9px;cursor:pointer;margin-left:8px}
-.mfgbtn:hover{border-color:var(--cyan)}
-.mfglegend{position:absolute;left:10px;bottom:10px;background:#0b1120cc;border:1px solid var(--bd);
-border-radius:8px;padding:8px 10px;font-size:10.5px;max-width:48%;backdrop-filter:blur(4px)}
-.mfglegend .lghdr{color:#aab6d6;font-weight:700;text-transform:uppercase;letter-spacing:.5px;display:block;margin-bottom:4px;font-size:10px}
-.mfglegend .lgrow{display:inline-flex;align-items:center;gap:5px;margin:2px 8px 2px 0;color:var(--dim)}
-.mfglegend .lgdot{width:8px;height:8px;border-radius:50%}
-.mfgdetails{position:absolute;right:10px;top:10px;width:300px;max-height:92%;overflow:auto;display:none;
-background:#0b1120f2;border:1px solid var(--cyan);border-radius:10px;padding:12px 14px;box-shadow:0 8px 30px #000a;backdrop-filter:blur(4px)}
-.mfgdetails.show{display:block}
-.mfgdetails .dh{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px}
-.mfgdetails .dh b{font-size:13px}
-.mfgdetails .dx{cursor:pointer;color:var(--dim);font-size:14px}
-.mfgdetails .drow{font-size:11.5px;margin:5px 0;color:#cdd6ee}
-.mfgdetails .dk{color:var(--dim);display:inline-block;min-width:78px}
-.mfgdetails .dmono{font-family:Consolas,monospace;font-size:10.5px;color:#9fb0d8;word-break:break-all}
-.mfgdetails .dsum{font-size:11.5px;color:#c6cfe6;margin-top:4px;line-height:1.5}
-.mfgtag{display:inline-block;padding:2px 8px;border-radius:20px;font-size:10.5px;font-weight:600;margin:2px 4px 0 0}
-.mfrprog{height:6px;background:#121a30;border-radius:5px;overflow:hidden;margin:4px 0 10px}
-.mfrprog .bar{height:100%;background:linear-gradient(90deg,#22d3ee,#34d399);border-radius:5px;transition:width .4s}
-.mfrbody{max-height:420px;overflow:auto;font-size:13px;line-height:1.6;color:#cdd6ee;padding:2px 6px}
-.mfrbody h1{font-size:17px;color:#e6ebf5;margin:6px 0}
-.mfrbody h2{font-size:14px;color:var(--cyan);margin:14px 0 6px;border-bottom:1px solid var(--bd);padding-bottom:4px}
-.mfrbody h3{font-size:13px;color:#aab6d6;margin:10px 0 4px}
-.mfrbody blockquote{border-left:3px solid var(--purple);margin:8px 0;padding:4px 12px;color:#9fb0d8;background:#0b1120;border-radius:0 6px 6px 0;font-style:italic}
-.mfrbody strong{color:#e6ebf5} .mfrbody li{margin:3px 0} .mfrbody p{margin:7px 0}
-</style></head><body>
-<h1><span class=dot></span>Polymarket Harness — Live Paper-Trading Monitor</h1>
-<div class=sub id=sub>paper only · $0 local swarm (qwen2.5:7b) · loading…</div>
+body{margin:0;background:radial-gradient(1200px 600px at 60% -10%,#150a22 0,#06060c 60%),var(--bg);
+color:var(--ink);font:13px/1.45 'Segoe UI',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+.mono{font-family:'Cascadia Code',Consolas,'Courier New',monospace}
+a{color:var(--cyan);text-decoration:none}a:hover{text-decoration:underline}
+.wrap{padding:10px 14px;max-width:1700px;margin:0 auto}
+.glow{border:1px solid var(--line);border-radius:10px;background:var(--panel);
+box-shadow:0 0 0 1px rgba(0,0,0,.4),0 0 22px -8px rgba(255,43,209,.35);backdrop-filter:blur(4px)}
+.lab{font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim)}
+.big{font-size:30px;font-weight:700;letter-spacing:.5px}
+.huge{font-size:40px;font-weight:800;letter-spacing:.5px}
+.grn{color:var(--grn)}.mag{color:var(--mag)}.amb{color:var(--amb)}.red{color:var(--red)}.cyan{color:var(--cyan)}.dim{color:var(--dim)}
+.badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10px;letter-spacing:.08em;
+border:1px solid currentColor;font-weight:600}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+.topbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:8px 14px;margin-bottom:10px}
+.topbar .sp{flex:1}
+.kpi{padding:14px 16px;min-width:230px;flex:1}
+.kpi .r{display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px dashed rgba(255,255,255,.05)}
+.kpi .r b{font-variant-numeric:tabular-nums}
+.col{display:flex;flex-direction:column;gap:10px}
+.sec{padding:12px 14px}
+h2.t{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--mag);margin:0 0 8px}
+.grid3{display:grid;grid-template-columns:1.15fr 1.7fr 1.15fr;gap:10px}
+.grid2{display:grid;grid-template-columns:1.6fr 1fr;gap:10px}
+@media(max-width:1100px){.grid3,.grid2{grid-template-columns:1fr}}
+canvas{display:block;width:100%}
+.stream{height:330px;overflow:auto;font-size:11.5px}
+.ev{padding:3px 6px;border-left:2px solid var(--dim);margin:2px 0;background:rgba(255,255,255,.02)}
+.ev .ts{color:var(--dim);font-size:10px}
+.tabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px}
+.tab{padding:2px 9px;border-radius:6px;border:1px solid var(--line);cursor:pointer;font-size:10.5px;color:var(--dim)}
+.tab.on{color:var(--mag);border-color:var(--mag);box-shadow:0 0 10px -4px var(--mag)}
+.bet{padding:11px 13px;margin-bottom:9px}
+.bet .q{font-weight:600;font-size:13px}
+.bet .g{display:flex;gap:6px;flex-wrap:wrap;margin-top:5px}
+.gp{font-size:9px;padding:1px 6px;border-radius:5px;border:1px solid var(--grn);color:var(--grn)}
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:7px}
+.metrics div{background:rgba(255,255,255,.03);border-radius:6px;padding:5px 7px}
+.metrics .lab{font-size:8.5px}.metrics b{font-size:14px;font-variant-numeric:tabular-nums}
+.timer{font-family:'Cascadia Code',monospace;font-size:18px;font-weight:700;letter-spacing:1px}
+table{width:100%;border-collapse:collapse;font-size:11.5px}
+th,td{text-align:left;padding:4px 7px;border-bottom:1px solid rgba(255,255,255,.05)}
+th{color:var(--dim);font-size:9.5px;letter-spacing:.1em;text-transform:uppercase}
+.term{height:200px;overflow:auto;background:#04040a;border-radius:8px;padding:8px;font-size:11px}
+.term .l{white-space:pre-wrap;word-break:break-word}
+.proof{font-size:11px;margin-top:6px;display:none}
+.proof .p{padding:2px 6px;border-left:2px solid var(--dim);margin:1px 0}
+.dotpulse{animation:pulse 1.4s infinite}@keyframes pulse{0%,100%{opacity:.4}50%{opacity:1}}
+.empty{color:var(--dim);font-style:italic;padding:8px}
+.smallbtn{font-size:9.5px;padding:1px 7px;border:1px solid var(--line);border-radius:5px;background:none;color:var(--cyan);cursor:pointer}
+</style></head><body><div class=wrap>
 
-<div class=ttl style="margin-bottom:6px">System health <span class=legend>(every badge is a live probe · green &lt;15m · amber 15–60m · red down/&gt;60m)</span></div>
-<div class="health" id=health><span class=hbadge><span class=hdot style="background:var(--dim)"></span>probing…</span></div>
-
-<div id=nextbet style="margin:8px 0 16px;padding:14px 18px;background:linear-gradient(90deg,#11224d,#0d1322);border:1px solid var(--cyan);border-radius:12px;box-shadow:0 0 24px #22d3ee22">
-  <span style="color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:.7px">⏱ Next bet resolves in</span>
-  <span id=nextcd class=mono style="font-size:32px;font-weight:800;color:var(--cyan);margin:0 14px;text-shadow:0 0 14px #22d3ee88">—</span>
-  <span id=nextq style="color:#aab6d6"></span>
+<div class="topbar glow">
+  <span class="big mag">◆ POLYMARKET&nbsp;<span class=ink>AI</span></span>
+  <span class="lab">COMMAND CENTER</span>
+  <span id=ver class="lab mono">branch · commit</span>
+  <span class="badge grn" id=paperbadge>PAPER-ONLY</span>
+  <span class="badge" id=sysbadge>SYSTEM unknown</span>
+  <span class="sp"></span>
+  <span class="lab">DB</span><span id=dbstat class=mono>unknown</span>
+  <span class="lab">STREAM</span><span id=sse class=mono>connecting…</span>
+  <span class="lab">LAST EVT</span><span id=evage class=mono>—</span>
+  <span class="huge mono" id=clock style="font-size:20px">--:--:--</span>
 </div>
 
-<div class="grid cards" id=cards></div>
-
-<div class="grid" style="grid-template-columns:1.5fr 1fr;gap:14px;margin-top:14px">
-  <div class="panel netwrap">
-    <div class=ttl>🧠 Agent network — live
-      <span class=legend>nodes flare as the swarm gathers data &amp; the agents reason</span>
-      <span id=netstate class=livedot>● idle</span></div>
-    <canvas id=net></canvas>
+<!-- HERO -->
+<div class="row" style="margin-bottom:10px">
+  <div class="kpi glow"><div class=lab>◢ PAPER WALLET</div>
+    <div class="huge" id=equity>—</div>
+    <div class="lab" id=eqver>equity unknown</div>
+    <div style="margin-top:8px" class=mono>
+      <div class=r><span class=dim>Starting</span><b id=w_start>—</b></div>
+      <div class=r><span class=dim>Cash</span><b id=w_cash>—</b></div>
+      <div class=r><span class=dim>Realized PnL</span><b id=w_real>—</b></div>
+      <div class=r><span class=dim>Unrealized PnL</span><b id=w_unreal>—</b></div>
+      <div class=r><span class=dim>Total PnL</span><b id=w_total>—</b></div>
+      <div class=r><span class=dim>Open exposure</span><b id=w_exp>—</b></div>
+      <div class=r><span class=dim>Open / Settled</span><b id=w_counts>—</b></div>
+      <div class=r><span class=dim>Accounting</span><b id=w_acct>—</b></div>
+    </div>
   </div>
-  <div class=panel>
-    <div class=ttl>🤖 LLM live — watch it think
-      <span class=legend>real token stream over WebSocket</span>
-      <span id=llmdot class=livedot>● connecting…</span></div>
-    <div id=llmlive class=llm><div class=llmq></div><div class=llmbody></div></div>
+  <div class="kpi glow"><div class=lab>◢ P&amp;L / READINESS</div>
+    <div class="huge" id=totalpnl>—</div>
+    <div class="lab">total paper PnL</div>
+    <div style="margin-top:8px" class=mono>
+      <div class=r><span class=dim>Realized</span><b id=p_real>—</b></div>
+      <div class=r><span class=dim>Unrealized</span><b id=p_unreal>—</b></div>
+      <div class=r><span class=dim>Max drawdown</span><b id=p_dd>—</b></div>
+      <div class=r><span class=dim>CLV avg</span><b id=p_clv>—</b></div>
+      <div class=r><span class=dim>Gate 2 readiness</span><b id=p_gate2>—</b></div>
+      <div class=r><span class=dim>Sample</span><b id=p_sample>—</b></div>
+    </div>
+  </div>
+  <div class="kpi glow"><div class=lab>◢ SAFETY GATES</div>
+    <div class=mono style="margin-top:4px">
+      <div class=r><span class=dim>System truth</span><b id=s_sys>—</b></div>
+      <div class=r><span class=dim>Accounting</span><b id=s_acct>—</b></div>
+      <div class=r><span class=dim>Gate 1 / Gate 2</span><b id=s_gates>—</b></div>
+      <div class=r><span class=dim>MiroFish</span><b id=s_mf>—</b></div>
+      <div class=r><span class=dim>Swarm/daemons</span><b id=s_daemon>—</b></div>
+      <div class=r><span class=dim>Parser</span><b id=s_parser>strict (Plan 7)</b></div>
+      <div class=r><span class=dim>Event safety</span><b id=s_event>multi-leg off</b></div>
+    </div>
+    <div class=lab style="margin-top:6px">verified, never faked · unknown ≠ green</div>
   </div>
 </div>
 
-<div class="grid main">
-  <div class=panel><div class=ttl>Equity &amp; realized P&amp;L</div><canvas id=pnl height=120></canvas></div>
-  <div class=panel><div class=ttl>The two gates (vs market bar 0.0627)</div><div id=gauges></div></div>
-</div>
-
-<div class="grid" style="margin-top:14px"><div class=panel>
-  <div class=ttl>🛰 Live agent feed — watch the swarm &amp; MiroFish gather data and reason
-    <span class=legend>(streaming the daemon's console in real time)</span>
-    <span id=streamdot class=livedot>● connecting…</span></div>
-  <div id=stream class=stream></div>
-</div></div>
-
-<div class="grid" style="margin-top:14px">
-  <div class=panel><div class=ttl>What it's betting on — open paper positions  <span class=legend>(click a market to open it on Polymarket ↗ · "⏳ awaiting result" = game/market in progress, NOT a loss)</span></div>
-    <table id=postbl><thead><tr><th>Market</th><th>Side</th><th>Model</th><th>Mkt</th><th>Edge</th><th>Stake</th><th>Fill</th><th style="color:var(--green)">If win</th><th style="color:var(--cyan)">⏱ Resolves in</th></tr></thead><tbody></tbody></table></div>
-</div>
-
-<div class="grid" style="margin-top:14px">
-  <div class=panel><div class=ttl>Settled bets — what we won / lost  <span class=legend id=closedsum></span></div>
-    <table id=closedtbl><thead><tr><th>Market</th><th>Side</th><th>Stake</th><th>Result</th><th>Won / Lost</th><th>When</th></tr></thead><tbody></tbody></table></div>
-</div>
-
-<div class="grid" style="margin-top:14px">
-  <div class=panel><div class=ttl>Challenger A/B — swarm vs <span id=ablegend class=legend>single-LLM</span> vs market</div>
-    <table id=abtbl><thead><tr><th>Market</th><th>Swarm</th><th>1-LLM</th><th>Market</th></tr></thead><tbody></tbody></table></div>
-</div>
-
-<div class="grid" style="margin-top:14px"><div class=panel>
-  <div class=ttl>🐟 MiroFish — knowledge graph
-    <span class=legend>entities &amp; relations the crowd-sim extracted · real data from :5001 (click a node)</span>
-    <button id=mfgrefresh class=mfgbtn>⟳ refresh</button>
-    <span id=mfgmeta class=livedot>—</span></div>
-  <div class=mfgwrap>
-    <canvas id=mfgraph></canvas>
-    <div id=mfglegend class=mfglegend></div>
-    <div id=mfgdetails class=mfgdetails></div>
+<!-- AI NOW + CHARTS -->
+<div class="grid2" style="margin-bottom:10px">
+  <div class="sec glow"><h2 class=t>◢ PnL / Equity Curve</h2>
+    <canvas id=curve height=170></canvas>
+    <div class=lab id=curvestate>—</div>
   </div>
-  <div id=mirofish style="margin-top:10px"></div>
-</div></div>
+  <div class="sec glow"><h2 class=t>◢ What is the AI doing now?</h2>
+    <div class="big" id=ai_state>—</div>
+    <div class=mono style="margin-top:6px;font-size:11.5px">
+      <div class=r><span class=dim>Market</span><b id=ai_mkt>—</b></div>
+      <div class=r><span class=dim>Agent</span><b id=ai_agent>—</b></div>
+      <div class=r><span class=dim>MiroFish</span><b id=ai_mf>—</b></div>
+      <div class=r><span class=dim>Last gate</span><b id=ai_gate>—</b></div>
+      <div class=r><span class=dim>Last no-bet</span><b id=ai_nobet>—</b></div>
+      <div class=r><span class=dim>Heartbeat</span><b id=ai_hb>—</b></div>
+      <div class=r><span class=dim>Last event age</span><b id=ai_age>—</b></div>
+    </div>
+  </div>
+</div>
 
-<div class="grid" style="margin-top:14px"><div class=panel>
-  <div class=ttl>🐟 MiroFish report — the crowd-sim's written analysis
-    <span class=legend>generated by MiroFish's report agent (:5001)</span>
-    <button id=mfrrefresh class=mfgbtn>⟳ refresh</button>
-    <span id=mfrmeta class=livedot>—</span></div>
-  <div id=mfrprog class=mfrprog></div>
-  <div id=mfrbody class=mfrbody></div>
-</div></div>
+<!-- SWARM MAP + STREAM -->
+<div class="grid2" style="margin-bottom:10px">
+  <div class="sec glow"><h2 class=t>◢ AI Swarm Map <span class=lab>(nodes glow on REAL events)</span></h2>
+    <canvas id=swarm height=300></canvas>
+  </div>
+  <div class="sec glow"><h2 class=t>◢ Live AI Stream</h2>
+    <div class=tabs id=tabs></div>
+    <div class="stream mono" id=stream><div class=empty>waiting for live events…</div></div>
+  </div>
+</div>
 
-<div class="grid" style="margin-top:14px"><div class=panel><div class=ttl>Decision transcript — why it's betting</div><div class=txn id=txn></div></div></div>
+<!-- ACTIVE BETS -->
+<div class="sec glow" style="margin-bottom:10px"><h2 class=t>◢ Active Paper Bets <span class=lab id=openct></span></h2>
+  <div id=openbets><div class=empty>no open paper bets</div></div>
+</div>
+
+<!-- SETTLED + CANDIDATES -->
+<div class="grid2" style="margin-bottom:10px">
+  <div class="sec glow"><h2 class=t>◢ Recent Settled Bets</h2>
+    <table><thead><tr><th>Market</th><th>Side</th><th>Entry</th><th>Out</th><th>Stake</th><th>Payout</th><th>PnL</th></tr></thead>
+    <tbody id=settled><tr><td colspan=7 class=empty>none</td></tr></tbody></table>
+  </div>
+  <div class="sec glow"><h2 class=t>◢ Markets Evaluated (bet / no-bet)</h2>
+    <div id=cands><div class=empty>none</div></div>
+  </div>
+</div>
+
+<!-- PROOF PANEL -->
+<div class="sec glow" style="margin-bottom:10px"><h2 class=t>◢ Proof This Is Working</h2>
+  <div class="row mono" style="font-size:11px">
+    <div class=col style="flex:1;min-width:240px">
+      <div class=r><span class=dim>Stream state</span><b id=pr_sse>—</b></div>
+      <div class=r><span class=dim>Last event id</span><b id=pr_eid>—</b></div>
+      <div class=r><span class=dim>Last event age</span><b id=pr_eage>—</b></div>
+      <div class=r><span class=dim>Clients</span><b id=pr_clients>—</b></div>
+    </div>
+    <div class=col style="flex:1;min-width:240px">
+      <div class=r><span class=dim>ai_pipeline HB</span><b id=pr_hb1>—</b></div>
+      <div class=r><span class=dim>sameday HB</span><b id=pr_hb2>—</b></div>
+      <div class=r><span class=dim>MiroFish state</span><b id=pr_mf>—</b></div>
+      <div class=r><span class=dim>Last decision</span><b id=pr_dec>—</b></div>
+    </div>
+    <div class=col style="flex:1;min-width:240px">
+      <div class=r><span class=dim>Branch / commit</span><b id=pr_ver>—</b></div>
+      <div class=r><span class=dim>Dirty tree</span><b id=pr_dirty>—</b></div>
+      <div class=r><span class=dim>Paper-only</span><b class=grn>true</b></div>
+      <div class=r><span class=dim>DB usable</span><b id=pr_db>—</b></div>
+    </div>
+  </div>
+</div>
+
+<!-- TERMINAL -->
+<div class="sec glow"><h2 class=t>◢ Execution Log · Live <span class=lab id=replaytag></span></h2>
+  <div class=tabs><span class=lab>filter:</span>
+    <span class="tab on" data-f="">all</span><span class=tab data-f=decision>decisions</span>
+    <span class=tab data-f=gate>gates</span><span class=tab data-f=agent>agents</span>
+    <span class=tab data-f=error>errors</span></div>
+  <div class="term mono" id=term><div class=empty>no events yet — start the AI daemons to see live activity</div></div>
+</div>
+</div>
 
 <script>
-const $=s=>document.querySelector(s);
-const money=v=>(v<0?'-$':'$')+Math.abs(v).toFixed(2);
-const pct=v=>v==null?'–':(v*100).toFixed(1)+'%';
-const b4=v=>v==null?'–':v.toFixed(4);
-// profit if an open bet resolves in our favor: each share pays $1, minus stake + fee
-function winIfHits(p){
-  const profit=(p.shares||0)-(p.stake||0)-(p.fee||0), pay=(p.shares||0);
-  const c=profit>=0?'pos':'neg';
-  return `<span class="${c}" style="font-weight:700">${profit>=0?'+':''}${money(profit)}</span>`
-       + `<span style="color:var(--dim);font-size:11px"> → ${money(pay)}</span>`;
-}
-let chart;
-function card(lab,big,delta,color){return `<div class=card><div class=accent style="background:${color}"></div>
-<div class=lab>${lab}</div><div class=big>${big}</div><div class=delta>${delta||''}</div></div>`}
-function gauge(label,val,disp,max,bar,goodLow){
-  const p=Math.max(0,Math.min(1,val/max));
-  const col = goodLow ? (val<=bar?'var(--green)':'var(--red)') : (val>=bar?'var(--green)':'var(--amber)');
-  const markP=Math.max(0,Math.min(1,bar/max));
-  return `<div class=gauge><div class=gl><span>${label}</span><span class=mono>${disp}</span></div>
-  <div class=gbar><div class=gfill style="width:${p*100}%;background:${col}"></div>
-  <div class=gmark style="left:${markP*100}%"></div></div></div>`;
-}
-function abbar(p,col){const w=Math.max(2,(p||0)*100);return `<span class=bartrack><span class=barf style="width:${w}%;background:${col}"></span></span>`}
-function fmtCountdown(end){
-  if(!end) return '—';
-  const ms=new Date(end).getTime()-Date.now();
-  if(isNaN(ms)) return '—';
-  if(ms<=0) return '⏳ awaiting result';
-  const s=Math.floor(ms/1000),d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60),ss=s%60;
-  const pad=n=>n<10?'0'+n:n;
-  return (d?d+'d ':'')+pad(h)+':'+pad(m)+':'+pad(ss);
-}
-function tickCountdowns(){
-  if(window._soon){
-    const ms=window._soon.t-Date.now();
-    const el=document.getElementById('nextcd');
-    if(el){ el.textContent = ms>0 ? fmtCountdown(new Date(window._soon.t).toISOString()) : '⏳ awaiting result';
-            el.style.color = ms>0 && ms<3600000 ? 'var(--amber)' : 'var(--cyan)'; }
-  }
-  document.querySelectorAll('.cd').forEach(el=>{
-    const e=el.getAttribute('data-end'); el.textContent=fmtCountdown(e);
-    const ms=e?new Date(e).getTime()-Date.now():NaN;
-    // past end-date but still open = game/market in progress, not a loss -> amber, not red
-    el.style.color = isNaN(ms)?'' : (ms<=0?'var(--amber)' : ms<3600000?'var(--amber)' : 'var(--green)');
-    el.style.fontWeight = (!isNaN(ms)&&ms>0&&ms<3600000)?'700':'';
-  });
-}
-setInterval(tickCountdowns, 1000);
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const ND='—';
+function money(v){if(v===null||v===undefined||v==='')return ND;const n=+v;if(!isFinite(n))return ND;
+  return (n<0?'-$':'$')+Math.abs(n).toFixed(2);}
+function num(v,d=2){if(v===null||v===undefined||v==='')return ND;const n=+v;return isFinite(n)?n.toFixed(d):ND;}
+function pct(v){if(v===null||v===undefined)return ND;const n=+v;return isFinite(n)?(n*100).toFixed(1)+'%':ND;}
+function sgnColor(v){if(v===null||v===undefined||!isFinite(+v))return 'var(--dim)';return +v>0?'var(--grn)':(+v<0?'var(--red)':'var(--ink)');}
+// honesty: ONLY explicit ok/healthy/pass map to green. unknown/stale/etc never green.
+function stateColor(s){s=(s||'').toLowerCase();
+  if(['ok','healthy','pass','passed','connected','won','running','finished'].includes(s))return 'var(--grn)';
+  if(['degraded','stale','idle','partial','awaiting_settlement','warning','learning'].includes(s))return 'var(--amb)';
+  if(['unsafe','fail','failed','blocked','error','crashed','lost','disconnected','invalid_timer'].includes(s))return 'var(--red)';
+  return 'var(--dim)';}
+function setBadge(el,txt,st){el.textContent=txt;el.style.color=stateColor(st);el.style.borderColor=stateColor(st);}
+async function getj(u){try{const r=await fetch(u,{cache:'no-store'});if(!r.ok)return null;return await r.json();}catch(e){return null;}}
 
+setInterval(()=>{$('#clock').textContent=new Date().toLocaleTimeString();},1000);
+
+/* ---------- swarm map (data-backed: nodes glow from real event types) ---------- */
+const SW=$('#swarm'),sx=SW.getContext('2d');
+const NODES=[['LLM·1','agent',.12,.2],['LLM·2','agent',.12,.5],['LLM·3','agent',.12,.8],
+ ['SWARM','swarm',.34,.5],['CHALLENGER','challenger',.34,.18],['EVIDENCE','evidence',.34,.82],
+ ['MIROFISH','mirofish',.56,.3],['GATES','gate',.56,.7],['WALLET','wallet',.78,.4],
+ ['ACCOUNTING','accounting',.78,.7],['JOURNAL','journal',.93,.55]];
+const EDGES=[[0,3],[1,3],[2,3],[4,3],[5,3],[3,6],[3,7],[6,7],[7,8],[8,9],[8,10],[6,8]];
+const heat={}; // source/type -> last-active ts
+function nodeColor(k){const t=heat[k];if(!t)return 'var(--dim)';const a=(Date.now()-t)/1000;
+  if(a<3)return 'var(--mag)';if(a<20)return 'var(--grn)';if(a<120)return 'var(--amb)';return 'var(--dim)';}
+function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim()||v;}
+function drawSwarm(){const w=SW.width=SW.clientWidth,h=SW.height=300;sx.clearRect(0,0,w,h);
+  EDGES.forEach(([a,b])=>{const A=NODES[a],B=NODES[b];const hot=Math.max(heatAge(A[1]),heatAge(B[1]));
+    sx.strokeStyle=hot<2?css('--mag'):'rgba(255,43,209,.10)';sx.lineWidth=hot<2?1.6:.7;
+    sx.beginPath();sx.moveTo(A[2]*w,A[3]*h);sx.lineTo(B[2]*w,B[3]*h);sx.stroke();});
+  NODES.forEach(n=>{const x=n[2]*w,y=n[3]*h,c=mapColor(nodeColor(n[1]));
+    const age=heatAge(n[1]);const r=age<3?11:7;
+    sx.beginPath();sx.arc(x,y,r,0,7);sx.fillStyle=c;sx.shadowColor=c;sx.shadowBlur=age<20?16:0;sx.fill();sx.shadowBlur=0;
+    sx.fillStyle=css('--dim');sx.font='9px monospace';sx.fillText(n[0],x+13,y+3);});}
+function heatAge(k){const t=heat[k];return t?(Date.now()-t)/1000:9999;}
+function mapColor(v){return v.startsWith('var(')?css(v.slice(4,-1)):v;}
+function touch(k){heat[k]=Date.now();}
+setInterval(drawSwarm,700);window.addEventListener('resize',drawSwarm);
+
+/* ---------- equity / pnl curve ---------- */
+async function drawCurve(){const d=await getj('/api/pnl-curve');const c=$('#curve'),g=c.getContext('2d');
+  const w=c.width=c.clientWidth,h=c.height=170;g.clearRect(0,0,w,h);
+  if(!d||!d.points||d.points.length<2){$('#curvestate').textContent=(d&&d.warnings&&d.warnings[0])||'not_enough_paper_wallet_history';return;}
+  $('#curvestate').textContent='state: '+d.state+(d.state==='unverified'?' · marks unverified (Plan 9)':'');
+  const pts=d.points,eq=pts.map(p=>p.equity).filter(v=>v!=null);
+  if(eq.length<2){$('#curvestate').textContent='not_enough_data';return;}
+  const mn=Math.min(...eq),mx=Math.max(...eq),sp=(mx-mn)||1;
+  function line(key,col){g.beginPath();let started=false;pts.forEach((p,i)=>{const v=p[key];if(v==null)return;
+    const x=i/(pts.length-1)*(w-8)+4,y=h-6-((v-mn)/sp)*(h-16);if(!started){g.moveTo(x,y);started=true;}else g.lineTo(x,y);});
+    g.strokeStyle=col;g.lineWidth=1.8;g.shadowColor=col;g.shadowBlur=8;g.stroke();g.shadowBlur=0;}
+  line('cash',css('--cyan'));line('equity',d.state==='ok'?css('--grn'):css('--amb'));}
+
+/* ---------- countdown timers (client-side, per second) ---------- */
+const timers={}; // position_id -> {endMs, status}
+function fmtCountdown(secs){if(secs===null||secs===undefined)return '—';if(secs<=0)return 'ENDED';
+  const d=Math.floor(secs/86400),h=Math.floor(secs%86400/3600),m=Math.floor(secs%3600/60),s=Math.floor(secs%60);
+  return (d?d+'d ':'')+String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');}
+setInterval(()=>{Object.entries(timers).forEach(([id,t])=>{const el=document.getElementById('tm_'+id);if(!el)return;
+  if(t.status==='timer_unknown'){el.textContent='timer_unknown';el.style.color='var(--dim)';return;}
+  if(t.status==='invalid_timer'){el.textContent='invalid_timer';el.style.color='var(--red)';return;}
+  if(t.endMs===null){el.textContent='timer_unknown';el.style.color='var(--dim)';return;}
+  const secs=Math.floor((t.endMs-Date.now())/1000);
+  if(secs<=0){el.textContent='AWAITING SETTLEMENT';el.style.color='var(--red)';return;}
+  el.textContent=fmtCountdown(secs);el.style.color=secs<86400?'var(--amb)':'var(--ink)';});},1000);
+
+/* ---------- active bets ---------- */
+async function renderBets(){const d=await getj('/api/paper-bets/open');const box=$('#openbets');
+  const ps=(d&&d.positions)||[];$('#openct').textContent='· '+ps.length+' open';
+  if(!ps.length){box.innerHTML='<div class=empty>no open paper bets</div>';return;}
+  box.innerHTML=ps.map(p=>{const pid=p.position_id;
+    timers[pid]={endMs:p.end_time?Date.parse(p.end_time):(p.seconds_until_end!=null?Date.now()+p.seconds_until_end*1000:null),status:p.timer_status};
+    const link=p.url_status==='ok'&&p.url?`<a href="${p.url}" target=_blank rel=noopener>open on Polymarket ↗</a>`:`<span class=red>link_unavailable</span>`;
+    const payout=p.payout_reason==='payout_ok';
+    const gates=(p.gates_passed||[]).map(g=>`<span class=gp>${g}</span>`).join('');
+    return `<div class="bet glow"><div style="display:flex;justify-content:space-between;gap:10px">
+      <div style="flex:1"><div class=q>${(p.question||'?')}</div>
+        <div class=lab>${p.market_id||''} · ${link}</div></div>
+      <div style="text-align:right"><span class="badge" style="color:${p.side==='YES'?'var(--grn)':'var(--mag)'}">${p.side||'?'}</span>
+        <div class=timer id="tm_${pid}">—</div></div></div>
+      <div class=metrics>
+        <div><div class=lab>Entry</div><b>${num(p.entry_price,3)}</b></div>
+        <div><div class=lab>Stake</div><b>${money(p.stake)}</b></div>
+        <div><div class=lab>Payout if win</div><b class=grn>${payout?money(p.possible_payout_if_win):'payout_unknown'}</b></div>
+        <div><div class=lab>Profit if win</div><b class=grn>${payout?money(p.possible_profit_if_win):ND}</b></div>
+        <div><div class=lab>Max loss</div><b class=red>${payout?money(p.max_loss):ND}</b></div>
+        <div><div class=lab>Unrealized</div><b style="color:${sgnColor(p.unrealized_pnl)}">${p.unrealized_pnl==null?'unknown':money(p.unrealized_pnl)}</b></div>
+        <div><div class=lab>Forecast</div><b>${pct(p.forecast_probability)}</b></div>
+        <div><div class=lab>MiroFish</div><b style="color:${stateColor(p.mirofish_state)}">${p.mirofish_state||'unknown'}</b></div>
+      </div>
+      <div class=g>${gates}</div>
+      <div class=lab style="margin-top:5px">AI reason: <span class=ink>${(p.ai_reason||'unknown')}</span></div>
+      <button class=smallbtn onclick="proof('${pid}')">▸ proof timeline</button>
+      <div class=proof id="proof_${pid}"></div></div>`;}).join('');}
+
+async function proof(pid){const el=$('#proof_'+pid);if(el.style.display==='block'){el.style.display='none';return;}
+  el.style.display='block';el.innerHTML='loading…';const d=await getj('/api/paper-bets/proof?position_id='+pid);
+  if(!d){el.innerHTML='<span class=red>proof unavailable</span>';return;}
+  el.innerHTML='<div class=lab>proof: '+d.proof_status+'</div>'+(d.timeline||[]).map(t=>
+    `<div class=p style="border-color:${stateColor(t.status)}"><span style="color:${stateColor(t.status)}">${t.status}</span> · ${t.step} <span class=dim>(${t.source})</span> — ${t.message||''}</div>`).join('');}
+
+/* ---------- settled + candidates ---------- */
+async function renderSettled(){const d=await getj('/api/paper-bets/settled');const tb=$('#settled');
+  const ps=(d&&d.positions)||[];if(!ps.length){tb.innerHTML='<tr><td colspan=7 class=empty>none</td></tr>';return;}
+  tb.innerHTML=ps.map(p=>{const link=p.url_status==='ok'&&p.url?`<a href="${p.url}" target=_blank rel=noopener>${(p.question||'?').substring(0,42)} ↗</a>`:(p.question||'?').substring(0,42)+' <span class=red>(link_unavailable)</span>';
+    return `<tr><td>${link}</td><td>${p.side||'?'}</td><td>${num(p.entry_price,3)}</td>
+    <td style="color:${stateColor(p.outcome)}">${p.outcome||'unknown'}</td><td>${money(p.stake)}</td>
+    <td>${money(p.payout)}</td><td style="color:${sgnColor(p.realized_pnl)}">${money(p.realized_pnl)}</td></tr>`;}).join('');}
+
+async function renderCands(){const d=await getj('/api/candidates/recent');const box=$('#cands');
+  const cs=(d&&d.candidates)||[];if(!cs.length){box.innerHTML='<div class=empty>none</div>';return;}
+  box.innerHTML=cs.map(c=>{const bet=c.action==='bet';
+    return `<div style="padding:5px 0;border-bottom:1px solid rgba(255,255,255,.05)">
+      <span class="badge" style="color:${bet?'var(--grn)':'var(--amb)'};font-size:9px">${bet?'BET':'NO-BET · '+(c.reason_bucket||'')}</span>
+      <span style="font-size:11.5px"> ${(c.question||'?').substring(0,58)}</span>
+      <div class=lab>fc ${pct(c.forecast_probability)} · mkt ${pct(c.market_price)} · ${(c.reason||'').substring(0,80)}</div></div>`;}).join('');}
+
+/* ---------- wallet / pnl / safety / proof / ai-now ---------- */
 async function tick(){
-  let d; try{ d=await (await fetch('/api/state')).json(); }catch(e){ return; }
-  const w=d.wallet, sb=d.scoreboard, c=d.counts;
-  const pnlCol = w.realized_pnl>=0?'var(--green)':'var(--red)';
-  $('#sub').innerHTML=`paper only · $0 local swarm (qwen2.5:7b) · ${c.bets} bets placed · ${c.forecasts} forecasts · updated ${new Date().toLocaleTimeString()}`;
-  $('#ablegend').textContent = (d.challenger_hosted?'🟢 ':'')+(d.challenger_model||'single-LLM')+(d.challenger_hosted?' (live)':' (local)');
-  $('#cards').innerHTML=[
-    card('Cash', money(w.cash), 'available to bet','var(--cyan)'),
-    // Plan 10: equity shows VERIFIED mark-to-market or 'unverified' — never a fake at-cost number painted as truth.
-    card('Equity', d.equity_verified ? money((d.accounting||{}).equity) : 'unverified',
-         d.equity_verified ? 'mark-to-market verified' : 'marks stale/missing · at-cost '+money(w.equity),
-         d.equity_verified ? 'var(--purple)' : 'var(--amber)'),
-    card('Realized P&amp;L', money(w.realized_pnl), `start ${money(w.starting_bankroll)}`, pnlCol),
-    card('Open positions', w.n_open, money(w.open_exposure)+' exposure','var(--amber)'),
-    card('Forecasts', c.forecasts, `${c.resolved} resolved`,'var(--blue)'),
-    // Plan 10: Gate 2 shows its Plan-9 fail-closed status/reason, not just a ✓/✗.
-    card('Gates', (sb.gate1?'1✓':'1✗')+' '+(sb.gate2?'2✓':'2✗'),
-         'G2 '+(sb.gate2_status||(sb.gate2?'pass':'fail'))
-           +((!sb.gate2 && sb.gate2_reasons && sb.gate2_reasons.length)?(' · '+sb.gate2_reasons[0]):'')
-           +` · n=${sb.n}/${sb.n_required}`,
-         (sb.gate1&&sb.gate2)?'var(--green)':'var(--pink)'),
-  ].join('');
-
-  $('#gauges').innerHTML =
-    gauge('GATE 1 · swarm Brier (lower=better)', sb.model_brier==null?0.25:sb.model_brier,
-          sb.model_brier==null?'no data':b4(sb.model_brier)+' vs bar '+d.bar, 0.25, d.bar, true)
-   + gauge('Resolved opinion markets', sb.n, sb.n+' / '+sb.n_required, sb.n_required, sb.n_required, false)
-   + gauge('GATE 2 · paper realized P&L', Math.max(0,w.realized_pnl), money(w.realized_pnl), Math.max(50,Math.abs(w.realized_pnl)*1.2||50), 0.0001, false)
-   + `<div class=legend style="margin-top:8px">single-LLM A/B Brier: <b>${b4(sb.baseline_brier)}</b> (n=${sb.baseline_n}) · white tick = market bar to beat</div>`;
-
-  const pb=$('#postbl tbody'); pb.innerHTML = (d.positions||[]).map(p=>`<tr>
-    <td class=q title="${(p.question||'').replace(/"/g,'')}">${p.event_slug?`<a href="https://polymarket.com/event/${p.event_slug}" target="_blank" rel="noopener">${p.question||''} ↗</a>`:(p.question||'')}</td>
-    <td><span class="pill ${p.side=='YES'?'yes':'no'}">${p.side}</span></td>
-    <td class=mono>${pct(p.model_p)}</td><td class=mono>${pct(p.market_p)}</td>
-    <td class="mono ${p.edge>=0?'pos':'neg'}">${(p.edge*100>=0?'+':'')+(p.edge*100).toFixed(1)}%</td>
-    <td class=mono>${money(p.stake)}</td><td class=mono>${(p.fill_price||0).toFixed(3)}</td>
-    <td class=mono>${winIfHits(p)}</td>
-    <td class="mono cd" data-end="${p.end_date||''}">${fmtCountdown(p.end_date)}</td></tr>`).join('')
-    || '<tr><td colspan=9 style="color:var(--dim)">no open positions</td></tr>';
-
-  // settled / closed bets — explicit win/loss per bet
-  const cl=d.closed||[];
-  let nWon=0,nLost=0,net=0;
-  cl.forEach(p=>{ const r=p.realized_pnl||0; net+=r; if(r>=0)nWon++; else nLost++; });
-  $('#closedsum').innerHTML = cl.length
-    ? `<span class=pos>${nWon} won</span> · <span class=neg>${nLost} lost</span> · net <b style="color:${net>=0?'var(--green)':'var(--red)'}">${money(net)}</b>`
-    : '';
-  $('#closedtbl tbody').innerHTML = cl.map(p=>{
-    const r=p.realized_pnl||0, win=r>=0;
-    const when = p.settled_at ? new Date(p.settled_at.replace(' ','T')+(/[zZ]|[+\-]\d\d:?\d\d$/.test(p.settled_at)?'':'Z')).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
-    return `<tr>
-      <td class=q title="${(p.question||'').replace(/"/g,'')}">${p.event_slug?`<a href="https://polymarket.com/event/${p.event_slug}" target="_blank" rel="noopener">${p.question||''} ↗</a>`:(p.question||'')}</td>
-      <td><span class="pill ${p.side=='YES'?'yes':'no'}">${p.side}</span></td>
-      <td class=mono>${money(p.stake)}</td>
-      <td><span class="pill ${win?'yes':'no'}">${win?'WON':'LOST'}${p.status=='closed'?' (cashed out)':''}</span></td>
-      <td class="mono ${win?'pos':'neg'}" style="font-weight:700">${(r>=0?'+':'')+money(r)}</td>
-      <td class=mono style="color:var(--dim)">${when}</td></tr>`;
-  }).join('') || '<tr><td colspan=6 style="color:var(--dim)">no settled bets yet — each bet shows here with its win/loss once it resolves or is cashed out</td></tr>';
-
-  // soonest-resolving open bet -> big banner at the top
-  let soon=null;
-  (d.positions||[]).forEach(p=>{ if(p.end_date){ const t=new Date(p.end_date).getTime(); if(t>Date.now() && (!soon||t<soon.t)) soon={t:t,q:p.question||'',side:p.side,stake:p.stake,win:(p.shares||0)-(p.stake||0)-(p.fee||0)}; }});
-  window._soon=soon;
-  $('#nextq').innerHTML = soon ? `${soon.side} $${(soon.stake||0).toFixed(0)} · wins <b style="color:var(--green)">+${money(soon.win)}</b> if it hits · ${soon.q.substring(0,60)}` : '(no open bets)';
-
-  const ab=$('#abtbl tbody'); ab.innerHTML=(d.ab||[]).map(r=>`<tr>
-    <td class=q title="${(r.question||'').replace(/"/g,'')}">${r.question||''}</td>
-    <td class=mono>${abbar(r.swarm_p,'var(--purple)')}${pct(r.swarm_p)}</td>
-    <td class=mono>${abbar(r.llm_p,'var(--cyan)')}${pct(r.llm_p)}</td>
-    <td class=mono>${abbar(r.market_p,'var(--green)')}${pct(r.market_p)}</td></tr>`).join('')
-    || '<tr><td colspan=4 style="color:var(--dim)">no A/B data yet</td></tr>';
-
-  $('#txn').innerHTML=(d.decisions||[]).map(x=>`<div class="tx ${x.status=='bet'?'bet':x.status=='rejected'?'rejected':'nobet'}">
-    <div class=h><span class=q title="${(x.question||'').replace(/"/g,'')}">${x.question||''}</span>
-    <span>${x.status=='bet'?`<span class="pill ${x.side=='YES'?'yes':'no'}">${x.side} ${money(x.stake)}</span>`:`<span style="color:var(--dim)">${x.status}</span>`}</span></div>
-    <div class=why>${x.why||''}</div>
-    <div class=meta>${x.ts?new Date(x.ts).toLocaleString():''} ${x.regime?'· regime '+x.regime:''} ${x.signal?'· '+x.signal:''}</div></div>`).join('')
-    || '<div style="color:var(--dim)">no decisions logged yet — they appear as the loop forecasts</div>';
-
-  $('#mirofish').innerHTML=(d.mirofish||[]).map(mf=>`<div class=tx style="border-color:#22d3ee">
-    <div class=h><span class=q title="${(mf.question||'').replace(/"/g,'')}">${mf.question||''}</span>
-    <span class=mono>crowd ${pct(mf.crowd_probability)}${mf.market_odds!=null?' · mkt '+pct(mf.market_odds):''} · ${mf.n_posts||0} posts</span></div>
-    ${(mf.posts||[]).slice(0,3).map(p=>`<div class=meta style="color:#9fb0d8">🗣 ${(p||'').substring(0,150)}</div>`).join('')}</div>`).join('')
-    || '<div style="color:var(--dim)">no MiroFish crowd simulations yet — they appear after a sim generates posts</div>';
-
-  const s=d.pnl_series||[];
-  const labels=s.map(p=>new Date(p.ts).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}));
-  const eq=s.map(p=>p.equity), rp=s.map(p=>p.realized_pnl), cash=s.map(p=>p.cash);
-  if(!chart){
-    chart=new Chart($('#pnl'),{type:'line',data:{labels,datasets:[
-      {label:'Equity',data:eq,borderColor:'#8b5cf6',backgroundColor:'#8b5cf622',tension:.25,fill:true,pointRadius:0,borderWidth:2},
-      {label:'Cash',data:cash,borderColor:'#22d3ee',tension:.25,pointRadius:0,borderWidth:1.5},
-      {label:'Realized P&L',data:rp,borderColor:'#34d399',tension:.25,pointRadius:0,borderWidth:1.5,yAxisID:'y1'},
-    ]},options:{responsive:true,interaction:{mode:'index',intersect:false},
-      plugins:{legend:{labels:{color:'#aab6d6',boxWidth:12}}},
-      scales:{x:{ticks:{color:'#5e6b8a',maxTicksLimit:8},grid:{color:'#131a2e'}},
-        y:{ticks:{color:'#5e6b8a'},grid:{color:'#131a2e'},title:{display:true,text:'$ equity/cash',color:'#5e6b8a'}},
-        y1:{position:'right',ticks:{color:'#34d399'},grid:{display:false},title:{display:true,text:'$ realized',color:'#34d399'}}}}});
-  } else {
-    chart.data.labels=labels; chart.data.datasets[0].data=eq; chart.data.datasets[1].data=cash; chart.data.datasets[2].data=rp; chart.update('none');
-  }
+  const [w,pnl,truth,ver,live,ai,gates,mf,hl]=await Promise.all([
+    getj('/api/paper-wallet'),getj('/api/pnl'),getj('/api/truth'),getj('/api/version'),
+    getj('/api/live/status'),getj('/api/ai-now'),getj('/api/gates'),getj('/api/mirofish'),getj('/api/health')]);
+  if(w){$('#equity').textContent=w.equity_verified?money(w.verified_equity):'unverified';
+    $('#equity').style.color=w.equity_verified?'var(--grn)':'var(--amb)';
+    $('#eqver').textContent=w.equity_verified?'equity VERIFIED (Plan 9)':'equity unverified · '+(w.accounting_status||'unknown');
+    $('#w_start').textContent=money(w.starting_bankroll);$('#w_cash').textContent=money(w.cash);
+    $('#w_real').textContent=money(w.realized_pnl);$('#w_real').style.color=sgnColor(w.realized_pnl);
+    $('#w_unreal').textContent=w.unrealized_pnl==null?'unverified':money(w.unrealized_pnl);
+    $('#w_total').textContent=money(w.total_pnl);$('#w_total').style.color=sgnColor(w.total_pnl);
+    $('#w_exp').textContent=money(w.open_exposure);
+    $('#w_counts').textContent=(w.open_positions_count??'?')+' / '+(w.settled_positions_count??'?');
+    $('#w_acct').textContent=w.accounting_status||'unknown';$('#w_acct').style.color=stateColor(w.accounting_status);}
+  if(pnl){$('#totalpnl').textContent=money(pnl.total_pnl);$('#totalpnl').style.color=sgnColor(pnl.total_pnl);
+    $('#p_real').textContent=money(pnl.realized_pnl);$('#p_unreal').textContent=pnl.unrealized_pnl==null?'unverified':money(pnl.unrealized_pnl);}
+  if(w){$('#p_dd').textContent=w.max_drawdown==null?ND:money(w.max_drawdown);
+    $('#p_gate2').textContent=(w.gate2_status||'unknown');$('#p_gate2').style.color=stateColor(w.gate2_pass?'pass':w.gate2_status);
+    $('#p_sample').textContent=(w.settled_positions_count??'?')+' settled';}
+  const clv=await getj('/api/clv/summary');if(clv){const c=clv.mean_clv||clv.overall||(clv.summary&&clv.summary.mean_clv);
+    $('#p_clv').textContent=(c&&c.mean_clv!=null)?num(c.mean_clv,3):(typeof c==='number'?num(c,3):'insufficient');}
+  if(truth){setBadge($('#sysbadge'),'SYSTEM '+(truth.state||'unknown'),truth.state);
+    $('#s_sys').textContent=truth.state||'unknown';$('#s_sys').style.color=stateColor(truth.state);
+    $('#s_acct').textContent=truth.accounting_status||'unknown';$('#s_acct').style.color=stateColor(truth.accounting_status);}
+  if(gates){const g2=gates.gate2||{};$('#s_gates').textContent=((gates.gate1&&gates.gate1.pass)?'G1✓':'G1✗')+' / '+(g2.pass?'G2 PASS':'G2 '+(g2.status||'unknown'));
+    $('#s_gates').style.color=stateColor(g2.pass?'pass':(g2.status||'unknown'));}
+  if(mf){$('#s_mf').textContent=(mf.used>0?('used×'+mf.used):'not used')+(mf.backend_alive?' · alive':'');$('#s_mf').style.color=stateColor(mf.used>0?'ok':'idle');
+    $('#pr_mf').textContent=mf.used>0?('used×'+mf.used):'not used';}
+  if(hl){const dm=hl.daemons||{};const a=dm.ai_pipeline||{},s=dm.sameday_daemon||{};
+    $('#s_daemon').textContent=(a.state||'unknown')+' / '+(s.state||'unknown');$('#s_daemon').style.color=stateColor(a.state);
+    $('#pr_hb1').textContent=a.state||'unknown';$('#pr_hb1').style.color=stateColor(a.state);
+    $('#pr_hb2').textContent=s.state||'unknown';$('#pr_hb2').style.color=stateColor(s.state);
+    $('#dbstat').textContent=hl.db_ok===false?'unusable':(hl.db_ok===true?'ok':'unknown');$('#dbstat').style.color=hl.db_ok?'var(--grn)':'var(--red)';
+    $('#pr_db').textContent=$('#dbstat').textContent;}
+  if(ver){const v=ver.git_branch?(ver.git_branch+' · '+(ver.git_commit||'').substring(0,7)):'unknown';
+    $('#ver').textContent=v;$('#pr_ver').textContent=v;$('#pr_dirty').textContent=ver.git_dirty==null?'unknown':(ver.git_dirty?'DIRTY':'clean');
+    $('#pr_dirty').style.color=ver.git_dirty?'var(--amb)':'var(--grn)';}
+  if(ai){$('#ai_state').textContent=(ai.state||'unknown').toUpperCase();$('#ai_state').style.color=stateColor(ai.state==='thinking'||ai.state==='evaluating'?'running':ai.state);
+    $('#ai_mkt').textContent=(ai.current_question||ai.current_market_id||'—');$('#ai_agent').textContent=ai.current_agent||'—';
+    $('#ai_mf').textContent=ai.mirofish_state||'unknown';$('#ai_gate').textContent=ai.last_gate_result||'—';
+    $('#ai_nobet').textContent=ai.last_no_bet_reason||'—';$('#ai_hb').textContent=ai.last_heartbeat_stage||'unknown';
+    $('#ai_age').textContent=ai.last_event_age_seconds==null?'no events':(ai.last_event_age_seconds.toFixed(0)+'s ago');
+    $('#pr_dec').textContent=ai.last_no_bet_reason||ai.last_bet_position_id||'—';}
+  if(live){setBadge($('#sysbadge'),$('#sysbadge').textContent,truth?truth.state:'unknown');
+    $('#pr_eid').textContent=live.last_event_id||'none';$('#pr_clients').textContent=live.client_count??'?';
+    $('#pr_sse').textContent=live.state||'unknown';$('#pr_sse').style.color=stateColor(live.state);
+    $('#pr_eage').textContent=live.last_event_age_seconds==null?'—':live.last_event_age_seconds.toFixed(0)+'s';
+    $('#evage').textContent=live.last_event_age_seconds==null?'no events':live.last_event_age_seconds.toFixed(0)+'s';
+    $('#evage').style.color=stateColor(live.state);}
+  drawCurve();renderBets();renderSettled();renderCands();
 }
-tick(); setInterval(tick,5000);
 
-// ── system health strip (every badge is a live probe / real DB ts / real mtime) ──
-function freshColor(sec){ if(sec==null) return 'var(--red)'; if(sec<900) return 'var(--green)'; if(sec<3600) return 'var(--amber)'; return 'var(--red)'; }
-function ago(sec){ if(sec==null) return 'never'; if(sec<60) return Math.round(sec)+'s ago'; if(sec<3600) return Math.round(sec/60)+'m ago'; if(sec<86400) return Math.round(sec/3600)+'h ago'; return Math.round(sec/86400)+'d ago'; }
-function hbadge(label,color,sub){ return `<span class=hbadge><span class=hdot style="background:${color};box-shadow:0 0 6px ${color}"></span>${label}<span class=hsub>${sub}</span></span>`; }
-async function healthTick(){
-  let h={}, t={};
-  try{ h=await(await fetch('/api/health')).json(); }catch(e){}
-  try{ t=await(await fetch('/api/truth')).json(); }catch(e){}
-  const o=h.ollama||{}, mf=h.mirofish_backend||{}, d=h.daemon||{}, f=h.freshness_sec||{};
-  const stc={healthy:'var(--green)',degraded:'var(--amber)',stale:'var(--amber)',unsafe:'var(--red)',unknown:'var(--dim)'};
-  const dc={healthy:'var(--green)',stale:'var(--amber)',degraded:'var(--amber)',crashed:'var(--red)',not_started:'var(--dim)',starting:'var(--amber)',unknown:'var(--dim)'};
-  const out=[];
-  // Plan 10: SYSTEM TRUTH badge FIRST — accounting + Gate 2 + services + DB. The dashboard can
-  // never read "all green" while accounting drifts / equity is unverified / a daemon is stale.
-  out.push(hbadge('System', stc[t.state]||'var(--red)',
-     (t.state||'unknown')+((t.accounting_status&&t.accounting_status!=='ok')?(' · acct '+t.accounting_status):'')));
-  const acc=h.accounting||{};
-  out.push(hbadge('Accounting', acc.verified?'var(--green)':(acc.status==='drift'?'var(--red)':'var(--amber)'), acc.status||'unknown'));
-  out.push(hbadge('Ollama', (o.up&&o.model_present)?'var(--green)':'var(--red)',
-     o.up ? (o.model_present ? (o.model||'model')+' ✓' : 'model missing') : 'down'));
-  out.push(hbadge('MiroFish', mf.up?'var(--green)':'var(--amber)', mf.up?'external :5001':(mf.mode||'local fallback')));
-  // Plan 10: per-daemon HONEST state (structured heartbeat) — not masked by MAX(mtime).
-  const dm=h.daemons||{};
-  Object.entries(dm).forEach(([n,hb])=> out.push(hbadge(n.replace('_daemon',''), dc[(hb||{}).state]||'var(--red)',
-     ((hb||{}).state||'?')+((hb&&hb.age_seconds!=null)?(' · '+ago(hb.age_seconds)):''))));
-  // Plan 10: when no STRUCTURED per-daemon heartbeat is available, do NOT colour by the legacy
-  // MAX(mtime) — a file timestamp is not verified fresh work. Show dim 'unverified', never green.
-  if(!Object.keys(dm).length) out.push(hbadge('Daemon', 'var(--dim)', d.age_sec==null?'no structured heartbeat':('mtime '+ago(d.age_sec)+' · unverified')));
-  [['swarm',f.swarm_forecast],['1-LLM',f.challenger],['crowd',f.mirofish],['bet',f.paper_position],['decision',f.decision]]
-    .forEach(([lab,sec])=> out.push(hbadge(lab, freshColor(sec), ago(sec))));
-  const el=document.getElementById('health'); if(el) el.innerHTML=out.join('');
-}
-healthTick(); setInterval(healthTick, 5000);
+/* ---------- SSE live stream ---------- */
+let curTab='', curFilter='';
+const TABS=['ALL','LLM','MIROFISH','SWARM','GATES','DECISIONS','WALLET','ERRORS'];
+const TABMAP={ALL:null,LLM:['agent.started','agent.finished','agent.token','agent.parse_failed'],
+ MIROFISH:['mirofish.stage','mirofish.state'],SWARM:['swarm.started','swarm.vote','swarm.degraded','forecast.final'],
+ GATES:['gate.result'],DECISIONS:['decision.bet','decision.no_bet','candidate.ranked','position.opened','position.settled'],
+ WALLET:['wallet.update','position.opened','position.settled','pnl.tick'],ERRORS:['error','agent.parse_failed']};
+$('#tabs').innerHTML=TABS.map((t,i)=>`<span class="tab ${i===0?'on':''}" data-t="${t}">${t}</span>`).join('');
+$$('#tabs .tab').forEach(el=>el.onclick=()=>{$$('#tabs .tab').forEach(x=>x.classList.remove('on'));el.classList.add('on');curTab=el.dataset.t==='ALL'?'':el.dataset.t;renderStream();});
+$$('.tabs .tab[data-f]').forEach(el=>el.onclick=()=>{$$('.tabs .tab[data-f]').forEach(x=>x.classList.remove('on'));el.classList.add('on');curFilter=el.dataset.f;renderTerm();});
+let EVTS=[];
+const NODEOF={agent:'agent',swarm:'swarm',challenger:'challenger',mirofish:'mirofish',gate:'gate',
+ wallet:'wallet',accounting:'accounting',predict_today:'journal',profit_intel:'journal',system:'journal'};
+function ingest(e){EVTS.unshift(e);if(EVTS.length>600)EVTS.pop();
+  const n=NODEOF[e.source]||(e.type&&e.type.split('.')[0]);if(n)touch(n);
+  if(e.type==='evidence.pack')touch('evidence');if(e.type&&e.type.startsWith('position'))touch('wallet');
+  renderStream();renderTerm();}
+function evRow(e){const c=stateColor(e.status);const rp=e.replay?'<span class=amb>[replay]</span> ':'';
+  return `<div class=ev style="border-color:${c}"><span class=ts>${(e.ts||'').substring(11,19)}</span>
+   <span style="color:${c}">${e.type}</span> <span class=dim>${e.source}</span> ${rp}${(e.message||'')}
+   ${e.question?'<span class=dim>· '+e.question.substring(0,40)+'</span>':''}</div>`;}
+function renderStream(){const f=curTab?TABMAP[curTab]:null;const evs=EVTS.filter(e=>!f||f.includes(e.type)).slice(0,120);
+  $('#stream').innerHTML=evs.length?evs.map(evRow).join(''):'<div class=empty>no events for this tab</div>';}
+function renderTerm(){const evs=EVTS.filter(e=>!curFilter||(e.type||'').includes(curFilter)||(e.source||'')===curFilter).slice(0,200);
+  $('#term').innerHTML=evs.length?evs.map(e=>`<div class=l><span class=dim>${(e.ts||'').substring(11,23)}</span> <span style="color:${stateColor(e.status)}">${(e.type||'').padEnd(16)}</span> ${e.source} · ${e.message||''} ${e.replay?'[replay]':''}</div>`).join(''):'<div class=empty>no events yet — start the AI daemons to see live activity</div>';
+  $('#replaytag').textContent=EVTS.some(e=>e.replay)?'· includes replay':'· live';}
+function connectSSE(){let es;try{es=new EventSource('/events/live');}catch(e){$('#sse').textContent='unsupported';return;}
+  es.onopen=()=>{$('#sse').textContent='● connected';$('#sse').style.color='var(--grn)';};
+  es.onmessage=ev=>{try{const e=JSON.parse(ev.data);if(e&&e.type)ingest(e);}catch(_){}};
+  es.onerror=()=>{$('#sse').textContent='● reconnecting…';$('#sse').style.color='var(--amb)';};}
 
-// ── live agent feed (SSE tail of the daemon console) ──────────────────────────
-(function(){
-  const box=document.getElementById('stream'), dot=document.getElementById('streamdot');
-  if(!box) return;
-  function cls(t){
-    if(/\bBET\b|SHORT —|LONG \(|\bWON\b|\bLOST\b|placed|cashed out/i.test(t)) return 'bet';
-    if(/Fetching|sources|Context ready|gather|scouting/i.test(t)) return 'data';
-    if(/MiroFish|🐟|crowd|🗣|posts/i.test(t)) return 'fish';
-    if(/^[\s]*[┌└│├┤─━┃┏┗┣]/.test(t)||/POLYSWARM|RESULT|FORECAST|═══/.test(t)) return 'head';
-    if(/ROUND|Regime|Bayesian|Weighted|Shapley|Consensus|swarm|agent|persona/i.test(t)) return 'swarm';
-    if(/not resolved yet|keepalive|waiting for/i.test(t)) return 'dim';
-    return '';
-  }
-  function add(t){
-    try{ window.netFeed && window.netFeed(t); }catch(_){}
-    const atBottom = box.scrollHeight-box.scrollTop-box.clientHeight < 50;
-    const el=document.createElement('span'); el.className='ln '+cls(t); el.textContent=t;
-    box.appendChild(el);
-    while(box.childNodes.length>600) box.removeChild(box.firstChild);
-    if(atBottom) box.scrollTop=box.scrollHeight;
-  }
-  function connect(){
-    const es=new EventSource('/api/stream');
-    es.onopen=()=>{ dot.textContent='● live'; dot.style.color='var(--green)'; };
-    es.onmessage=e=>{ let t; try{ t=JSON.parse(e.data); }catch(_){ t=e.data; } add(t); };
-    es.onerror=()=>{ dot.textContent='● reconnecting…'; dot.style.color='var(--amber)'; }; // EventSource auto-reconnects
-  }
-  connect();
-})();
-
-// ── agent network bubble graph (driven by the live feed) ──────────────────────
-(function(){
-  const cv=document.getElementById('net'); if(!cv) return;
-  const ctx=cv.getContext('2d'); const state=document.getElementById('netstate');
-  let W=0,H=0; const DPR=Math.min(window.devicePixelRatio||1,2);
-  const NODES=[
-    {id:'market',label:'MARKET',col:'#22d3ee',r:16},
-    {id:'macro', label:'Macro Analyst',     col:'#8b5cf6',r:9},
-    {id:'contra',label:'Contrarian Skeptic',col:'#f472b6',r:9},
-    {id:'crypto',label:'Crypto Native',     col:'#34d399',r:9},
-    {id:'quant', label:'Quant Trader',      col:'#f59e0b',r:9},
-    {id:'retail',label:'Retail',            col:'#60a5fa',r:9},
-    {id:'fish',  label:'MiroFish crowd',    col:'#22d3ee',r:11},
-    {id:'data',  label:'Data · 23 src',     col:'#fbbf24',r:11},
-    {id:'llm',   label:'1-LLM',             col:'#a78bfa',r:8},
-  ];
-  const byId={}; NODES.forEach(n=>byId[n.id]=n);
-  const EDGES=[]; NODES.forEach(n=>{ if(n.id!=='market') EDGES.push(['market',n.id]); });
-  ['macro','contra','crypto','quant','retail'].forEach((a,i,A)=>EDGES.push([a,A[(i+1)%A.length]]));
-  EDGES.push(['fish','retail'],['data','quant'],['data','macro']);
-  const pulses=[];
-  function layout(){
-    const cx=W/2,cy=H/2,R=Math.min(W,H)*0.34; byId.market.hx=cx; byId.market.hy=cy;
-    const ring=NODES.filter(n=>n.id!=='market');
-    ring.forEach((n,i)=>{ const a=-Math.PI/2+i/ring.length*6.2832; n.hx=cx+Math.cos(a)*R; n.hy=cy+Math.sin(a)*R; });
-    NODES.forEach(n=>{ if(n.x==null){ n.x=n.hx; n.y=n.hy; n.ph=Math.random()*6.28; n.e=0; }});
-  }
-  function resize(){ const r=cv.getBoundingClientRect(); W=r.width; H=r.height||340;
-    cv.width=W*DPR; cv.height=H*DPR; ctx.setTransform(DPR,0,0,DPR,0,0); layout(); }
-  function activate(id,power){ const n=byId[id]; if(!n) return;
-    n.e=Math.min(1.5,(n.e||0)+(power||0.9)); byId.market.e=Math.min(1.3,(byId.market.e||0)+0.35);
-    pulses.push({a:'market',b:id,t:0,col:n.col});
-    if(state){ state.textContent='● working'; state.style.color='var(--green)'; window._netBusy=Date.now(); } }
-  window.netFeed=function(line){ const t=line||'';
-    if(/Macro Analyst/i.test(t)) activate('macro');
-    else if(/Contrarian/i.test(t)) activate('contra');
-    else if(/Crypto Native/i.test(t)) activate('crypto');
-    else if(/Quantitative|Quant/i.test(t)) activate('quant');
-    else if(/Retail/i.test(t)) activate('retail');
-    if(/MiroFish|🐟|crowd|🗣/i.test(t)) activate('fish');
-    if(/Fetching|sources|Context ready|gather|scouting/i.test(t)) activate('data',1.1);
-    if(/single-LLM|1-LLM|baseline|challenger/i.test(t)) activate('llm');
-    if(/FORECAST|RESULT|ROUND|Bayesian|Weighted|swarm/i.test(t)){ activate('market',0.5);
-      ['macro','contra','crypto','quant','retail'].forEach(a=>activate(a,0.45)); }
-    if(/\bBET\b|SHORT|LONG \(|placed/i.test(t)) activate('market',0.8);
-  };
-  let tt=0;
-  function frame(){ tt+=0.016; ctx.clearRect(0,0,W,H);
-    if(state && window._netBusy && Date.now()-window._netBusy>4000){ state.textContent='● idle'; state.style.color='var(--dim)'; window._netBusy=0; }
-    NODES.forEach(n=>{ const tx=n.hx+Math.cos(tt*0.6+n.ph)*6, ty=n.hy+Math.sin(tt*0.5+n.ph)*6;
-      n.x+=(tx-n.x)*0.04; n.y+=(ty-n.y)*0.04; n.e=(n.e||0)*0.97; });
-    EDGES.forEach(([a,b])=>{ const na=byId[a],nb=byId[b],en=Math.max(na.e||0,nb.e||0);
-      ctx.beginPath(); ctx.moveTo(na.x,na.y); ctx.lineTo(nb.x,nb.y);
-      ctx.strokeStyle='rgba(120,140,205,'+(0.05+en*0.4)+')'; ctx.lineWidth=0.6+en*1.6; ctx.stroke(); });
-    for(let i=pulses.length-1;i>=0;i--){ const p=pulses[i]; p.t+=0.03; const na=byId[p.a],nb=byId[p.b];
-      const x=na.x+(nb.x-na.x)*p.t, y=na.y+(nb.y-na.y)*p.t;
-      ctx.beginPath(); ctx.arc(x,y,2.6,0,6.28); ctx.fillStyle=p.col; ctx.shadowColor=p.col; ctx.shadowBlur=10; ctx.fill(); ctx.shadowBlur=0;
-      if(p.t>=1) pulses.splice(i,1); }
-    NODES.forEach(n=>{ const e=n.e||0, rr=n.r*(1+e*0.6);
-      const g=ctx.createRadialGradient(n.x,n.y,0,n.x,n.y,rr*3.2);
-      g.addColorStop(0,n.col+'cc'); g.addColorStop(0.4,n.col+(e>0.2?'55':'22')); g.addColorStop(1,'transparent');
-      ctx.beginPath(); ctx.arc(n.x,n.y,rr*3.2,0,6.28); ctx.fillStyle=g; ctx.fill();
-      ctx.beginPath(); ctx.arc(n.x,n.y,rr,0,6.28); ctx.fillStyle=n.col; ctx.shadowColor=n.col; ctx.shadowBlur=8+e*18; ctx.fill(); ctx.shadowBlur=0;
-      ctx.font='10px Segoe UI,system-ui'; ctx.textAlign='center'; ctx.fillStyle='rgba(220,228,245,'+(0.42+e*0.55)+')';
-      ctx.fillText(n.label,n.x,n.y-rr-5); });
-    requestAnimationFrame(frame);
-  }
-  window.addEventListener('resize',resize); resize(); requestAnimationFrame(frame);
-  setInterval(()=>{ if(!window._netBusy){ const ids=['macro','contra','crypto','quant','retail','data','fish']; activate(ids[Math.floor(tt*7)%ids.length],0.22);} },2600);
-})();
-
-// ── MiroFish knowledge graph (REAL entities/relations from :5001, force-directed) ──
-(function(){
-  const cv=document.getElementById('mfgraph'); if(!cv) return;
-  const ctx=cv.getContext('2d'); const DPR=Math.min(window.devicePixelRatio||1,2);
-  const meta=document.getElementById('mfgmeta'), legend=document.getElementById('mfglegend'), details=document.getElementById('mfgdetails');
-  const TYPECOL={ Person:'#f472b6', PersonEntity:'#f472b6', Company:'#34d399', Organization:'#fb923c',
-    MediaOutlet:'#f59e0b', GovernmentAgency:'#9ca3af', InvestorInstitution:'#60a5fa', PolicyMaker:'#a78bfa',
-    DeveloperCommunity:'#22d3ee', TechExecutive:'#f59e0b', Entity:'#3b82f6', EventEntity:'#eab308' };
-  function colorFor(t){ if(TYPECOL[t]) return TYPECOL[t];
-    let h=0; for(let i=0;i<(t||'').length;i++) h=(h*31+t.charCodeAt(i))%360; return 'hsl('+h+',65%,60%)'; }
-  let W=0,H=0, nodes=[], edges=[], byId={}, sel=null, drag=null;
-  function resize(){ const r=cv.getBoundingClientRect(); W=r.width;H=r.height||380;
-    cv.width=W*DPR;cv.height=H*DPR;ctx.setTransform(DPR,0,0,DPR,0,0); }
-  function layout(){ const cx=W/2,cy=H/2,R=Math.min(W,H)*0.28;
-    nodes.forEach((n,i)=>{ const a=i/Math.max(1,nodes.length)*6.2832;
-      n.x=cx+Math.cos(a)*R+(i%2?12:-12); n.y=cy+Math.sin(a)*R; n.vx=0;n.vy=0; n.deg=0; });
-    edges.forEach(e=>{ if(byId[e.source]) byId[e.source].deg++; if(byId[e.target]) byId[e.target].deg++; }); }
-  async function load(){
-    let d; try{ d=await(await fetch('/api/mirofish_graph')).json(); }
-    catch(e){ if(meta){meta.textContent='backend offline';meta.style.color='var(--amber)';} return; }
-    if(!d.available){ if(meta){meta.textContent=(d.reason||'unavailable');meta.style.color='var(--amber)';}
-      nodes=[];edges=[];byId={}; if(legend) legend.innerHTML=''; return; }
-    if(meta){ meta.textContent='● '+d.name+' · '+d.node_count+' entities · '+d.edge_count+' relations'; meta.style.color='var(--green)'; }
-    nodes=(d.nodes||[]).map(n=>({...n})); byId={}; nodes.forEach(n=>byId[n.id]=n);
-    edges=(d.edges||[]).filter(e=>byId[e.source]&&byId[e.target]);
-    layout();
-    const types=[...new Set(nodes.map(n=>n.type))];
-    if(legend) legend.innerHTML='<span class=lghdr>Entity types</span>'+types.map(t=>'<span class=lgrow><span class=lgdot style="background:'+colorFor(t)+'"></span>'+t+'</span>').join('');
-  }
-  function step(){
-    for(let i=0;i<nodes.length;i++){ for(let j=i+1;j<nodes.length;j++){ const a=nodes[i],b=nodes[j];
-      let dx=a.x-b.x,dy=a.y-b.y,d2=(dx*dx+dy*dy)||1,d=Math.sqrt(d2),f=2600/d2;
-      a.vx+=dx/d*f;a.vy+=dy/d*f;b.vx-=dx/d*f;b.vy-=dy/d*f; }}
-    edges.forEach(e=>{ const a=byId[e.source],b=byId[e.target]; if(!a||!b)return;
-      let dx=b.x-a.x,dy=b.y-a.y,d=Math.hypot(dx,dy)||1,f=(d-130)*0.012;
-      a.vx+=dx/d*f;a.vy+=dy/d*f;b.vx-=dx/d*f;b.vy-=dy/d*f; });
-    const cx=W/2,cy=H/2;
-    nodes.forEach(n=>{ if(n===drag) return; n.vx+=(cx-n.x)*0.002;n.vy+=(cy-n.y)*0.002;
-      n.vx*=0.85;n.vy*=0.85; n.x+=n.vx;n.y+=n.vy;
-      n.x=Math.max(24,Math.min(W-24,n.x)); n.y=Math.max(22,Math.min(H-22,n.y)); });
-    draw(); requestAnimationFrame(step);
-  }
-  function draw(){ ctx.clearRect(0,0,W,H);
-    edges.forEach(e=>{ const a=byId[e.source],b=byId[e.target]; if(!a||!b)return; const hot=sel&&(sel.id===a.id||sel.id===b.id);
-      ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);
-      ctx.strokeStyle=hot?'#f472b6cc':'#f472b63a'; ctx.lineWidth=hot?1.8:0.9; ctx.stroke();
-      if(hot){ const mx=(a.x+b.x)/2,my=(a.y+b.y)/2; ctx.font='9px Segoe UI';ctx.fillStyle='#f472b6';ctx.textAlign='center';
-        ctx.fillText((e.type||'').slice(0,26),mx,my-3); } });
-    nodes.forEach(n=>{ const col=colorFor(n.type), r=7+Math.min(8,(n.deg||0)*2)+(n===sel?3:0);
-      ctx.beginPath();ctx.arc(n.x,n.y,r,0,6.28);ctx.fillStyle=col;
-      ctx.shadowColor=col;ctx.shadowBlur=n===sel?16:7;ctx.fill();ctx.shadowBlur=0;
-      if(n===sel){ctx.lineWidth=2;ctx.strokeStyle='#fff';ctx.stroke();}
-      ctx.font='10px Segoe UI';ctx.fillStyle='rgba(220,228,245,.85)';ctx.textAlign='center';
-      ctx.fillText((n.name||'').slice(0,24),n.x,n.y-r-4); });
-  }
-  function at(mx,my){ let hit=null,best=520; nodes.forEach(n=>{const d=(n.x-mx)**2+(n.y-my)**2; if(d<best){best=d;hit=n;}}); return hit; }
-  function pos(ev){ const r=cv.getBoundingClientRect(); return [ev.clientX-r.left, ev.clientY-r.top]; }
-  cv.addEventListener('mousedown',ev=>{ const p=pos(ev); drag=at(p[0],p[1]); if(drag) selectNode(drag); });
-  cv.addEventListener('mousemove',ev=>{ if(drag){ const p=pos(ev); drag.x=p[0];drag.y=p[1];drag.vx=0;drag.vy=0; } });
-  window.addEventListener('mouseup',()=>{ drag=null; });
-  function selectNode(n){ sel=n; if(!details) return;
-    const attrs=Object.entries(n.attributes||{}).filter(([k])=>k!=='name').map(([k,v])=>'<div class=drow><span class=dk>'+k+'</span>'+v+'</div>').join('');
-    const labs=((n.labels&&n.labels.length?n.labels:[n.type])).map(l=>'<span class=mfgtag style="background:'+colorFor(l)+'22;color:'+colorFor(l)+'">'+l+'</span>').join('');
-    details.innerHTML='<div class=dh><b>'+(n.name||'')+'</b><span class=dx onclick="document.getElementById(\'mfgdetails\').classList.remove(\'show\')">✕</span></div>'
-      +'<div class=drow><span class=dk>type</span>'+n.type+'</div>'
-      +'<div class=drow><span class=dk>uuid</span><span class=dmono>'+(n.id||'')+'</span></div>'
-      +'<div class=drow><span class=dk>created</span>'+(n.created_at?new Date(n.created_at).toLocaleString():'—')+'</div>'
-      +(attrs?'<div class=drow style="margin-top:6px;color:var(--dim);font-weight:600">Properties</div>'+attrs:'')
-      +(n.summary?'<div class=drow style="margin-top:6px;color:var(--dim);font-weight:600">Summary</div><div class=dsum>'+n.summary+'</div>':'')
-      +'<div class=drow style="margin-top:8px">'+labs+'</div>';
-    details.classList.add('show');
-  }
-  const rb=document.getElementById('mfgrefresh'); if(rb) rb.onclick=load;
-  window.addEventListener('resize',resize);
-  resize(); load(); requestAnimationFrame(step); setInterval(load,30000);
-})();
-
-// ── MiroFish report (the crowd-sim's written analysis, real markdown from :5001) ──
-(function(){
-  const body=document.getElementById('mfrbody'), meta=document.getElementById('mfrmeta'), prog=document.getElementById('mfrprog');
-  if(!body) return;
-  function md2html(md){
-    const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    const inline=s=>esc(s).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\*(.+?)\*/g,'<em>$1</em>');
-    let html='',inList=false; const close=()=>{ if(inList){html+='</ul>';inList=false;} };
-    (md||'').split('\n').forEach(raw=>{ const l=raw.trim();
-      if(!l){ close(); return; }
-      if(l.startsWith('### ')){ close(); html+='<h3>'+inline(l.slice(4))+'</h3>'; }
-      else if(l.startsWith('## ')){ close(); html+='<h2>'+inline(l.slice(3))+'</h2>'; }
-      else if(l.startsWith('# ')){ close(); html+='<h1>'+inline(l.slice(2))+'</h1>'; }
-      else if(l.startsWith('> ')){ close(); html+='<blockquote>'+inline(l.slice(2))+'</blockquote>'; }
-      else if(/^(-|\*|\d+\.)\s/.test(l)){ if(!inList){html+='<ul>';inList=true;} html+='<li>'+inline(l.replace(/^(-|\*|\d+\.)\s/,''))+'</li>'; }
-      else { close(); html+='<p>'+inline(l)+'</p>'; }
-    });
-    close(); return html;
-  }
-  async function load(){
-    let d; try{ d=await(await fetch('/api/mirofish_report')).json(); }
-    catch(e){ if(meta){meta.textContent='offline';meta.style.color='var(--amber)';} return; }
-    if(!d.available){ if(meta){meta.textContent=d.reason||'no report';meta.style.color='var(--amber)';}
-      body.innerHTML='<p style="color:var(--dim)">No MiroFish report yet — none have completed.</p>'; if(prog)prog.innerHTML=''; return; }
-    const done=d.status==='done'||d.status==='completed';
-    if(meta){ meta.textContent='● '+(d.status||'')+(d.sections_total?(' · '+d.sections_done+'/'+d.sections_total+' sections'):''); meta.style.color=done?'var(--green)':'var(--amber)'; }
-    if(prog){ const p=d.progress!=null?d.progress:(done?100:0); prog.innerHTML='<div class=bar style="width:'+p+'%"></div>'; }
-    body.innerHTML=md2html(d.markdown);
-  }
-  const rb=document.getElementById('mfrrefresh'); if(rb) rb.onclick=load;
-  load(); setInterval(load,30000);
-})();
-
-// ── LLM live: real WebSocket token stream ─────────────────────────────────────
-(function(){
-  const wrap=document.getElementById('llmlive'), dot=document.getElementById('llmdot'); if(!wrap) return;
-  const qEl=wrap.querySelector('.llmq'), body=wrap.querySelector('.llmbody'); let cursor=null;
-  const esc=s=>(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-  function setCursor(on){ if(cursor){cursor.remove();cursor=null;} if(on){ cursor=document.createElement('span'); cursor.className='cursor'; body.appendChild(cursor);} }
-  function connect(){
-    const proto=location.protocol==='https:'?'wss':'ws'; let ws;
-    try{ ws=new WebSocket(proto+'://'+location.host+'/ws/llm'); }catch(_){ dot.textContent='● ws unavailable'; dot.style.color='var(--red)'; return; }
-    ws.onopen=()=>{ dot.textContent='● streaming'; dot.style.color='var(--green)'; };
-    ws.onmessage=e=>{ let m; try{m=JSON.parse(e.data);}catch(_){return;}
-      if(m.t==='start'){
-        var meta=(m.price!=null?' · mkt '+Math.round(m.price*100)+'%':'')
-               +(m.hours!=null?' · '+(m.hours<1?'<1':Math.round(m.hours))+'h':'')
-               +(m.side?' · rule '+m.side+(m.edge?' +'+(m.edge*100).toFixed(1)+'%':''):' · no edge');
-        qEl.innerHTML='🔎 <b>scouting</b> ▸ '+esc(m.market)+'<span style="color:var(--dim)">'+esc(meta)+(m.model?'  ['+m.model+']':'')+'</span>';
-        body.textContent=''; setCursor(true);
-        try{ window.netFeed && window.netFeed('Fetching sources single-LLM scouting'); }catch(_){}}
-      else if(m.t==='tok'){ setCursor(false); body.appendChild(document.createTextNode(m.v)); setCursor(true); wrap.scrollTop=wrap.scrollHeight; }
-      else if(m.t==='meta'){ qEl.textContent='▸ live model'; body.textContent=m.msg||''; setCursor(false); }
-      else if(m.t==='done'){ setCursor(false); body.appendChild(document.createTextNode('\n\n— analysis complete —')); wrap.scrollTop=wrap.scrollHeight; }
-      else if(m.t==='idle'){ setCursor(false); if(dot){ dot.textContent='● idle · caught up'; dot.style.color='var(--dim)'; } }
-    };
-    ws.onclose=()=>{ dot.textContent='● reconnecting…'; dot.style.color='var(--amber)'; setCursor(false); setTimeout(connect,2500); };
-    ws.onerror=()=>{ try{ws.close();}catch(_){} };
-  }
-  connect();
-})();
+connectSSE();tick();setInterval(tick,3000);drawSwarm();
 </script></body></html>"""
 
 

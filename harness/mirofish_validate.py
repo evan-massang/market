@@ -335,6 +335,22 @@ def record_run(result: MiroFishResult, forecast_id: str | None = None) -> bool:
              _min_sims, _match_thr,
              result.question_match_score, result.error, json.dumps(result.warnings)))
         conn.commit(); conn.close()
+        # Live telemetry (best-effort, never affects the run): emit the canonical MiroFish state
+        # so the dashboard stream shows REAL mirofish stages. used != alive (Plan 8 honesty).
+        try:
+            from harness import live_events as _le, mirofish_status as _mfs2
+            row = {"usable": int(result.usable), "freshness_status": result.freshness_status,
+                   "stage_reached": result.stage_reached, "report_age_seconds": result.report_age_seconds,
+                   "question_match_score": result.question_match_score, "n_posts": result.n_posts,
+                   "min_sims_used": _min_sims, "match_threshold_used": _match_thr}
+            state = _mfs2.state_from_row(row)
+            _le.emit("mirofish.state", "mirofish", market_id=result.market_id,
+                     question=result.question, stage=result.stage_reached, status=state,
+                     message=f"MiroFish {state} ({result.freshness_status})",
+                     data={"state": state, "usable": bool(result.usable),
+                           "freshness_status": result.freshness_status})
+        except Exception:
+            pass
         return True
     except Exception:
         return False
