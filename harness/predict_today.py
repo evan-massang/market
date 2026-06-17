@@ -785,7 +785,33 @@ def _skip(mid, q, reason, *, p=None, price=None):
         journal.record_decision(mid, q, p, price, None, None, 0.0, None, "", "guard", "no_bet", why)
     except Exception:
         pass
+    # Plan 11: record a PAPER-ONLY decision feature snapshot (best-effort, never affects the skip).
+    try:
+        from harness import decision_features as _dfeat
+        _dfeat.record_decision(action="no_bet", reason=reason, source="predict_today",
+                               market_id=mid, question=q, forecast_probability=p, price=price,
+                               blocked_by_gate=reason)
+    except Exception:
+        pass
     return False
+
+
+def _log_decision_features(m, *, action, reason, final_p=None, price=None, side=None, edge=None,
+                           p=None, meta=None, pack=None, regime=None, stake=None):
+    """Plan 11: best-effort PAPER-ONLY decision feature snapshot from the forecast locals already
+    computed in predict_one. Fully guarded — never raises, never affects the bet decision."""
+    try:
+        from harness import decision_features as _dfeat
+        meta = meta or {}
+        kw = dict(reason=reason, source="predict_today", forecast_probability=final_p, price=price,
+                  side=side, edge_raw=edge, swarm_probability=p, consensus=meta.get("consensus"),
+                  n_agents_succeeded=meta.get("n_agents_succeeded"), regime=regime, stake=stake)
+        if pack is not None:
+            kw["evidence_quality"] = getattr(pack, "evidence_quality", None)
+            kw["evidence_source_count"] = getattr(pack, "n_sources", None)
+        _dfeat.record_decision(m, action=action, **{k: v for k, v in kw.items() if v is not None})
+    except Exception:
+        pass
 
 
 def _evidence_guard(pack):
@@ -1095,6 +1121,9 @@ def predict_one(m, cfg):
                        f"Portfolio EV ${ep.portfolio_ev:+.2f}, worst-case ${ep.worst_case_loss:+.2f}. "
                        f"Bought {fr.side} @ {fr.fill_price:.3f} with ${fr.stake:.2f}. Resolves in {hl:.1f}h (today).")
                 journal.record_decision(mid, q, final_p, price, edge, fr.side, fr.stake, fr.fill_price, regime, sig, "bet", why)
+                _log_decision_features(m, action="bet", reason="event_portfolio_accepted",
+                                       final_p=final_p, price=price, side=fr.side, edge=edge,
+                                       p=p, meta=meta, pack=pack, regime=regime)
                 print(f"      BET PLACED: {fr.side} ${fr.stake:.2f} @ {fr.fill_price:.3f} — resolves in {hl:.1f}h")
                 return True
             print(f"      bet rejected by wallet: {fr.reason}")
@@ -1127,6 +1156,9 @@ def predict_one(m, cfg):
             why = (f"AI pipeline: gathered GDELT+signals, swarm {p:.0%} vs market {price:.0%} "
                    f"(edge {sz.edge:+.1%}). No bet — {sz.reason}.")
             journal.record_decision(mid, q, final_p, price, sz.edge, None, 0.0, None, regime, "no edge", "no_bet", why)
+            _log_decision_features(m, action="no_bet", reason=f"no_edge:{sz.reason}",
+                                   final_p=final_p, price=price, edge=sz.edge,
+                                   p=p, meta=meta, pack=pack, regime=regime)
             print("      DECISION: NO BET — edge below threshold")
             if obs:
                 obs.hooks.on_trade_skip(
@@ -1161,6 +1193,9 @@ def predict_one(m, cfg):
                    f"swarm forecast {p:.0%} vs market {price:.0%} → {sz.edge:+.1%} edge. Bought {fr.side} @ "
                    f"{fr.fill_price:.3f} with ${fr.stake:.2f} ({sz.reason}). Resolves in {hl:.1f}h (today).")
             journal.record_decision(mid, q, final_p, price, sz.edge, fr.side, fr.stake, fr.fill_price, regime, sig, "bet", why)
+            _log_decision_features(m, action="bet", reason=f"bet:{sz.reason}",
+                                   final_p=final_p, price=price, side=fr.side, edge=sz.edge,
+                                   p=p, meta=meta, pack=pack, regime=regime, stake=fr.stake)
             print(f"      BET PLACED: {fr.side} ${fr.stake:.2f} @ {fr.fill_price:.3f} — resolves in {hl:.1f}h")
             return True
         print(f"      bet rejected by wallet: {fr.reason}")

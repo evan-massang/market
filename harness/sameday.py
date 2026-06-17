@@ -252,7 +252,31 @@ def _sd_skip(mid, q, reason, p=None, price=None, layer="guard"):
                                 f"Guard skip: {reason}.")
     except Exception:
         pass
+    # Plan 11: PAPER-ONLY decision feature snapshot (best-effort, never affects the skip).
+    try:
+        from harness import decision_features as _dfeat
+        _dfeat.record_decision(action="no_bet", reason=reason, source="sameday",
+                               market_id=mid, question=q, forecast_probability=p, price=price,
+                               blocked_by_gate=reason)
+    except Exception:
+        pass
     return False
+
+
+def _log_sd_features(m, *, action, reason, final_p=None, price=None, side=None, edge=None,
+                     p=None, cons=None, pack=None, stake=None):
+    """Plan 11: best-effort PAPER-ONLY decision feature snapshot for sameday bets. Never raises;
+    never affects the bet decision."""
+    try:
+        from harness import decision_features as _dfeat
+        kw = dict(reason=reason, source="sameday", forecast_probability=final_p, price=price,
+                  side=side, edge_raw=edge, swarm_probability=p, consensus=cons, stake=stake)
+        if pack is not None:
+            kw["evidence_quality"] = getattr(pack, "evidence_quality", None)
+            kw["evidence_source_count"] = getattr(pack, "n_sources", None)
+        _dfeat.record_decision(m, action=action, **{k: v for k, v in kw.items() if v is not None})
+    except Exception:
+        pass
 
 
 def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE):
@@ -464,6 +488,9 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                                                 "LONG (YES)" if side == "YES" else "SHORT (NO)", "bet",
                                                 f"Event-portfolio (multi-leg ME): swarm {p:.0%} vs market {price:.0%}, "
                                                 f"portfolio EV ${ep.portfolio_ev:+.2f}, worst ${ep.worst_case_loss:+.2f} -> {fr.side}.")
+                        _log_sd_features(m, action="bet", reason="event_portfolio_accepted",
+                                         final_p=final_p, price=price, side=fr.side, edge=edge,
+                                         p=p, cons=cons, pack=pack, stake=fr.stake)
                         print(f"  [sameday] BET {fr.side} ${fr.stake:.2f} @ {fr.fill_price:.3f} "
                               f"(event portfolio, {hl:.1f}h) {q[:34]}")
                     else:
@@ -537,6 +564,9 @@ def place_sameday(max_new=6, use_ai=True, max_scout=MAX_SCOUT, min_edge=MIN_EDGE
                                             fr.side, fr.stake, fr.fill_price, "swarm",
                                             "LONG (YES)" if sz.side == "YES" else "SHORT (NO)", "bet",
                                             f"Swarm sees {p:.0%} vs market {price:.0%} ({hl:.1f}h) -> {sz.side}, edge {sz.edge:+.1%}.")
+                    _log_sd_features(m, action="bet", reason=f"bet:{sz.reason}",
+                                     final_p=final_p, price=price, side=fr.side, edge=sz.edge,
+                                     p=p, cons=cons, pack=pack, stake=fr.stake)
                     print(f"  [sameday] BET {fr.side} ${fr.stake:.2f} @ {fr.fill_price:.3f} "
                           f"(swarm {p:.0%} vs mkt {price:.0%}, {hl:.1f}h) {q[:34]}")
                 else:

@@ -311,6 +311,35 @@ def api_gates():
         return JSONResponse(_envelope(state="unknown", reason=f"gates_unavailable:{e}", source="gates"))
 
 
+@app.get("/api/profit-intelligence")
+def api_profit_intelligence():
+    """Plan 11: PAPER-ONLY profit intelligence — candidate signals, no-bet learning, post-trade
+    learning, attribution. NEVER reports 'profitable' unless Gate 2 (Plan 9) is pass; otherwise it
+    shows learning / insufficient_sample / watching. Read-only; never trades."""
+    try:
+        from harness import profit_intel as _pi
+        rep = _safe(lambda: _pi.profit_intelligence_report(), None)
+        if not rep:
+            return JSONResponse(_envelope(state="unknown", reason="profit_intel_unavailable",
+                                          source="profit_intel", paper_only=True, report=None))
+        gate2_pass = bool(rep.get("gate2_pass"))
+        # green ('ok') ONLY on a Gate-2 pass; degraded if accounting unverified; else honest learning
+        if gate2_pass:
+            state = "ok"
+        elif rep.get("accounting_status") not in ("ok", None):
+            state = "degraded"
+        else:
+            state = "learning"
+        return JSONResponse(_envelope(
+            state=state, reason=rep.get("headline"), source="profit_intel", paper_only=True,
+            accounting_status=rep.get("accounting_status"), gate2_status=rep.get("gate2_status"),
+            gate2_pass=gate2_pass, needs_more_data=rep.get("needs_more_data"),
+            profitable_claim_allowed=rep.get("profitable_claim_allowed"), report=rep))
+    except Exception as e:
+        return JSONResponse(_envelope(state="unknown", reason=f"profit_intel_error:{e}",
+                                      source="profit_intel", paper_only=True))
+
+
 @app.get("/api/version")
 def api_version():
     """Plan 10: code version / git branch+commit / dirty tree. None (not crash) when git is absent."""

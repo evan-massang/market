@@ -136,8 +136,10 @@ def losing_trades(limit: int = 25) -> list[dict]:
 def theme_label_performance() -> dict:
     out = {"by_theme": {}, "by_label": {}}
     try:
-        from harness import adaptive
-        out["by_theme"] = adaptive.theme_pnl()
+        # Plan 11: DISPLAY-safe theme P&L — small-sample win-rate/ROI withheld (never a fake
+        # '100% win rate' from n=1). Does not touch adaptive.theme_pnl (sizing) itself.
+        from harness import profit_intel as _pi
+        out["by_theme"] = _pi.guarded_theme_pnl()
     except Exception as e:
         _err("command_center.theme_perf", e)
     try:

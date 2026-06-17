@@ -192,7 +192,10 @@ def profitability_report() -> dict:
            "clv_by_theme": {}, "edge_decay": {}, "experiment_leaderboard": []}
     try:
         from harness import adaptive as _adaptive
-        out["theme_pnl"] = _adaptive.theme_pnl() or {}
+        # Plan 11: DISPLAY-safe theme P&L (small-sample win-rate/ROI withheld). adaptive_min_edge
+        # below still uses _adaptive directly, so SIZING reads the raw theme_pnl, unchanged.
+        from harness import profit_intel as _pi
+        out["theme_pnl"] = _pi.guarded_theme_pnl() or {}
         known = {"elections", "approval", "geopolitics", "culture", "other"}
         themes = sorted(set(out["theme_pnl"].keys()) | known)
         ame = {"_overall": _adaptive.adaptive_min_edge(None)}

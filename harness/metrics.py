@@ -217,8 +217,9 @@ def full_report() -> dict:
     rep = gate_report()
     rep["calibration"] = calibration_buckets()
     try:
-        from harness import adaptive
-        rep["theme_pnl"] = adaptive.theme_pnl()
+        # Plan 11: DISPLAY-safe theme P&L — small-sample win-rate/ROI withheld for the dashboard.
+        from harness import profit_intel as _pi
+        rep["theme_pnl"] = _pi.guarded_theme_pnl()
     except Exception as e:
         _err("metrics.full_report.theme_pnl", e)
         rep["theme_pnl"] = {}
